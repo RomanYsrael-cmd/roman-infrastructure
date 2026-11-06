@@ -10,7 +10,9 @@
       "authorized_actors": [
         "RomanYsrael-cmd"
       ],
-      "allowed_platform_shas": [],
+      "allowed_platform_shas": [
+        "4310a6007291ad655acec4a43cc44d355d2277f6"
+      ],
       "workflow_event": "workflow_dispatch",
       "production_branch": "main",
       "environment": "production",

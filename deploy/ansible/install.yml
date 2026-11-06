@@ -64,7 +64,7 @@
           - ss
           - -ltnH
           - sport
-          - =
+          - '='
           - :18080
       register: listener_check
       changed_when: false
