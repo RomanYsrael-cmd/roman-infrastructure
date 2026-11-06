@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+image-metadata.json
+*.env
+*.pem
+*.key
+id_ed25519*
+known_hosts

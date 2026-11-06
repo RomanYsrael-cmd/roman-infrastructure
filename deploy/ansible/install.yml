@@ -1,0 +1,183 @@
+---
+- name: Install the restricted Roman deployment controller
+  hosts: roman_servers
+  become: true
+  gather_facts: true
+  vars:
+    platform_root: /opt/roman-platform
+    platform_config_dir: /etc/roman-platform
+    platform_storage_root: /srv/apps/roman-platform
+    platform_repo_root: "{{ playbook_dir }}/../.."
+    nginx_site_file: /etc/nginx/conf.d/roman-platform-smoke.conf
+    nginx_route_file: /etc/roman-platform/nginx/active-smoke.conf
+
+  tasks:
+    - name: Require a dedicated Ed25519 deployment public key
+      ansible.builtin.assert:
+        that:
+          - deploy_public_key is defined
+          - deploy_public_key is match('^ssh-ed25519 [A-Za-z0-9+/=]+')
+        fail_msg: Pass only the deployment public key; never put a private key in this playbook.
+
+    - name: Require the applications SSD mount
+      ansible.builtin.assert:
+        that:
+          - ansible_mounts | selectattr('mount', 'equalto', '/srv/apps') | list | length == 1
+        fail_msg: /srv/apps is not mounted; no controller files will be installed.
+
+    - name: Read service state
+      ansible.builtin.service_facts:
+
+    - name: Require the existing Docker and Nginx services
+      ansible.builtin.assert:
+        that:
+          - ansible_facts.services['docker.service'] is defined
+          - ansible_facts.services['docker.service'].state == 'running'
+          - ansible_facts.services['nginx.service'] is defined
+          - ansible_facts.services['nginx.service'].state == 'running'
+        fail_msg: Docker or Nginx is not healthy; install stopped before changing either service.
+
+    - name: Read the configured Docker data root
+      ansible.builtin.command:
+        argv:
+          - docker
+          - info
+          - --format
+          - "{{ '{{.DockerRootDir}}' }}"
+      register: docker_root
+      changed_when: false
+
+    - name: Require Docker storage on the applications SSD
+      ansible.builtin.assert:
+        that:
+          - docker_root.stdout is match('^/srv/apps(/|$)')
+        fail_msg: Docker data is not on /srv/apps; controller installation is blocked.
+
+    - name: Check whether this private listener is already managed
+      ansible.builtin.stat:
+        path: "{{ nginx_site_file }}"
+      register: platform_nginx_site
+
+    - name: Check whether the private listener port is already occupied
+      ansible.builtin.command:
+        argv:
+          - ss
+          - -ltnH
+          - sport
+          - =
+          - :18080
+      register: listener_check
+      changed_when: false
+      failed_when: false
+
+    - name: Refuse to claim an unrelated listener
+      ansible.builtin.assert:
+        that:
+          - listener_check.stdout | trim == '' or platform_nginx_site.stat.exists
+        fail_msg: Port 18080 is already in use and is not managed by this platform.
+
+    - name: Create root-owned controller directories
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "{{ item.mode }}"
+      loop:
+        - { path: "{{ platform_root }}/bin", mode: "0755" }
+        - { path: "{{ platform_root }}/controller", mode: "0755" }
+        - { path: "{{ platform_config_dir }}/nginx", mode: "0750" }
+        - { path: "{{ platform_storage_root }}/state", mode: "0750" }
+        - { path: "{{ platform_storage_root }}/logs", mode: "0750" }
+        - { path: "{{ platform_storage_root }}/metrics", mode: "0750" }
+        - { path: /run/roman-platform, mode: "0700" }
+        - { path: /run/lock/roman-platform, mode: "0750" }
+
+    - name: Install the Python controller
+      ansible.builtin.copy:
+        src: "{{ platform_repo_root }}/deploy/controller/roman_deploy.py"
+        dest: "{{ platform_root }}/controller/roman_deploy.py"
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Install the restricted command wrapper
+      ansible.builtin.copy:
+        src: "{{ platform_repo_root }}/deploy/controller/bin/roman-deploy"
+        dest: "{{ platform_root }}/bin/roman-deploy"
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Install the server allowlist
+      ansible.builtin.copy:
+        src: "{{ platform_repo_root }}/platform/applications.json"
+        dest: "{{ platform_config_dir }}/applications.json"
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Create the restricted deployment account
+      ansible.builtin.user:
+        name: roman-deploy
+        comment: Restricted Roman platform deploy request account
+        system: true
+        create_home: true
+        home: /var/lib/roman-deploy
+        shell: /bin/sh
+        password_lock: true
+        state: present
+
+    - name: Create the deployment account SSH directory
+      ansible.builtin.file:
+        path: /var/lib/roman-deploy/.ssh
+        state: directory
+        owner: roman-deploy
+        group: roman-deploy
+        mode: "0700"
+
+    - name: Install the forced-command deployment public key
+      ansible.builtin.template:
+        src: templates/authorized_keys.j2
+        dest: /var/lib/roman-deploy/.ssh/authorized_keys
+        owner: roman-deploy
+        group: roman-deploy
+        mode: "0600"
+
+    - name: Install the single-command sudo rule
+      ansible.builtin.copy:
+        dest: /etc/sudoers.d/roman-platform-deploy
+        owner: root
+        group: root
+        mode: "0440"
+        content: "roman-deploy ALL=(root) NOPASSWD: {{ platform_root }}/bin/roman-deploy --ssh\n"
+        validate: /usr/sbin/visudo -cf %s
+
+    - name: Create a closed route before any application is deployed
+      ansible.builtin.copy:
+        dest: "{{ nginx_route_file }}"
+        content: "return 503;\n"
+        owner: root
+        group: root
+        mode: "0644"
+        force: false
+
+    - name: Install an isolated loopback-only Nginx listener
+      ansible.builtin.template:
+        src: templates/roman-platform-smoke.conf.j2
+        dest: "{{ nginx_site_file }}"
+        owner: root
+        group: root
+        mode: "0644"
+      notify: Reload Roman platform Nginx
+
+  handlers:
+    - name: Validate Nginx configuration
+      ansible.builtin.command: nginx -t
+      listen: Reload Roman platform Nginx
+
+    - name: Reload Nginx without restarting it
+      ansible.builtin.service:
+        name: nginx
+        state: reloaded
+      listen: Reload Roman platform Nginx

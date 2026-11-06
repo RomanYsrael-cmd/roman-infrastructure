@@ -1,0 +1,49 @@
+name: Roman platform smoke deployment
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: Choose DEPLOY SMOKE or ROLLBACK SMOKE to authorize one isolated operation
+        required: true
+        type: choice
+        options:
+          - CANCEL
+          - DEPLOY SMOKE
+          - ROLLBACK SMOKE
+
+permissions:
+  contents: read
+  actions: read
+  packages: write
+
+jobs:
+  smoke-deploy:
+    if: >-
+      github.repository == 'RomanYsrael-cmd/roman-lms' &&
+      github.event_name == 'workflow_dispatch' &&
+      github.ref == 'refs/heads/main' &&
+      inputs.confirmation == 'DEPLOY SMOKE'
+    uses: RomanYsrael-cmd/roman-infrastructure/.github/workflows/romanlms-smoke-deploy.yml@PLATFORM_COMMIT_SHA_TO_SET
+    with:
+      confirmation: ${{ inputs.confirmation }}
+      operation: deploy
+      platform_ref: PLATFORM_COMMIT_SHA_TO_SET
+    secrets:
+      ROMAN_PLATFORM_SSH_PRIVATE_KEY: ${{ secrets.ROMAN_PLATFORM_SSH_PRIVATE_KEY }}
+      ROMAN_PLATFORM_SSH_KNOWN_HOSTS: ${{ secrets.ROMAN_PLATFORM_SSH_KNOWN_HOSTS }}
+
+  smoke-rollback:
+    if: >-
+      github.repository == 'RomanYsrael-cmd/roman-lms' &&
+      github.event_name == 'workflow_dispatch' &&
+      github.ref == 'refs/heads/main' &&
+      inputs.confirmation == 'ROLLBACK SMOKE'
+    uses: RomanYsrael-cmd/roman-infrastructure/.github/workflows/romanlms-smoke-deploy.yml@PLATFORM_COMMIT_SHA_TO_SET
+    with:
+      confirmation: ROLLBACK SMOKE
+      operation: rollback
+      platform_ref: PLATFORM_COMMIT_SHA_TO_SET
+    secrets:
+      ROMAN_PLATFORM_SSH_PRIVATE_KEY: ${{ secrets.ROMAN_PLATFORM_SSH_PRIVATE_KEY }}
+      ROMAN_PLATFORM_SSH_KNOWN_HOSTS: ${{ secrets.ROMAN_PLATFORM_SSH_KNOWN_HOSTS }}

@@ -1,0 +1,54 @@
+{
+  "schema_version": 1,
+  "applications": {
+    "platform-smoke": {
+      "app_id": "platform-smoke",
+      "repository": "RomanYsrael-cmd/roman-lms",
+      "workflow_repository": "RomanYsrael-cmd/roman-lms",
+      "workflow_path": ".github/workflows/roman-platform-smoke.yml",
+      "reusable_workflow_path": "RomanYsrael-cmd/roman-infrastructure/.github/workflows/romanlms-smoke-deploy.yml",
+      "authorized_actors": [
+        "RomanYsrael-cmd"
+      ],
+      "allowed_platform_shas": [],
+      "workflow_event": "workflow_dispatch",
+      "production_branch": "main",
+      "environment": "production",
+      "strategy": "blue-green",
+      "image_namespace": "ghcr.io/romanysrael-cmd/roman-lms-platform-smoke",
+      "image_source_repository": "RomanYsrael-cmd/roman-infrastructure",
+      "required_mounts": [
+        "/srv/apps"
+      ],
+      "docker_root_prefix": "/srv/apps",
+      "storage_root": "/srv/apps/roman-platform",
+      "minimum_free_gib": 10,
+      "minimum_cpu_cores": 2,
+      "minimum_available_memory_mb": 768,
+      "required_services": [
+        "docker.service",
+        "nginx.service"
+      ],
+      "backup_marker": null,
+      "backup_max_age_hours": 24,
+      "runtime_tmp_dir": "/run/roman-platform",
+      "lock_dir": "/run/lock/roman-platform",
+      "state_file": "/srv/apps/roman-platform/state/platform-smoke.json",
+      "history_file": "/srv/apps/roman-platform/logs/deployments.jsonl",
+      "metrics_file": "/srv/apps/roman-platform/metrics/roman-platform.prom",
+      "route_file": "/etc/roman-platform/nginx/active-smoke.conf",
+      "route_health_url": "http://127.0.0.1:18080/health",
+      "slot_ports": {
+        "blue": 19081,
+        "green": 19082
+      },
+      "container_port": 8080,
+      "container_memory": "256m",
+      "container_cpus": 1.0,
+      "pids_limit": 64,
+      "health_path": "/health",
+      "expected_health_text": "\"status\":\"ok\"",
+      "readiness_timeout_seconds": 45
+    }
+  }
+}

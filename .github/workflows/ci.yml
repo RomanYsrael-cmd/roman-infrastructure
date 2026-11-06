@@ -1,0 +1,71 @@
+name: Roman Infrastructure CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: roman-infrastructure-ci
+  cancel-in-progress: false
+
+jobs:
+  validate-and-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+
+      - name: Run controller policy and failure-gate tests
+        run: |
+          python3 -m compileall -q deploy/controller deploy/tests app/smoke
+          python3 -m unittest discover -s deploy/tests -v
+          python3 -m json.tool platform/applications.json >/dev/null
+
+      - name: Validate the opt-in Ansible bootstrap syntax
+        run: |
+          python3 -m pip install --disable-pip-version-check --no-input ansible-core==2.22.0
+          ansible-playbook --syntax-check -i 'roman_servers,' deploy/ansible/install.yml
+
+      - name: Build and smoke-test the HTTP candidate on loopback
+        run: |
+          set -euo pipefail
+          image=roman-infrastructure-smoke:ci
+          container=roman-infrastructure-smoke-ci
+          cleanup() { docker rm -f "$container" >/dev/null 2>&1 || true; }
+          trap cleanup EXIT
+          docker buildx build --load \
+            --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --build-arg "SOURCE_REPO=https://github.com/$GITHUB_REPOSITORY" \
+            --build-arg "REVISION=$GITHUB_SHA" \
+            --tag "$image" app/smoke
+          docker run --detach --name "$container" --read-only \
+            --tmpfs /tmp:rw,nosuid,nodev,noexec,size=8m \
+            --cap-drop ALL --security-opt no-new-privileges:true \
+            --publish 127.0.0.1:18180:8080 "$image" >/dev/null
+          python3 - <<'PY'
+          import json
+          import time
+          import urllib.request
+
+          url = "http://127.0.0.1:18180/health"
+          deadline = time.monotonic() + 30
+          while time.monotonic() < deadline:
+              try:
+                  with urllib.request.urlopen(url, timeout=2) as response:
+                      body = json.load(response)
+                      if response.status == 200 and body.get("status") == "ok":
+                          print("Loopback health check passed.")
+                          break
+              except Exception:
+                  time.sleep(1)
+          else:
+              raise SystemExit("Smoke service did not become healthy.")
+          PY

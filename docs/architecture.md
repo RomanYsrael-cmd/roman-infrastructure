@@ -1,0 +1,32 @@
+# Deployment architecture
+
+## Release path
+
+The central repository provides controller code and shared policy. RomanLMS keeps its language-specific builds and tests. Its existing self-hosted runner remains registered only to RomanLMS and is selected by the label set self-hosted, Windows, X64, roman-laptop.
+
+An operator manually starts the smoke workflow from RomanLMS main and selects DEPLOY SMOKE. The workflow calls this repository's reusable workflow at a full commit SHA. The job refuses any other repository, branch, or event. It uses the existing laptop runner, verifies Docker Desktop's Linux engine and Tailscale, builds and health-checks the test image, publishes the image under the RomanLMS GHCR namespace, then submits its immutable digest to roman-server over Tailscale SSH.
+
+The server accepts only a dedicated public key with a forced command, no PTY, and no forwarding. That command invokes the root-owned controller through one exact sudo rule. The controller validates the workflow run via the GitHub API, checks the main commit and pinned reusable workflow, and accepts only the application and GHCR namespace in its root-owned policy.
+
+## Server release behavior
+
+The smoke application has two loopback-only container slots. The candidate starts on the inactive slot and must answer its health URL before Nginx changes. Nginx listens for this route only on 127.0.0.1:18080; it does not add a Cloudflare route, public DNS record, or production hostname. If Nginx validation or the routed health check fails, the previous include file is restored and the candidate is removed. The controller retains the previous healthy container for a later rollback.
+
+The controller rejects deployment if /srv/apps is not a mount, Docker stores data outside /srv/apps, free disk or memory is below policy, required services are down, a required backup marker is stale, or another deployment holds the application lock. These checks fail closed. The smoke application has no database or persistent application data.
+
+The controller writes an audit JSONL record, active/previous revision state, and a Prometheus textfile metric on the applications SSD. No existing monitoring configuration is replaced. The node-exporter textfile collector path still needs confirmation on the live server before claiming those metrics are scraped.
+
+## Trust boundaries
+
+- Public pull-request CI runs only on GitHub-hosted runners with a read-only token.
+- RomanLMS keeps its existing runner scope. This repository does not request runner sharing or registration.
+- The production caller is workflow_dispatch only from RomanLMS main, restricted to the repository owner account, and requires the explicit deployment or rollback confirmation choice.
+- The deploy job receives only contents:read, actions:read, and packages:write in its short-lived GITHUB_TOKEN.
+- The SSH private key and host key are workflow secrets; they never belong in this repository.
+- The server receives the GitHub token only inside the encrypted SSH request and uses a temporary Docker configuration that is deleted after the pull.
+- The request cannot name shell commands, file paths, compose files, ports, container arguments, or arbitrary images.
+- The application and image are allowlisted on the server; remote inputs cannot select a different application policy.
+
+## Main branch policy
+
+The direct user instruction requires main to remain unprotected because of cost. The repository is public and has no branch ruleset. No branch protection is created. The separate manual deploy dispatch does not protect main from direct pushes and is not presented as equivalent to branch protection.

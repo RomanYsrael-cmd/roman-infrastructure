@@ -1,0 +1,313 @@
+name: Reusable RomanLMS smoke deployment
+
+on:
+  workflow_call:
+    inputs:
+      confirmation:
+        description: Exact manual authorization phrase from the caller workflow
+        required: true
+        type: string
+      operation:
+        description: Deploy a test release or roll back to the retained previous release
+        required: true
+        type: string
+      platform_ref:
+        description: Full commit SHA of this infrastructure workflow and controller
+        required: true
+        type: string
+    secrets:
+      ROMAN_PLATFORM_SSH_PRIVATE_KEY:
+        required: false
+      ROMAN_PLATFORM_SSH_KNOWN_HOSTS:
+        required: false
+
+permissions:
+  contents: read
+  actions: read
+  packages: write
+
+concurrency:
+  group: roman-platform-production
+  cancel-in-progress: false
+
+jobs:
+  deploy-smoke:
+    if: >-
+      github.repository == 'RomanYsrael-cmd/roman-lms' &&
+      github.actor == 'RomanYsrael-cmd' &&
+      github.event_name == 'workflow_dispatch' &&
+      github.ref == 'refs/heads/main' &&
+      inputs.operation == 'deploy' &&
+      inputs.confirmation == 'DEPLOY SMOKE'
+    runs-on: [self-hosted, Windows, X64, roman-laptop]
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      PLATFORM_REF: ${{ inputs.platform_ref }}
+      IMAGE: ghcr.io/romanysrael-cmd/roman-lms-platform-smoke
+    steps:
+      - name: Check out the caller repository at its dispatched commit
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          ref: ${{ github.sha }}
+          path: roman-lms
+          persist-credentials: false
+
+      - name: Check out the pinned infrastructure controller and smoke image
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          repository: RomanYsrael-cmd/roman-infrastructure
+          ref: ${{ inputs.platform_ref }}
+          path: platform
+          token: ${{ github.token }}
+          persist-credentials: false
+
+      - name: Validate authorization, runner prerequisites, and private network
+        env:
+          PLATFORM_SSH_PRIVATE_KEY: ${{ secrets.ROMAN_PLATFORM_SSH_PRIVATE_KEY }}
+          PLATFORM_SSH_KNOWN_HOSTS: ${{ secrets.ROMAN_PLATFORM_SSH_KNOWN_HOSTS }}
+        run: |
+          if ($env:GITHUB_REPOSITORY -ne 'RomanYsrael-cmd/roman-lms' -or
+              $env:GITHUB_REF -ne 'refs/heads/main' -or
+              $env:GITHUB_EVENT_NAME -ne 'workflow_dispatch') {
+            throw 'Only a manually dispatched RomanLMS main workflow can deploy.'
+          }
+          if ($env:PLATFORM_REF -notmatch '^[0-9a-f]{40}$') {
+            throw 'The infrastructure workflow must be pinned to a full commit SHA.'
+          }
+          if ([string]::IsNullOrWhiteSpace($env:PLATFORM_SSH_PRIVATE_KEY) -or
+              [string]::IsNullOrWhiteSpace($env:PLATFORM_SSH_KNOWN_HOSTS)) {
+            throw 'Configure the dedicated deployment SSH key and verified server host key as repository secrets.'
+          }
+          $dockerOs = (& docker info --format '{{.OSType}}' 2>$null).Trim()
+          if ($LASTEXITCODE -ne 0 -or $dockerOs -ne 'linux') {
+            throw 'Docker Desktop Linux engine is unavailable; no deployment was attempted.'
+          }
+          $tailscalePath = 'C:\Program Files\Tailscale\tailscale.exe'
+          if (-not (Test-Path -LiteralPath $tailscalePath)) {
+            throw 'Tailscale is not installed on the existing RomanLMS laptop runner.'
+          }
+          $status = (& $tailscalePath status --json | ConvertFrom-Json)
+          if ($status.BackendState -ne 'Running') {
+            throw 'Tailscale is not connected on the existing laptop runner.'
+          }
+          $server = $status.Peer.PSObject.Properties.Value |
+            Where-Object { $_.HostName -eq 'roman-server' -and $_.Online } |
+            Select-Object -First 1
+          if (-not $server -or $server.TailscaleIPs -notcontains '100.67.102.11') {
+            throw 'roman-server is not reachable on its approved Tailscale address.'
+          }
+          if (-not (Test-NetConnection -ComputerName 100.67.102.11 -Port 22 -InformationLevel Quiet)) {
+            throw 'The private SSH port is unavailable; deployment stopped before any server change.'
+          }
+
+      - name: Test policy and health-check a local image on loopback
+        run: |
+          $ErrorActionPreference = 'Stop'
+          python -m unittest discover -s platform/deploy/tests -v
+          $tag = $env:IMAGE + ':sha-' + $env:GITHUB_SHA
+          $candidate = 'roman-platform-smoke-ci-' + $env:GITHUB_RUN_ID
+          $buildArgs = @(
+            'buildx', 'build', '--load',
+            '--label', 'org.opencontainers.image.source=https://github.com/RomanYsrael-cmd/roman-infrastructure',
+            '--label', "org.opencontainers.image.revision=$env:PLATFORM_REF",
+            '--label', "io.roman.platform.source-revision=$env:PLATFORM_REF",
+            '--build-arg', 'SOURCE_REPO=https://github.com/RomanYsrael-cmd/roman-infrastructure',
+            '--build-arg', "REVISION=$env:PLATFORM_REF",
+            '--build-arg', "PLATFORM_REF=$env:PLATFORM_REF",
+            '--tag', $tag, 'platform/app/smoke'
+          )
+          & docker @buildArgs
+          if ($LASTEXITCODE -ne 0) { throw 'Docker image build failed.' }
+          try {
+            $runArgs = @(
+              'run', '--detach', '--name', $candidate, '--read-only',
+              '--tmpfs', '/tmp:rw,nosuid,nodev,noexec,size=8m',
+              '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges:true',
+              '--publish', '127.0.0.1::8080', $tag
+            )
+            & docker @runArgs | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw 'Local candidate container failed to start.' }
+            $mapping = (& docker port $candidate '8080/tcp').Trim()
+            if ($mapping -notmatch '127\.0\.0\.1:(\d+)$') { throw 'Candidate did not bind to loopback only.' }
+            $url = 'http://127.0.0.1:' + $Matches[1] + '/health'
+            $healthy = $false
+            $deadline = (Get-Date).AddSeconds(30)
+            while ((Get-Date) -lt $deadline) {
+              try {
+                $health = Invoke-RestMethod -Uri $url -TimeoutSec 2
+                if ($health.status -eq 'ok') { $healthy = $true; break }
+              } catch { Start-Sleep -Seconds 1 }
+            }
+            if (-not $healthy) { throw 'The built image failed its loopback health check.' }
+          } finally {
+            & docker rm -f $candidate 2>$null | Out-Null
+          }
+
+      - id: publish
+        name: Publish the tested image and resolve its immutable GHCR digest
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dockerConfig = Join-Path $env:RUNNER_TEMP ('roman-platform-docker-' + $env:GITHUB_RUN_ID)
+          New-Item -ItemType Directory -Path $dockerConfig -Force | Out-Null
+          $env:DOCKER_CONFIG = $dockerConfig
+          $tag = $env:IMAGE + ':sha-' + $env:GITHUB_SHA
+          try {
+            $env:GH_TOKEN | & docker login ghcr.io --username $env:GITHUB_ACTOR --password-stdin
+            if ($LASTEXITCODE -ne 0) { throw 'GHCR authentication failed.' }
+            & docker push $tag
+            if ($LASTEXITCODE -ne 0) { throw 'GHCR image publishing failed.' }
+            & docker pull $tag
+            if ($LASTEXITCODE -ne 0) { throw 'Published GHCR image could not be pulled.' }
+            $repoDigest = (& docker image inspect --format '{{index .RepoDigests 0}}' $tag).Trim()
+            if ($repoDigest -notmatch ('^' + [regex]::Escape($env:IMAGE) + '@(sha256:[0-9a-f]{64})$')) {
+              throw 'GHCR did not return an immutable image digest.'
+            }
+            $digest = $Matches[1]
+            $immutableImage = $env:IMAGE + '@' + $digest
+            $labels = (& docker image inspect --format '{{json .Config.Labels}}' $immutableImage | ConvertFrom-Json)
+            if ($labels.'org.opencontainers.image.revision' -ne $env:PLATFORM_REF -or
+                $labels.'org.opencontainers.image.source' -ne 'https://github.com/RomanYsrael-cmd/roman-infrastructure' -or
+                $labels.'io.roman.platform.source-revision' -ne $env:PLATFORM_REF) {
+              throw 'Published image labels do not match the dispatched and pinned commits.'
+            }
+            Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value ('digest=' + $digest)
+            Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value ('Published and health-checked ' + $immutableImage)
+          } finally {
+            & docker logout ghcr.io 2>$null | Out-Null
+            Remove-Item -LiteralPath $dockerConfig -Recurse -Force -ErrorAction SilentlyContinue
+          }
+
+      - name: Submit the approved digest through restricted Tailscale SSH
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PLATFORM_SSH_PRIVATE_KEY: ${{ secrets.ROMAN_PLATFORM_SSH_PRIVATE_KEY }}
+          PLATFORM_SSH_KNOWN_HOSTS: ${{ secrets.ROMAN_PLATFORM_SSH_KNOWN_HOSTS }}
+          IMAGE_DIGEST: ${{ steps.publish.outputs.digest }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:IMAGE_DIGEST -notmatch '^sha256:[0-9a-f]{64}$') {
+            throw 'The publishing step did not provide a valid immutable digest.'
+          }
+          $immutableImage = $env:IMAGE + '@' + $env:IMAGE_DIGEST
+          $knownHostsPath = Join-Path $env:RUNNER_TEMP ('roman-platform-known-hosts-' + $env:GITHUB_RUN_ID)
+          $keyPath = Join-Path $env:RUNNER_TEMP ('roman-platform-deploy-key-' + $env:GITHUB_RUN_ID)
+          try {
+            $utf8 = [System.Text.UTF8Encoding]::new($false)
+            [System.IO.File]::WriteAllText($knownHostsPath, $env:PLATFORM_SSH_KNOWN_HOSTS.Trim() + [Environment]::NewLine, $utf8)
+            [System.IO.File]::WriteAllText($keyPath, $env:PLATFORM_SSH_PRIVATE_KEY.Trim() + [Environment]::NewLine, $utf8)
+            & icacls.exe $keyPath /inheritance:r /grant:r "$($env:USERNAME):(F)" | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw 'Could not restrict deployment-key file permissions.' }
+            & ssh-keygen.exe -F '100.67.102.11' -f $knownHostsPath | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw 'The configured host key does not pin roman-server at 100.67.102.11.' }
+            $request = @{
+              operation = 'deploy'
+              app_id = 'platform-smoke'
+              repository = $env:GITHUB_REPOSITORY
+              branch = 'main'
+              commit_sha = $env:GITHUB_SHA
+              workflow_sha = $env:GITHUB_SHA
+              platform_sha = $env:PLATFORM_REF
+              environment = 'production'
+              strategy = 'blue-green'
+              image = $immutableImage
+              github_token = $env:GH_TOKEN
+              registry_token = $env:GH_TOKEN
+              release = @{
+                run_id = $env:GITHUB_RUN_ID
+                run_attempt = $env:GITHUB_RUN_ATTEMPT
+                actor = $env:GITHUB_ACTOR
+              }
+            } | ConvertTo-Json -Depth 5 -Compress
+            $request | & ssh.exe -i $keyPath -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o "UserKnownHostsFile=$knownHostsPath" roman-deploy@100.67.102.11
+            if ($LASTEXITCODE -ne 0) { throw 'The restricted deployment controller rejected the request.' }
+          } finally {
+            Remove-Item -LiteralPath $keyPath, $knownHostsPath -Force -ErrorAction SilentlyContinue
+          }
+
+  rollback-smoke:
+    if: >-
+      github.repository == 'RomanYsrael-cmd/roman-lms' &&
+      github.actor == 'RomanYsrael-cmd' &&
+      github.event_name == 'workflow_dispatch' &&
+      github.ref == 'refs/heads/main' &&
+      inputs.operation == 'rollback' &&
+      inputs.confirmation == 'ROLLBACK SMOKE'
+    runs-on: [self-hosted, Windows, X64, roman-laptop]
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      PLATFORM_REF: ${{ inputs.platform_ref }}
+    steps:
+      - name: Validate rollback authorization and private network
+        env:
+          PLATFORM_SSH_PRIVATE_KEY: ${{ secrets.ROMAN_PLATFORM_SSH_PRIVATE_KEY }}
+          PLATFORM_SSH_KNOWN_HOSTS: ${{ secrets.ROMAN_PLATFORM_SSH_KNOWN_HOSTS }}
+        run: |
+          if ($env:GITHUB_REPOSITORY -ne 'RomanYsrael-cmd/roman-lms' -or
+              $env:GITHUB_REF -ne 'refs/heads/main' -or
+              $env:GITHUB_EVENT_NAME -ne 'workflow_dispatch') {
+            throw 'Only a manually dispatched RomanLMS main workflow can request rollback.'
+          }
+          if ($env:PLATFORM_REF -notmatch '^[0-9a-f]{40}$' -or
+              [string]::IsNullOrWhiteSpace($env:PLATFORM_SSH_PRIVATE_KEY) -or
+              [string]::IsNullOrWhiteSpace($env:PLATFORM_SSH_KNOWN_HOSTS)) {
+            throw 'Pinned workflow or deployment credentials are missing.'
+          }
+          $tailscalePath = 'C:\Program Files\Tailscale\tailscale.exe'
+          if (-not (Test-Path -LiteralPath $tailscalePath)) { throw 'Tailscale is unavailable.' }
+          $status = (& $tailscalePath status --json | ConvertFrom-Json)
+          if ($status.BackendState -ne 'Running') { throw 'Tailscale is not connected.' }
+          $server = $status.Peer.PSObject.Properties.Value |
+            Where-Object { $_.HostName -eq 'roman-server' -and $_.Online } |
+            Select-Object -First 1
+          if (-not $server -or $server.TailscaleIPs -notcontains '100.67.102.11') {
+            throw 'roman-server is not online at its approved Tailscale address.'
+          }
+          if (-not (Test-NetConnection -ComputerName 100.67.102.11 -Port 22 -InformationLevel Quiet)) {
+            throw 'The private SSH port is unavailable.'
+          }
+
+      - name: Ask the server to restore the retained healthy release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PLATFORM_SSH_PRIVATE_KEY: ${{ secrets.ROMAN_PLATFORM_SSH_PRIVATE_KEY }}
+          PLATFORM_SSH_KNOWN_HOSTS: ${{ secrets.ROMAN_PLATFORM_SSH_KNOWN_HOSTS }}
+        run: |
+          $knownHostsPath = Join-Path $env:RUNNER_TEMP ('roman-platform-known-hosts-' + $env:GITHUB_RUN_ID)
+          $keyPath = Join-Path $env:RUNNER_TEMP ('roman-platform-deploy-key-' + $env:GITHUB_RUN_ID)
+          try {
+            $utf8 = [System.Text.UTF8Encoding]::new($false)
+            [System.IO.File]::WriteAllText($knownHostsPath, $env:PLATFORM_SSH_KNOWN_HOSTS.Trim() + [Environment]::NewLine, $utf8)
+            [System.IO.File]::WriteAllText($keyPath, $env:PLATFORM_SSH_PRIVATE_KEY.Trim() + [Environment]::NewLine, $utf8)
+            & icacls.exe $keyPath /inheritance:r /grant:r "$($env:USERNAME):(F)" | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw 'Could not restrict deployment-key file permissions.' }
+            & ssh-keygen.exe -F '100.67.102.11' -f $knownHostsPath | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw 'The configured host key does not pin roman-server.' }
+            $request = @{
+              operation = 'rollback'
+              app_id = 'platform-smoke'
+              repository = $env:GITHUB_REPOSITORY
+              branch = 'main'
+              commit_sha = $env:GITHUB_SHA
+              workflow_sha = $env:GITHUB_SHA
+              platform_sha = $env:PLATFORM_REF
+              environment = 'production'
+              github_token = $env:GH_TOKEN
+              release = @{
+                run_id = $env:GITHUB_RUN_ID
+                run_attempt = $env:GITHUB_RUN_ATTEMPT
+                actor = $env:GITHUB_ACTOR
+              }
+            } | ConvertTo-Json -Depth 5 -Compress
+            $request | & ssh.exe -i $keyPath -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o "UserKnownHostsFile=$knownHostsPath" roman-deploy@100.67.102.11
+            if ($LASTEXITCODE -ne 0) { throw 'The restricted deployment controller rejected the rollback request.' }
+          } finally {
+            Remove-Item -LiteralPath $keyPath, $knownHostsPath -Force -ErrorAction SilentlyContinue
+          }
