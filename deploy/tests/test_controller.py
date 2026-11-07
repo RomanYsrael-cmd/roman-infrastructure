@@ -159,7 +159,7 @@ class WorkflowOriginTests(unittest.TestCase):
                 "head_sha": WORKFLOW_SHA,
                 "run_attempt": 1,
                 "actor": {"login": "RomanYsrael-cmd"},
-                "path": APP["workflow_path"] + "@refs/heads/main",
+                "path": APP["workflow_path"],
                 "referenced_workflows": [{
                     "path": APP["reusable_workflow_path"] + "@" + WORKFLOW_SHA,
                     "sha": WORKFLOW_SHA,
@@ -179,6 +179,14 @@ class WorkflowOriginTests(unittest.TestCase):
         value = request()
         responses = self._responses()
         responses[0]["event"] = "pull_request"
+        with mock.patch.object(deploy, "github_json", side_effect=responses):
+            with self.assertRaisesRegex(deploy.DeploymentError, "authorized in-progress"):
+                deploy.verify_release_origin(value, self.app)
+
+    def test_rejects_a_different_workflow_file(self):
+        value = request()
+        responses = self._responses()
+        responses[0]["path"] = ".github/workflows/other.yml"
         with mock.patch.object(deploy, "github_json", side_effect=responses):
             with self.assertRaisesRegex(deploy.DeploymentError, "authorized in-progress"):
                 deploy.verify_release_origin(value, self.app)

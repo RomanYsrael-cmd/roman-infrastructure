@@ -132,7 +132,7 @@ def verify_release_origin(request: dict[str, Any], app: dict[str, Any]) -> None:
         f"actions/runs/{run_id}",
         request["github_token"],
     )
-    expected_path = app["workflow_path"] + "@"
+    expected_path = app["workflow_path"]
     actor = run.get("actor") or {}
     actor_login = actor.get("login") if isinstance(actor, dict) else None
     workflow_refs = run.get("referenced_workflows") or []
@@ -151,7 +151,7 @@ def verify_release_origin(request: dict[str, Any], app: dict[str, Any]) -> None:
         or run.get("run_attempt") != int(request["release"]["run_attempt"])
         or actor_login != request["release"]["actor"]
         or actor_login not in app.get("authorized_actors", [])
-        or not str(run.get("path", "")).startswith(expected_path)
+        or run.get("path") != expected_path
         or not reusable_is_pinned
     ):
         raise DeploymentError("Workflow run is not an authorized in-progress production release.")
