@@ -279,6 +279,8 @@ class GrafanaAlertProvisioningTests(unittest.TestCase):
         rules = grafana_alerts.desired_rules("alerts-folder")
         self.assertEqual(len(rules), 2)
         self.assertTrue(all(item["metadata"]["labels"]["grafana.app/folder"] == "alerts-folder" for item in rules))
+        self.assertTrue(all("grafana.com/group" not in item["metadata"]["labels"] for item in rules))
+        self.assertTrue(all("grafana.com/group-index" not in item["metadata"]["labels"] for item in rules))
         self.assertTrue(all(item["spec"]["labels"]["severity"] == "warning" for item in rules))
         self.assertIn('outcome="failure"', rules[0]["spec"]["expressions"]["A"]["model"]["expr"])
         self.assertIn("bool 120", rules[1]["spec"]["expressions"]["A"]["model"]["expr"])

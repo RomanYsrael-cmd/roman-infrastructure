@@ -16,7 +16,6 @@ from typing import Any
 GRAFANA_URL = "http://127.0.0.1:3000"
 GRAFANA_PASSWORD_FILE = Path("/etc/roman-platform/secrets/grafana_admin_password")
 FOLDER_TITLE = "Roman Infrastructure Alerts"
-GROUP_NAME = "Roman Platform Deployment"
 CONTACT_POINT_NAME = "Roman Infrastructure Telegram"
 DATASOURCE_UID = "prometheus"
 NAMESPACE = "default"
@@ -86,7 +85,6 @@ def _rule_resource(
     query: str,
     summary: str,
     description: str,
-    group_index: int,
 ) -> dict[str, Any]:
     return {
         "apiVersion": "rules.alerting.grafana.app/v1beta1",
@@ -96,8 +94,6 @@ def _rule_resource(
             "namespace": NAMESPACE,
             "labels": {
                 "grafana.app/folder": folder_uid,
-                "grafana.com/group": GROUP_NAME,
-                "grafana.com/group-index": str(group_index),
             },
         },
         "spec": {
@@ -146,7 +142,6 @@ def desired_rules(folder_uid: str) -> list[dict[str, Any]]:
                 "{{ $labels.request_sha }} did not complete. The active route was retained. "
                 "Review /srv/apps/roman-platform/logs/deployments.jsonl on roman-server."
             ),
-            group_index=0,
         ),
         _rule_resource(
             name="roman-platform-deploy-succeeded",
@@ -162,7 +157,6 @@ def desired_rules(folder_uid: str) -> list[dict[str, Any]]:
                 "{{ $labels.request_sha }} passed its health gate. The short success "
                 "notification resolves automatically after two minutes."
             ),
-            group_index=1,
         ),
     ]
 
@@ -206,7 +200,6 @@ def _matches(current: dict[str, Any], desired: dict[str, Any]) -> bool:
     return (
         metadata.get("labels", {}).get("grafana.app/folder")
         == desired["metadata"]["labels"]["grafana.app/folder"]
-        and metadata.get("labels", {}).get("grafana.com/group") == GROUP_NAME
         and spec.get("title") == wanted["title"]
         and spec.get("trigger") == wanted["trigger"]
         and spec.get("labels") == wanted["labels"]
