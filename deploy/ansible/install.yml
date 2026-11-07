@@ -131,6 +131,14 @@
         group: root
         mode: "0755"
 
+    - name: Install the pre-sudo forced-command gate
+      ansible.builtin.copy:
+        src: "{{ platform_repo_root }}/deploy/controller/bin/roman-deploy-ssh"
+        dest: "{{ platform_root }}/bin/roman-deploy-ssh"
+        owner: root
+        group: root
+        mode: "0755"
+
     - name: Install the idempotent deployment alert provisioner
       ansible.builtin.copy:
         src: "{{ platform_repo_root }}/deploy/monitoring/provision_grafana_alerts.py"

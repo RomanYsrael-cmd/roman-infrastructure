@@ -2,13 +2,13 @@
 
 RomanLMS production restoration and cutover remain out of scope for this deployment phase.
 
-The current private RomanLMS repository has one active workflow, RomanLMS CI, on main. It uses the existing self-hosted Windows runner, a same-repository owner-authored pull request gate, read-only contents permissions, pinned language setup actions, and deployment contract tests. It has no deployment workflow. The latest recorded run failed in its required-check aggregation; see the Actions run and logs before relying on it as a release signal.
+The current private RomanLMS repository runs RomanLMS CI on main using the existing self-hosted Windows runner, a same-repository owner-authored pull request gate, read-only contents permissions, pinned language setup actions, and deployment contract tests. The deployment caller has been added, but its current full SHA is not approved by the server policy. Latest run [42317669874](https://github.com/RomanYsrael-cmd/roman-lms/actions/runs/42317669874) failed because backend PostgreSQL/Testcontainers and Android checks failed; deployment contract and workflow security checks passed. Keep the deploy gate closed until the checks pass.
 
 Before a RomanLMS production release:
 
-- Re-enable and verify the existing laptop runner; do not move or replace it.
-- Restore the Docker Desktop Linux engine and verify its storage reserve.
-- Confirm the current CI aggregate failure and any skipped Docker/Testcontainers checks.
+- Keep the existing laptop runner scoped to RomanLMS; do not move or replace it.
+- Keep the Docker Desktop Linux engine available and verify its storage reserve.
+- Resolve the current CI failures in backend PostgreSQL/Testcontainers and Android checks.
 - Restore and validate production database backups separately; this controller does not touch the RomanLMS database.
 - Add the RomanLMS-specific server allowlist, resource policy, health/readiness tests, and migration/backup gates.
 - Verify the deployment SSH account and GHCR package permissions without exposing secrets.

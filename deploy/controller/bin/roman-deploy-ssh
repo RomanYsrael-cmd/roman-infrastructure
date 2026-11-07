@@ -1,0 +1,9 @@
+#!/bin/sh
+set -eu
+
+if [ -n "${SSH_ORIGINAL_COMMAND:-}" ]; then
+    printf '%s\n' "Remote commands are not accepted." >&2
+    exit 2
+fi
+
+exec /usr/bin/sudo -n /opt/roman-platform/bin/roman-deploy --ssh

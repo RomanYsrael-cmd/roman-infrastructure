@@ -1,4 +1,7 @@
 import json
+import os
+import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -86,6 +89,34 @@ class RequestValidationTests(unittest.TestCase):
         value["image"] = f"{APP['image_namespace']}@sha256:{DIGEST}"
         with self.assertRaisesRegex(deploy.DeploymentError, "unsupported fields"):
             deploy.validate_request(value, CONFIG)
+
+
+class ForcedCommandLauncherTests(unittest.TestCase):
+    @unittest.skipUnless(shutil.which("sh"), "POSIX shell is required")
+    def test_rejects_remote_commands_before_sudo(self):
+        source = (ROOT / "deploy" / "controller" / "bin" / "roman-deploy-ssh").read_text(encoding="utf-8")
+        with tempfile.TemporaryDirectory() as tmp:
+            temp = Path(tmp)
+            marker = temp / "sudo-called"
+            fake_sudo = temp / "sudo"
+            fake_sudo.write_text(f'#!/bin/sh\nprintf called > "{marker}"\nexit 99\n', encoding="utf-8")
+            fake_sudo.chmod(0o755)
+            launcher = temp / "launcher"
+            launcher.write_text(source.replace("/usr/bin/sudo", str(fake_sudo)), encoding="utf-8")
+            launcher.chmod(0o755)
+
+            result = subprocess.run(
+                ["sh", str(launcher)],
+                env={**os.environ, "SSH_ORIGINAL_COMMAND": "id"},
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("Remote commands are not accepted", result.stderr)
+            self.assertFalse(marker.exists(), "remote commands must be rejected before sudo")
 
 
 class WorkflowOriginTests(unittest.TestCase):

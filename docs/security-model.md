@@ -12,7 +12,7 @@ Never commit private keys, GitHub tokens, database passwords, package tokens, or
 
 The workflow token is limited to reading source and Actions run metadata plus writing the RomanLMS package. It is passed to the controller over SSH only for GitHub verification and GHCR pull, never placed in the release record or audit file.
 
-The server deployment user is not in the docker group and has no interactive shell path through the authorized key. The key invokes only /opt/roman-platform/bin/roman-deploy --ssh. Sudoers grants exactly that command. The controller and policy remain root-owned.
+The server deployment user is not in the docker group and has no interactive shell path through the authorized key. The key invokes only the root-owned /opt/roman-platform/bin/roman-deploy-ssh launcher, which rejects SSH remote commands before sudo can strip SSH_ORIGINAL_COMMAND. Sudoers grants exactly /opt/roman-platform/bin/roman-deploy --ssh. The controller and policy remain root-owned.
 
 ## Image and rollout checks
 

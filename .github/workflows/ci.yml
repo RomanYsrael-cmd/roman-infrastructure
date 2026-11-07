@@ -24,6 +24,7 @@ jobs:
 
       - name: Run controller policy and failure-gate tests
         run: |
+          sh -n deploy/controller/bin/roman-deploy-ssh
           python3 -m compileall -q deploy/controller deploy/tests app/smoke
           python3 -m unittest discover -s deploy/tests -v
           python3 -m json.tool platform/applications.json >/dev/null
