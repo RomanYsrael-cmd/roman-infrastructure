@@ -24,11 +24,11 @@ jobs:
       github.event_name == 'workflow_dispatch' &&
       github.ref == 'refs/heads/main' &&
       inputs.confirmation == 'DEPLOY SMOKE'
-    uses: RomanYsrael-cmd/roman-infrastructure/.github/workflows/romanlms-smoke-deploy.yml@06ceaeb4605b5c25405f9cfa32531c0abcbb8b36
+    uses: RomanYsrael-cmd/roman-infrastructure/.github/workflows/romanlms-smoke-deploy.yml@971247957617bde2ca99b188ffdd1f4b0b153f69
     with:
       confirmation: ${{ inputs.confirmation }}
       operation: deploy
-      platform_ref: 06ceaeb4605b5c25405f9cfa32531c0abcbb8b36
+      platform_ref: 971247957617bde2ca99b188ffdd1f4b0b153f69
     secrets:
       ROMAN_PLATFORM_SSH_PRIVATE_KEY: ${{ secrets.ROMAN_PLATFORM_SSH_PRIVATE_KEY }}
       ROMAN_PLATFORM_SSH_KNOWN_HOSTS: ${{ secrets.ROMAN_PLATFORM_SSH_KNOWN_HOSTS }}
@@ -39,11 +39,11 @@ jobs:
       github.event_name == 'workflow_dispatch' &&
       github.ref == 'refs/heads/main' &&
       inputs.confirmation == 'ROLLBACK SMOKE'
-    uses: RomanYsrael-cmd/roman-infrastructure/.github/workflows/romanlms-smoke-deploy.yml@06ceaeb4605b5c25405f9cfa32531c0abcbb8b36
+    uses: RomanYsrael-cmd/roman-infrastructure/.github/workflows/romanlms-smoke-deploy.yml@971247957617bde2ca99b188ffdd1f4b0b153f69
     with:
       confirmation: ROLLBACK SMOKE
       operation: rollback
-      platform_ref: 06ceaeb4605b5c25405f9cfa32531c0abcbb8b36
+      platform_ref: 971247957617bde2ca99b188ffdd1f4b0b153f69
     secrets:
       ROMAN_PLATFORM_SSH_PRIVATE_KEY: ${{ secrets.ROMAN_PLATFORM_SSH_PRIVATE_KEY }}
       ROMAN_PLATFORM_SSH_KNOWN_HOSTS: ${{ secrets.ROMAN_PLATFORM_SSH_KNOWN_HOSTS }}
