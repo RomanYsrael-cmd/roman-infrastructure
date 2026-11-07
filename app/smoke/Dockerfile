@@ -1,13 +1,18 @@
-FROM python:3.13-slim
+FROM python:3.13-slim@sha256:09a17cad02668ae61ece136b4fd36ac3849e14f670ebedb637ea3e15580525bc
 
+ARG PACKAGE_REPO
 ARG SOURCE_REPO
 ARG REVISION
 ARG PLATFORM_REF
+ARG CALLER_REVISION
 
-LABEL org.opencontainers.image.source="${SOURCE_REPO}" \
+LABEL org.opencontainers.image.source="${PACKAGE_REPO}" \
       org.opencontainers.image.revision="${REVISION}" \
       org.opencontainers.image.title="Roman Infrastructure Smoke Service" \
-      io.roman.platform.source-revision="${PLATFORM_REF}"
+      io.roman.platform.source-repository="${SOURCE_REPO}" \
+      io.roman.platform.source-revision="${PLATFORM_REF}" \
+      io.roman.deployment.package-repository="${PACKAGE_REPO}" \
+      io.roman.deployment.caller-revision="${CALLER_REVISION}"
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1

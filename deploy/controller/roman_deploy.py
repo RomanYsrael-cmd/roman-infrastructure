@@ -226,9 +226,7 @@ def service_is_active(service: str) -> bool:
 
 
 def preflight(app: dict[str, Any]) -> None:
-    for mount in app["required_mounts"]:
-        if not os.path.ismount(mount):
-            raise DeploymentError(f"Required storage mount is unavailable: {mount}.")
+    require_storage_mounts(app)
     root = os.path.realpath(docker_root())
     expected_root = os.path.realpath(app["docker_root_prefix"])
     if root != expected_root and not root.startswith(expected_root.rstrip(os.sep) + os.sep):
@@ -281,8 +279,10 @@ def registry_session(app: dict[str, Any], request: dict[str, Any]):
 def verify_image_labels(
     image: str,
     source_revision: str,
+    caller_revision: str,
     platform_sha: str,
-    repository: str,
+    package_repository: str,
+    source_repository: str,
     env: dict[str, str],
 ) -> None:
     result = run_command(
@@ -294,13 +294,20 @@ def verify_image_labels(
         labels = json.loads(result.stdout.strip())
     except json.JSONDecodeError as exc:
         raise DeploymentError("Image metadata could not be verified.") from exc
-    expected_source = f"https://github.com/{repository}"
+    expected_package_repository = f"https://github.com/{package_repository}"
+    expected_source_repository = f"https://github.com/{source_repository}"
     if labels.get("org.opencontainers.image.revision") != source_revision:
         raise DeploymentError("Image revision label does not match the approved source revision.")
-    if labels.get("org.opencontainers.image.source") != expected_source:
-        raise DeploymentError("Image source label does not match the approved repository.")
+    if labels.get("org.opencontainers.image.source") != expected_package_repository:
+        raise DeploymentError("OCI source label does not match the package repository.")
+    if labels.get("io.roman.platform.source-repository") != expected_source_repository:
+        raise DeploymentError("Image source-repository label does not match the approved infrastructure repository.")
     if labels.get("io.roman.platform.source-revision") != platform_sha:
         raise DeploymentError("Image platform-source label does not match the pinned reusable workflow.")
+    if labels.get("io.roman.deployment.package-repository") != expected_package_repository:
+        raise DeploymentError("Image package-repository label does not match the authorized GHCR package repository.")
+    if labels.get("io.roman.deployment.caller-revision") != caller_revision:
+        raise DeploymentError("Image caller-revision label does not match the authorized RomanLMS commit.")
 
 
 def _atomic_write(path: str | Path, content: str, mode: int = 0o640) -> None:
@@ -339,6 +346,7 @@ def _read_state(path: str) -> dict[str, Any]:
 
 
 def _append_audit(app: dict[str, Any], event: dict[str, Any]) -> None:
+    require_storage_mounts(app)
     path = Path(app["history_file"])
     path.parent.mkdir(mode=0o750, parents=True, exist_ok=True)
     safe_event = {key: value for key, value in event.items() if key not in {"github_token", "registry_token"}}
@@ -349,25 +357,51 @@ def _append_audit(app: dict[str, Any], event: dict[str, Any]) -> None:
         os.fsync(stream.fileno())
 
 
-def _write_metrics(app: dict[str, Any], state: dict[str, Any], outcome: str) -> None:
+def _prometheus_label(value: str) -> str:
+    return value.replace("\\", "\\\\").replace("\n", "\\n").replace('"', '\\"')
+
+
+def _write_metrics(
+    app: dict[str, Any],
+    state: dict[str, Any],
+    outcome: str,
+    operation: str,
+    duration_seconds: float,
+    workflow_run_id: str,
+    request_sha: str,
+) -> None:
+    require_storage_mounts(app)
     active = state.get("active") or {}
-    app_id = app["app_id"]
+    app_id = _prometheus_label(app["app_id"])
+    operation = _prometheus_label(operation)
+    outcome = _prometheus_label(outcome)
+    event_labels = (
+        f'app_id="{app_id}",operation="{operation}",outcome="{outcome}",'
+        f'workflow_run_id="{_prometheus_label(workflow_run_id)}",request_sha="{_prometheus_label(request_sha)}"'
+    )
+    app_labels = f'app_id="{app_id}"'
     lines = [
         "# HELP roman_platform_last_deployment_timestamp_seconds Unix time of the latest deployment outcome.",
         "# TYPE roman_platform_last_deployment_timestamp_seconds gauge",
-        f'roman_platform_last_deployment_timestamp_seconds{{app_id="{app_id}",outcome="{outcome}"}} {time.time():.0f}',
+        f"roman_platform_last_deployment_timestamp_seconds{{{event_labels}}} {time.time():.0f}",
+        "# HELP roman_platform_last_deployment_duration_seconds Duration of the latest deployment operation.",
+        "# TYPE roman_platform_last_deployment_duration_seconds gauge",
+        f"roman_platform_last_deployment_duration_seconds{{{event_labels}}} {max(0.0, duration_seconds):.3f}",
+        "# HELP roman_platform_last_deployment_info Latest deployment operation and outcome.",
+        "# TYPE roman_platform_last_deployment_info gauge",
+        f"roman_platform_last_deployment_info{{{event_labels}}} 1",
     ]
     if active.get("commit_sha"):
         lines.extend([
             "# HELP roman_platform_active_release_info Active release caller revision.",
             "# TYPE roman_platform_active_release_info gauge",
-            f'roman_platform_active_release_info{{app_id="{app_id}",revision="{active["commit_sha"]}",slot="{active["slot"]}"}} 1',
+            f'roman_platform_active_release_info{{{app_labels},revision="{_prometheus_label(active["commit_sha"])}",slot="{_prometheus_label(active["slot"])}"}} 1',
         ])
     if active.get("platform_sha"):
         lines.extend([
             "# HELP roman_platform_active_platform_revision_info Active pinned infrastructure workflow revision.",
             "# TYPE roman_platform_active_platform_revision_info gauge",
-            f'roman_platform_active_platform_revision_info{{app_id="{app_id}",revision="{active["platform_sha"]}"}} 1',
+            f'roman_platform_active_platform_revision_info{{{app_labels},revision="{_prometheus_label(active["platform_sha"])}"}} 1',
         ])
     _atomic_write(app["metrics_file"], "\n".join(lines) + "\n", 0o640)
 
@@ -384,6 +418,12 @@ def _lock(app: dict[str, Any]):
         handle.close()
         raise DeploymentError("Another deployment for this application is already running.") from None
     return handle
+
+
+def require_storage_mounts(app: dict[str, Any]) -> None:
+    for mount in app["required_mounts"]:
+        if not os.path.ismount(mount):
+            raise DeploymentError(f"Required storage mount is unavailable: {mount}.")
 
 
 def _container_name(app: dict[str, Any], slot: str, commit_sha: str) -> str:
@@ -473,7 +513,9 @@ def _deploy(request: dict[str, Any], app: dict[str, Any]) -> dict[str, Any]:
         verify_image_labels(
             request["image"],
             request["platform_sha"],
+            request["commit_sha"],
             request["platform_sha"],
+            app["image_package_repository"],
             app["image_source_repository"],
             env,
         )
@@ -482,6 +524,7 @@ def _deploy(request: dict[str, Any], app: dict[str, Any]) -> dict[str, Any]:
     if previous:
         _remove_inactive_slot(app, previous["slot"], active)
         state["previous"] = None
+        require_storage_mounts(app)
         _atomic_write(state_path, json.dumps(state, indent=2, sort_keys=True) + "\n")
     else:
         _remove_inactive_slot(app, candidate_slot, active)
@@ -532,6 +575,7 @@ def _deploy(request: dict[str, Any], app: dict[str, Any]) -> dict[str, Any]:
             "previous": active,
             "updated_at": new_active["deployed_at"],
         }
+        require_storage_mounts(app)
         _atomic_write(state_path, json.dumps(new_state, indent=2, sort_keys=True) + "\n")
         duration = round(time.time() - started, 3)
         _append_audit(app, {
@@ -548,7 +592,15 @@ def _deploy(request: dict[str, Any], app: dict[str, Any]) -> dict[str, Any]:
         })
         metrics_warning = False
         try:
-            _write_metrics(app, new_state, "success")
+            _write_metrics(
+                app,
+                new_state,
+                "success",
+                "deploy",
+                duration,
+                request["release"]["run_id"],
+                request["commit_sha"],
+            )
         except OSError:
             metrics_warning = True
         return {
@@ -572,6 +624,7 @@ def _deploy(request: dict[str, Any], app: dict[str, Any]) -> dict[str, Any]:
         raise
 
 def _rollback(request: dict[str, Any], app: dict[str, Any]) -> dict[str, Any]:
+    started = time.time()
     state_path = app["state_file"]
     state = _read_state(state_path)
     active = state.get("active")
@@ -597,6 +650,7 @@ def _rollback(request: dict[str, Any], app: dict[str, Any]) -> dict[str, Any]:
         route_switched = True
         timestamp = datetime.now(timezone.utc).isoformat()
         new_state = {"active": previous, "previous": active, "updated_at": timestamp}
+        require_storage_mounts(app)
         _atomic_write(state_path, json.dumps(new_state, indent=2, sort_keys=True) + "\n")
         _append_audit(app, {
             "operation": "rollback",
@@ -616,7 +670,15 @@ def _rollback(request: dict[str, Any], app: dict[str, Any]) -> dict[str, Any]:
         raise
     metrics_warning = False
     try:
-        _write_metrics(app, new_state, "rollback")
+        _write_metrics(
+            app,
+            new_state,
+            "success",
+            "rollback",
+            time.time() - started,
+            request["release"]["run_id"],
+            request["commit_sha"],
+        )
     except OSError:
         metrics_warning = True
     return {
@@ -632,6 +694,7 @@ def _rollback(request: dict[str, Any], app: dict[str, Any]) -> dict[str, Any]:
 def execute(request: Any, config: dict[str, Any]) -> dict[str, Any]:
     app, request = validate_request(request, config)
     lock = _lock(app)
+    started = time.time()
     try:
         try:
             preflight(app)
@@ -652,6 +715,16 @@ def execute(request: Any, config: dict[str, Any]) -> dict[str, Any]:
             }
             with contextlib.suppress(Exception):
                 _append_audit(app, event)
+            with contextlib.suppress(Exception):
+                _write_metrics(
+                    app,
+                    _read_state(app["state_file"]),
+                    "failure",
+                    request["operation"],
+                    time.time() - started,
+                    request["release"]["run_id"],
+                    request["commit_sha"],
+                )
             raise
     finally:
         lock.close()

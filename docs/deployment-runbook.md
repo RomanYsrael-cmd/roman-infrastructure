@@ -6,10 +6,10 @@ The controller and workflow files are staged in this repository. The production 
 
 ## Server bootstrap after admin access is restored
 
-1. Verify an independent administrative SSH session to 100.67.102.11. The current laptop identity is rejected, so this step has not passed yet.
+1. Verify an independent administrative SSH session to 100.67.102.11. Admin password SSH was verified during the audit; the dedicated `roman-deploy` identity still needs to be installed and verified.
 2. Create a dedicated Ed25519 deployment key pair. Keep its private half out of Git and pass only its public half to the Ansible playbook.
 3. Confirm /srv/apps is mounted, Docker's data root is physically below /srv/apps, Docker and Nginx are healthy, and port 18080 is unused.
-4. Run deploy/ansible/install.yml with become from a trusted admin environment. Review the diff first. The playbook adds one account, one sudo rule, a forced authorized key, and an isolated Nginx listener on loopback. It does not change the existing public route, Cloudflare, Tailscale, firewall, PostgreSQL, or monitoring setup.
+4. Run deploy/ansible/install.yml with become from a trusted admin environment. Review the diff first. The playbook adds one account, one sudo rule, a forced key restricted to the RomanLMS runner's verified Tailscale IP, a private Nginx listener on loopback, and two deployment alert rules. It does not change the existing public route, Cloudflare, Tailscale, firewall, PostgreSQL, Telegram contact point, or notification policy tree.
 5. Verify Nginx syntax and the initial local 503 route; verify the admin SSH session again.
 6. After the reusable workflow commit is pinned in the caller example, populate allowed_platform_shas in the server policy with that exact commit, then install the same policy.
 7. Add the private key and a host-key-verified known_hosts entry to RomanLMS repository secrets. Do not obtain the server key by blindly trusting an unverified public network scan.

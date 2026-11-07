@@ -7,6 +7,8 @@
     platform_root: /opt/roman-platform
     platform_config_dir: /etc/roman-platform
     platform_storage_root: /srv/apps/roman-platform
+    node_exporter_textfile_dir: /srv/apps/monitoring/textfile_collector
+    deploy_source_tailscale_ip: 100.104.209.82
     platform_repo_root: "{{ playbook_dir }}/../.."
     nginx_site_file: /etc/nginx/conf.d/roman-platform-smoke.conf
     nginx_route_file: /etc/roman-platform/nginx/active-smoke.conf
@@ -18,6 +20,12 @@
           - deploy_public_key is defined
           - deploy_public_key is match('^ssh-ed25519 [A-Za-z0-9+/=]+')
         fail_msg: Pass only the deployment public key; never put a private key in this playbook.
+
+    - name: Require the verified RomanLMS runner Tailscale address
+      ansible.builtin.assert:
+        that:
+          - deploy_source_tailscale_ip == '100.104.209.82'
+        fail_msg: Update deploy_source_tailscale_ip only after verifying the laptop runner's Tailscale address.
 
     - name: Require the applications SSD mount
       ansible.builtin.assert:
@@ -52,6 +60,21 @@
         that:
           - docker_root.stdout is match('^/srv/apps(/|$)')
         fail_msg: Docker data is not on /srv/apps; controller installation is blocked.
+
+    - name: Inspect the existing Node Exporter textfile collector directory
+      ansible.builtin.stat:
+        path: "{{ node_exporter_textfile_dir }}"
+      register: textfile_directory
+
+    - name: Require the existing root-owned monitoring collector path
+      ansible.builtin.assert:
+        that:
+          - textfile_directory.stat.exists
+          - textfile_directory.stat.isdir
+          - textfile_directory.stat.pw_name == 'root'
+          - textfile_directory.stat.gr_name == 'root'
+          - textfile_directory.stat.mode == '0755'
+        fail_msg: Existing Node Exporter collector path is unavailable or has unexpected ownership.
 
     - name: Check whether this private listener is already managed
       ansible.builtin.stat:
@@ -89,7 +112,6 @@
         - { path: "{{ platform_config_dir }}/nginx", mode: "0750" }
         - { path: "{{ platform_storage_root }}/state", mode: "0750" }
         - { path: "{{ platform_storage_root }}/logs", mode: "0750" }
-        - { path: "{{ platform_storage_root }}/metrics", mode: "0750" }
         - { path: /run/roman-platform, mode: "0700" }
         - { path: /run/lock/roman-platform, mode: "0750" }
 
@@ -108,6 +130,14 @@
         owner: root
         group: root
         mode: "0755"
+
+    - name: Install the idempotent deployment alert provisioner
+      ansible.builtin.copy:
+        src: "{{ platform_repo_root }}/deploy/monitoring/provision_grafana_alerts.py"
+        dest: "{{ platform_root }}/bin/provision-grafana-alerts"
+        owner: root
+        group: root
+        mode: "0750"
 
     - name: Install the server allowlist
       ansible.builtin.copy:
@@ -170,6 +200,14 @@
         group: root
         mode: "0644"
       notify: Reload Roman platform Nginx
+
+    - name: Apply and validate the private Nginx listener before alert setup
+      ansible.builtin.meta: flush_handlers
+
+    - name: Add deployment outcome rules to the existing Telegram route
+      ansible.builtin.command: "{{ platform_root }}/bin/provision-grafana-alerts"
+      register: deployment_alert_setup
+      changed_when: "'changed=true' in deployment_alert_setup.stdout"
 
   handlers:
     - name: Validate Nginx configuration

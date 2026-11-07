@@ -111,12 +111,17 @@ jobs:
           $candidate = 'roman-platform-smoke-ci-' + $env:GITHUB_RUN_ID
           $buildArgs = @(
             'buildx', 'build', '--load',
-            '--label', 'org.opencontainers.image.source=https://github.com/RomanYsrael-cmd/roman-infrastructure',
+            '--label', 'org.opencontainers.image.source=https://github.com/RomanYsrael-cmd/roman-lms',
             '--label', "org.opencontainers.image.revision=$env:PLATFORM_REF",
+            '--label', 'io.roman.platform.source-repository=https://github.com/RomanYsrael-cmd/roman-infrastructure',
             '--label', "io.roman.platform.source-revision=$env:PLATFORM_REF",
+            '--label', 'io.roman.deployment.package-repository=https://github.com/RomanYsrael-cmd/roman-lms',
+            '--label', "io.roman.deployment.caller-revision=$env:GITHUB_SHA",
+            '--build-arg', 'PACKAGE_REPO=https://github.com/RomanYsrael-cmd/roman-lms',
             '--build-arg', 'SOURCE_REPO=https://github.com/RomanYsrael-cmd/roman-infrastructure',
             '--build-arg', "REVISION=$env:PLATFORM_REF",
             '--build-arg', "PLATFORM_REF=$env:PLATFORM_REF",
+            '--build-arg', "CALLER_REVISION=$env:GITHUB_SHA",
             '--tag', $tag, 'platform/app/smoke'
           )
           & docker @buildArgs
@@ -171,8 +176,11 @@ jobs:
             $immutableImage = $env:IMAGE + '@' + $digest
             $labels = (& docker image inspect --format '{{json .Config.Labels}}' $immutableImage | ConvertFrom-Json)
             if ($labels.'org.opencontainers.image.revision' -ne $env:PLATFORM_REF -or
-                $labels.'org.opencontainers.image.source' -ne 'https://github.com/RomanYsrael-cmd/roman-infrastructure' -or
-                $labels.'io.roman.platform.source-revision' -ne $env:PLATFORM_REF) {
+                $labels.'org.opencontainers.image.source' -ne 'https://github.com/RomanYsrael-cmd/roman-lms' -or
+                $labels.'io.roman.platform.source-repository' -ne 'https://github.com/RomanYsrael-cmd/roman-infrastructure' -or
+                $labels.'io.roman.platform.source-revision' -ne $env:PLATFORM_REF -or
+                $labels.'io.roman.deployment.package-repository' -ne 'https://github.com/RomanYsrael-cmd/roman-lms' -or
+                $labels.'io.roman.deployment.caller-revision' -ne $env:GITHUB_SHA) {
               throw 'Published image labels do not match the dispatched and pinned commits.'
             }
             Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value ('digest=' + $digest)

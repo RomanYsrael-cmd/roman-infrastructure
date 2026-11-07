@@ -1,1 +1,1 @@
-command="sudo -n /opt/roman-platform/bin/roman-deploy --ssh",restrict,from="100.64.0.0/10" {{ deploy_public_key }}
+command="sudo -n /opt/roman-platform/bin/roman-deploy --ssh",restrict,from="{{ deploy_source_tailscale_ip }}" {{ deploy_public_key }}

@@ -18,6 +18,7 @@
       "environment": "production",
       "strategy": "blue-green",
       "image_namespace": "ghcr.io/romanysrael-cmd/roman-lms-platform-smoke",
+      "image_package_repository": "RomanYsrael-cmd/roman-lms",
       "image_source_repository": "RomanYsrael-cmd/roman-infrastructure",
       "required_mounts": [
         "/srv/apps"
@@ -37,7 +38,7 @@
       "lock_dir": "/run/lock/roman-platform",
       "state_file": "/srv/apps/roman-platform/state/platform-smoke.json",
       "history_file": "/srv/apps/roman-platform/logs/deployments.jsonl",
-      "metrics_file": "/srv/apps/roman-platform/metrics/roman-platform.prom",
+      "metrics_file": "/srv/apps/monitoring/textfile_collector/roman-platform.prom",
       "route_file": "/etc/roman-platform/nginx/active-smoke.conf",
       "route_health_url": "http://127.0.0.1:18080/health",
       "slot_ports": {

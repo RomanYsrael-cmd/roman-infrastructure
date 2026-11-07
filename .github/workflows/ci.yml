@@ -44,7 +44,10 @@ jobs:
             --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
             --label "org.opencontainers.image.revision=$GITHUB_SHA" \
             --build-arg "SOURCE_REPO=https://github.com/$GITHUB_REPOSITORY" \
+            --build-arg "PACKAGE_REPO=https://github.com/$GITHUB_REPOSITORY" \
             --build-arg "REVISION=$GITHUB_SHA" \
+            --build-arg "PLATFORM_REF=$GITHUB_SHA" \
+            --build-arg "CALLER_REVISION=$GITHUB_SHA" \
             --tag "$image" app/smoke
           docker run --detach --name "$container" --read-only \
             --tmpfs /tmp:rw,nosuid,nodev,noexec,size=8m \

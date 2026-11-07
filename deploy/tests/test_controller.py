@@ -8,8 +8,10 @@ from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "deploy" / "controller"))
+sys.path.insert(0, str(ROOT / "deploy" / "monitoring"))
 
 import roman_deploy as deploy
+import provision_grafana_alerts as grafana_alerts
 
 
 CONFIG = json.loads((ROOT / "platform" / "applications.json").read_text(encoding="utf-8"))
@@ -138,22 +140,34 @@ class ImageProvenanceTests(unittest.TestCase):
         labels = {
             "org.opencontainers.image.revision": SHA,
             "org.opencontainers.image.source": "https://github.com/RomanYsrael-cmd/roman-lms",
+            "io.roman.platform.source-repository": "https://github.com/RomanYsrael-cmd/roman-infrastructure",
             "io.roman.platform.source-revision": WORKFLOW_SHA,
+            "io.roman.deployment.package-repository": "https://github.com/RomanYsrael-cmd/roman-lms",
+            "io.roman.deployment.caller-revision": SHA,
         }
         result = SimpleNamespace(stdout=json.dumps(labels), returncode=0, stderr="")
         with mock.patch.object(deploy, "run_command", return_value=result):
-            deploy.verify_image_labels("approved-image@sha256:" + DIGEST, SHA, WORKFLOW_SHA, APP["repository"], {})
+            deploy.verify_image_labels(
+                "approved-image@sha256:" + DIGEST, SHA, SHA, WORKFLOW_SHA,
+                APP["image_package_repository"], APP["image_source_repository"], {},
+            )
 
     def test_rejects_wrong_image_revision(self):
         labels = {
             "org.opencontainers.image.revision": "d" * 40,
             "org.opencontainers.image.source": "https://github.com/RomanYsrael-cmd/roman-lms",
+            "io.roman.platform.source-repository": "https://github.com/RomanYsrael-cmd/roman-infrastructure",
             "io.roman.platform.source-revision": WORKFLOW_SHA,
+            "io.roman.deployment.package-repository": "https://github.com/RomanYsrael-cmd/roman-lms",
+            "io.roman.deployment.caller-revision": SHA,
         }
         result = SimpleNamespace(stdout=json.dumps(labels), returncode=0, stderr="")
         with mock.patch.object(deploy, "run_command", return_value=result):
             with self.assertRaisesRegex(deploy.DeploymentError, "revision label"):
-                deploy.verify_image_labels("approved-image@sha256:" + DIGEST, SHA, WORKFLOW_SHA, APP["repository"], {})
+                deploy.verify_image_labels(
+                    "approved-image@sha256:" + DIGEST, SHA, SHA, WORKFLOW_SHA,
+                    APP["image_package_repository"], APP["image_source_repository"], {},
+                )
 
 
 class GateTests(unittest.TestCase):
@@ -195,6 +209,19 @@ class GateTests(unittest.TestCase):
             with self.assertRaisesRegex(deploy.DeploymentError, "outside the approved applications SSD"):
                 deploy.preflight(APP)
 
+    def test_missing_mount_does_not_write_release_artifacts_to_os_drive(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_path = Path(tmp) / "deployments.jsonl"
+            metrics_path = Path(tmp) / "roman-platform.prom"
+            app = dict(APP, history_file=str(audit_path), metrics_file=str(metrics_path))
+            with mock.patch.object(deploy.os.path, "ismount", return_value=False):
+                with self.assertRaisesRegex(deploy.DeploymentError, "Required storage mount"):
+                    deploy._append_audit(app, {"operation": "deploy"})
+                with self.assertRaisesRegex(deploy.DeploymentError, "Required storage mount"):
+                    deploy._write_metrics(app, {}, "failure", "deploy", 1, "12345", SHA)
+            self.assertFalse(audit_path.exists())
+            self.assertFalse(metrics_path.exists())
+
     @unittest.skipIf(deploy.fcntl is None, "Linux file locks are required")
     def test_conflicting_deployment_is_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -220,6 +247,59 @@ class RouteSafetyTests(unittest.TestCase):
                 with self.assertRaisesRegex(deploy.DeploymentError, "nginx rejected candidate"):
                     deploy.switch_route(app, 19081)
             self.assertEqual(route.read_text(encoding="utf-8"), original)
+
+
+class MetricsTests(unittest.TestCase):
+    def test_writes_latest_outcome_duration_and_active_release(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            metrics_path = Path(tmp) / "roman-platform.prom"
+            app = dict(APP, metrics_file=str(metrics_path))
+            state = {
+                "active": {
+                    "commit_sha": SHA,
+                    "platform_sha": WORKFLOW_SHA,
+                    "slot": "blue",
+                }
+            }
+
+            with mock.patch.object(deploy.os.path, "ismount", return_value=True):
+                deploy._write_metrics(app, state, "failure", "deploy", 2.75, "12345", SHA)
+
+            metrics = metrics_path.read_text(encoding="utf-8")
+            self.assertIn('roman_platform_last_deployment_info{app_id="platform-smoke",operation="deploy",outcome="failure",workflow_run_id="12345",request_sha="' + SHA + '"} 1', metrics)
+            self.assertIn('roman_platform_last_deployment_duration_seconds{app_id="platform-smoke",operation="deploy",outcome="failure",workflow_run_id="12345",request_sha="' + SHA + '"} 2.750', metrics)
+            self.assertIn(f'roman_platform_active_release_info{{app_id="platform-smoke",revision="{SHA}",slot="blue"}} 1', metrics)
+
+    def test_escapes_prometheus_label_values(self):
+        self.assertEqual(deploy._prometheus_label('a"b\\c\nd'), 'a\\"b\\\\c\\nd')
+
+
+class GrafanaAlertProvisioningTests(unittest.TestCase):
+    def test_rules_use_existing_warning_route_and_deployment_metrics(self):
+        rules = grafana_alerts.desired_rules("alerts-folder")
+        self.assertEqual(len(rules), 2)
+        self.assertTrue(all(item["metadata"]["labels"]["grafana.app/folder"] == "alerts-folder" for item in rules))
+        self.assertTrue(all(item["spec"]["labels"]["severity"] == "warning" for item in rules))
+        self.assertIn('outcome="failure"', rules[0]["spec"]["expressions"]["A"]["model"]["expr"])
+        self.assertIn("bool 120", rules[1]["spec"]["expressions"]["A"]["model"]["expr"])
+        self.assertTrue(all(item["spec"]["noDataState"] == "Ok" for item in rules))
+
+    def test_upsert_skips_an_unchanged_rule(self):
+        desired = grafana_alerts.desired_rules("alerts-folder")[0]
+        current = {
+            "metadata": {"labels": desired["metadata"]["labels"]},
+            "spec": desired["spec"],
+        }
+        with mock.patch.object(grafana_alerts, "api_request", return_value=current) as api:
+            self.assertFalse(grafana_alerts._upsert_rule("unused", desired))
+        self.assertEqual(api.call_count, 1)
+
+    def test_upsert_refuses_a_rule_uid_owned_by_another_component(self):
+        desired = grafana_alerts.desired_rules("alerts-folder")[0]
+        current = {"spec": {"labels": {"component": "unrelated"}}}
+        with mock.patch.object(grafana_alerts, "api_request", return_value=current):
+            with self.assertRaisesRegex(grafana_alerts.ProvisioningError, "belongs to another component"):
+                grafana_alerts._upsert_rule("unused", desired)
 
 
 if __name__ == "__main__":

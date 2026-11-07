@@ -8,7 +8,7 @@ Untrusted external pull requests must not run on the laptop runner. The current 
 
 ## Credentials
 
-Never commit private keys, GitHub tokens, database passwords, package tokens, or app secrets. The deployment private key belongs in the RomanLMS repository secret ROMAN_PLATFORM_SSH_PRIVATE_KEY. The matching public key is installed by the server bootstrap playbook with a forced command and a Tailscale source range. A separately verified known-hosts line belongs in ROMAN_PLATFORM_SSH_KNOWN_HOSTS.
+Never commit private keys, GitHub tokens, database passwords, package tokens, or app secrets. The deployment private key belongs in the RomanLMS repository secret ROMAN_PLATFORM_SSH_PRIVATE_KEY. The matching public key is installed by the server bootstrap playbook with a forced command and an exact source IP restriction for the verified RomanLMS runner (`100.104.209.82` at audit time). A separately verified known-hosts line belongs in ROMAN_PLATFORM_SSH_KNOWN_HOSTS.
 
 The workflow token is limited to reading source and Actions run metadata plus writing the RomanLMS package. It is passed to the controller over SSH only for GitHub verification and GHCR pull, never placed in the release record or audit file.
 

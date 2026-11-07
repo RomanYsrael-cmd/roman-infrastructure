@@ -14,7 +14,9 @@ The smoke application has two loopback-only container slots. The candidate start
 
 The controller rejects deployment if /srv/apps is not a mount, Docker stores data outside /srv/apps, free disk or memory is below policy, required services are down, a required backup marker is stale, or another deployment holds the application lock. These checks fail closed. The smoke application has no database or persistent application data.
 
-The controller writes an audit JSONL record, active/previous revision state, and a Prometheus textfile metric on the applications SSD. No existing monitoring configuration is replaced. The node-exporter textfile collector path still needs confirmation on the live server before claiming those metrics are scraped.
+The controller writes an audit JSONL record and active/previous revision state on the applications SSD. Its deployment metric is written to the existing `/srv/apps/monitoring/textfile_collector` directory. A read-only server audit confirmed that Node Exporter mounts this root-owned directory read-only as its textfile collector path, and a temporary probe was scraped successfully by Prometheus then removed. The controller exports the latest outcome, operation duration, workflow run, requested commit, active application revision, and pinned platform revision. It writes failure metrics only after it holds the application lock, so a rejected concurrent request cannot overwrite an in-flight deployment's status.
+
+The Ansible bootstrap adds two Grafana-managed rules through the Grafana 13.3 App Platform API: a failure alert that remains active until a newer operation supersedes it, and a short success notification that resolves after two minutes. Both use the existing Prometheus data source, `Roman Infrastructure Alerts` folder, warning-to-Telegram policy, and Telegram contact point. The provisioner verifies those existing resources first and does not modify contact points or notification policies. The live controller and deployment rules have not yet been installed.
 
 ## Trust boundaries
 
