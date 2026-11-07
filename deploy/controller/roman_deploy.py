@@ -494,6 +494,29 @@ def _active_containers(app: dict[str, Any], slot: str) -> list[str]:
     return [item for item in result.stdout.splitlines() if re.fullmatch(r"[0-9a-f]{12,64}", item)]
 
 
+def _release_container_available(app: dict[str, Any], release: dict[str, Any]) -> bool:
+    slot = release.get("slot")
+    commit_sha = release.get("commit_sha")
+    if slot not in app["slot_ports"] or not isinstance(commit_sha, str) or not re.fullmatch(r"[0-9a-f]{40}", commit_sha):
+        return False
+    expected_name = _container_name(app, slot, commit_sha)
+    if release.get("container") != expected_name:
+        return False
+    result = run_command(
+        [
+            "docker", "inspect", "--format",
+            '{{.Name}}|{{index .Config.Labels "roman.platform.app"}}|{{index .Config.Labels "roman.platform.slot"}}',
+            expected_name,
+        ],
+        timeout=15,
+        check=False,
+    )
+    return (
+        result.returncode == 0
+        and result.stdout.strip() == f"/{expected_name}|{app['app_id']}|{slot}"
+    )
+
+
 def _remove_inactive_slot(app: dict[str, Any], slot: str, active: dict[str, Any] | None) -> None:
     containers = _active_containers(app, slot)
     if active and active.get("slot") == slot and active.get("container") in containers:
@@ -638,7 +661,7 @@ def _rollback(request: dict[str, Any], app: dict[str, Any]) -> dict[str, Any]:
         raise DeploymentError("There is no retained previous release to roll back to.")
     if previous.get("slot") not in app["slot_ports"]:
         raise DeploymentError("Previous release state has an invalid slot.")
-    if previous.get("container") not in _active_containers(app, previous["slot"]):
+    if not _release_container_available(app, previous):
         raise DeploymentError("Previous release container is no longer available.")
     port = int(app["slot_ports"][previous["slot"]])
     _wait_http(

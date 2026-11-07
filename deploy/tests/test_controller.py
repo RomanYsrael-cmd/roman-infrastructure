@@ -40,6 +40,39 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertIn(confirmation + "\n              $global:LASTEXITCODE = 0", workflow)
 
 
+class RetainedReleaseContainerTests(unittest.TestCase):
+    def test_matches_the_retained_container_name_and_labels(self):
+        name = deploy._container_name(APP, "blue", SHA)
+        release = {"slot": "blue", "commit_sha": SHA, "container": name}
+        result = subprocess.CompletedProcess(
+            args=["docker", "inspect"],
+            returncode=0,
+            stdout=f"/{name}|platform-smoke|blue\n",
+            stderr="",
+        )
+        with mock.patch.object(deploy, "run_command", return_value=result) as run:
+            self.assertTrue(deploy._release_container_available(APP, release))
+        self.assertEqual(run.call_args.args[0][-1], name)
+
+    def test_rejects_wrong_container_identity_without_running_docker(self):
+        release = {"slot": "blue", "commit_sha": SHA, "container": "--help"}
+        with mock.patch.object(deploy, "run_command") as run:
+            self.assertFalse(deploy._release_container_available(APP, release))
+        run.assert_not_called()
+
+    def test_rejects_container_with_wrong_slot_label(self):
+        name = deploy._container_name(APP, "blue", SHA)
+        release = {"slot": "blue", "commit_sha": SHA, "container": name}
+        result = subprocess.CompletedProcess(
+            args=["docker", "inspect"],
+            returncode=0,
+            stdout=f"/{name}|platform-smoke|green\n",
+            stderr="",
+        )
+        with mock.patch.object(deploy, "run_command", return_value=result):
+            self.assertFalse(deploy._release_container_available(APP, release))
+
+
 def request(**overrides):
     value = {
         "operation": "deploy",
