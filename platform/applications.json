@@ -11,7 +11,7 @@
         "RomanYsrael-cmd"
       ],
       "allowed_platform_shas": [
-        "415361d8055dea254e54ccf021802cca9c77de71"
+        "2981677b61d3b80e0d87f7767f401f1509a53c82"
       ],
       "workflow_event": "workflow_dispatch",
       "production_branch": "main",
