@@ -20,6 +20,8 @@ CONTACT_POINT_NAME = "Roman Infrastructure Telegram"
 DATASOURCE_UID = "prometheus"
 NAMESPACE = "default"
 APP_ID = "platform-smoke"
+DASHBOARD_UID = "romanlms-phase6-private"
+DASHBOARD_TAG = "roman-platform-managed"
 
 
 class ProvisioningError(Exception):
@@ -129,8 +131,8 @@ def _rule_resource(
     }
 
 
-def desired_rules(folder_uid: str) -> list[dict[str, Any]]:
-    return [
+def desired_rules(folder_uid: str, include_phase6: bool = False) -> list[dict[str, Any]]:
+    rules = [
         _rule_resource(
             name="roman-platform-deploy-failed",
             title="Roman Platform Deployment Failed",
@@ -158,7 +160,49 @@ def desired_rules(folder_uid: str) -> list[dict[str, Any]]:
                 "notification resolves automatically after two minutes."
             ),
         ),
+        _rule_resource(
+            name="romanlms-phase6-deploy-failed",
+            title="RomanLMS Private Deployment Failed",
+            folder_uid=folder_uid,
+            query='roman_platform_last_deployment_info{app_id="romanlms-phase6",outcome="failure"}',
+            summary="RomanLMS private {{ $labels.operation }} failed",
+            description=(
+                "Private release run {{ $labels.workflow_run_id }} for commit "
+                "{{ $labels.request_sha }} failed. Check the Phase 6 deployment audit and retained route."
+            ),
+        ),
+        _rule_resource(
+            name="romanlms-phase6-deploy-succeeded",
+            title="RomanLMS Private Deployment Succeeded",
+            folder_uid=folder_uid,
+            query=(
+                '(time() - roman_platform_last_deployment_timestamp_seconds'
+                '{app_id="romanlms-phase6",outcome="success"}) < bool 120'
+            ),
+            summary="RomanLMS private {{ $labels.operation }} succeeded",
+            description=(
+                "Private release run {{ $labels.workflow_run_id }} for commit "
+                "{{ $labels.request_sha }} passed its checks. This notification resolves after two minutes."
+            ),
+        ),
+        _rule_resource(
+            name="romanlms-phase6-component-down",
+            title="RomanLMS Private Component Down",
+            folder_uid=folder_uid,
+            query='1 - romanlms_phase6_component_up',
+            summary="RomanLMS private {{ $labels.app_component }} is unavailable",
+            description="The private component health check failed. Inspect the active release and private route on roman-server.",
+        ),
+        _rule_resource(
+            name="romanlms-phase6-dependency-down",
+            title="RomanLMS Private Dependency Down",
+            folder_uid=folder_uid,
+            query='1 - romanlms_phase6_dependency_up',
+            summary="RomanLMS private {{ $labels.dependency }} is unavailable",
+            description="The isolated staging dependency health check failed. Inspect its container and storage mounts.",
+        ),
     ]
+    return rules if include_phase6 else rules[:2]
 
 
 def _verify_existing_telegram_route(password: str) -> str:
@@ -238,7 +282,62 @@ def _upsert_rule(password: str, desired: dict[str, Any]) -> bool:
     return True
 
 
+def desired_dashboard() -> dict[str, Any]:
+    panels = [
+        ("Private components", "romanlms_phase6_component_up", "short"),
+        ("Private dependencies", "romanlms_phase6_dependency_up", "short"),
+        ("HTTP requests per second", "sum by (status_class) (rate(romanlms_phase6_http_requests_total[5m]))", "reqps"),
+        ("Mean HTTP response time", "sum(rate(romanlms_phase6_http_duration_seconds_total[5m])) / clamp_min(sum(rate(romanlms_phase6_http_requests_observed_total[5m])), 0.001)", "s"),
+        ("JVM memory", "romanlms_phase6_jvm_memory_used_bytes", "bytes"),
+        ("Container memory", "romanlms_phase6_container_memory_bytes", "bytes"),
+        ("Container CPU", "romanlms_phase6_container_cpu_percent", "percent"),
+        ("Database connections", "romanlms_phase6_database_connections", "short"),
+        ("Active release", 'roman_platform_active_release_info{app_id="romanlms-phase6"}', "short"),
+        ("Database backup age", "roman_pgbackrest_last_backup_age_seconds", "s"),
+        ("Storage available", "roman_monitoring_filesystem_available_bytes", "bytes"),
+    ]
+    return {
+        "uid": DASHBOARD_UID,
+        "title": "RomanLMS Phase 6 Private",
+        "tags": [DASHBOARD_TAG],
+        "timezone": "browser",
+        "schemaVersion": 39,
+        "refresh": "30s",
+        "time": {"from": "now-6h", "to": "now"},
+        "panels": [
+            {"id": index + 1, "type": "timeseries", "title": title,
+             "gridPos": {"h": 8, "w": 12, "x": (index % 2) * 12, "y": (index // 2) * 8},
+             "datasource": {"type": "prometheus", "uid": DATASOURCE_UID},
+             "fieldConfig": {"defaults": {"unit": unit}, "overrides": []},
+             "targets": [{"refId": "A", "expr": expression, "datasource": {"type": "prometheus", "uid": DATASOURCE_UID}}]}
+            for index, (title, expression, unit) in enumerate(panels)
+        ],
+    }
+
+
+def _upsert_dashboard(password: str, folder_uid: str) -> bool:
+    desired = desired_dashboard()
+    current = api_request(f"/api/dashboards/uid/{DASHBOARD_UID}", password)
+    if current is not None:
+        dashboard = current.get("dashboard", {}) if isinstance(current, dict) else {}
+        if DASHBOARD_TAG not in dashboard.get("tags", []):
+            raise ProvisioningError("The Phase 6 dashboard UID belongs to another dashboard; it was not changed.")
+        keys = ("uid", "title", "tags", "timezone", "schemaVersion", "refresh", "time", "panels")
+        if all(dashboard.get(key) == desired.get(key) for key in keys) and current.get("meta", {}).get("folderUid") == folder_uid:
+            return False
+        desired["id"] = dashboard.get("id")
+        desired["version"] = dashboard.get("version", 0)
+    result = api_request("/api/dashboards/db", password, method="POST", body={"dashboard": desired, "folderUid": folder_uid, "overwrite": True, "message": "Managed RomanLMS private monitoring"})
+    if not isinstance(result, dict) or result.get("uid") != DASHBOARD_UID:
+        raise ProvisioningError("Grafana did not confirm the Phase 6 dashboard.")
+    return True
+
+
 def main() -> int:
+    if sys.argv[1:] not in ([], ["--include-phase6"]):
+        print("Unsupported alert provisioning option.", file=sys.stderr)
+        return 1
+    include_phase6 = sys.argv[1:] == ["--include-phase6"]
     try:
         password = GRAFANA_PASSWORD_FILE.read_text(encoding="utf-8").strip()
     except OSError:
@@ -253,7 +352,9 @@ def main() -> int:
         if not isinstance(health, dict) or health.get("database") != "ok":
             raise ProvisioningError("Grafana health check did not pass.")
         folder_uid = _verify_existing_telegram_route(password)
-        changed = sum(_upsert_rule(password, item) for item in desired_rules(folder_uid))
+        changed = sum(_upsert_rule(password, item) for item in desired_rules(folder_uid, include_phase6))
+        if include_phase6:
+            changed += int(_upsert_dashboard(password, folder_uid))
     except ProvisioningError as exc:
         print(str(exc), file=sys.stderr)
         return 1

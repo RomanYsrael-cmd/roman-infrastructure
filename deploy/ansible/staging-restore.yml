@@ -1,0 +1,82 @@
+---
+- name: Restore the reviewed backup into a new private Phase 6 environment
+  hosts: roman_servers
+  become: true
+  gather_facts: false
+  vars:
+    phase6_sha256: b9a1d013332c7692d11b84c2503e51195b8e6ec36e71a5fa223640fa9a617890
+    phase6_root_copy: /run/roman-platform/romanlms-phase6-source.dump
+  tasks:
+    - name: Require an explicitly named private transfer file
+      ansible.builtin.assert:
+        that:
+          - phase6_transfer_path is defined
+          - phase6_transfer_path is match('^/run/user/1000/romanlms-phase6-[0-9a-f]{32}\.dump$')
+        fail_msg: Supply the exact private Phase 6 transfer path created for this run.
+
+    - name: Inspect the user's private runtime directory
+      ansible.builtin.stat:
+        path: /run/user/1000
+        follow: false
+      register: phase6_runtime
+
+    - name: Require a private runtime directory
+      ansible.builtin.assert:
+        that:
+          - phase6_runtime.stat.isdir | default(false)
+          - not (phase6_runtime.stat.islnk | default(false))
+          - phase6_runtime.stat.uid == 1000
+          - phase6_runtime.stat.mode == '0700'
+        fail_msg: The transfer directory is not private and owned by the administrative user.
+
+    - name: Inspect the transferred dump without following links
+      ansible.builtin.stat:
+        path: "{{ phase6_transfer_path }}"
+        follow: false
+        checksum_algorithm: sha256
+      register: phase6_dump
+
+    - name: Verify source identity, size, and checksum
+      ansible.builtin.assert:
+        that:
+          - phase6_dump.stat.isreg | default(false)
+          - not (phase6_dump.stat.islnk | default(false))
+          - phase6_dump.stat.uid == 1000
+          - phase6_dump.stat.size == 31389710
+          - phase6_dump.stat.checksum == phase6_sha256
+        fail_msg: The private transfer does not match the reviewed backup; no restore was started.
+
+    - name: Restrict the transfer file permissions
+      ansible.builtin.file:
+        path: "{{ phase6_transfer_path }}"
+        owner: romanysrael
+        mode: "0600"
+
+    - name: Inspect the root-controlled temporary copy destination
+      ansible.builtin.stat:
+        path: "{{ phase6_root_copy }}"
+        follow: false
+      register: phase6_existing_copy
+
+    - name: Refuse to overwrite an existing temporary copy
+      ansible.builtin.assert:
+        that:
+          - not phase6_existing_copy.stat.exists
+          - not (phase6_existing_copy.stat.islnk | default(false))
+        fail_msg: A root staging copy already exists; inspect it before retrying.
+
+    - name: Copy the verified dump into the root-controlled temporary directory
+      ansible.builtin.copy:
+        src: "{{ phase6_transfer_path }}"
+        dest: "{{ phase6_root_copy }}"
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0600"
+        force: false
+      no_log: true
+
+    - name: Create the isolated database and object store
+      ansible.builtin.command: /usr/bin/python3 /opt/roman-platform/bin/prepare-romanlms-phase6
+      no_log: true
+      changed_when: true

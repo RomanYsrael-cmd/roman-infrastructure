@@ -1,0 +1,201 @@
+name: Reusable private application deployment
+
+on:
+  workflow_call:
+    inputs:
+      operation:
+        required: true
+        type: string
+      confirmation:
+        required: true
+        type: string
+      platform_ref:
+        required: true
+        type: string
+      test_component:
+        required: false
+        type: string
+        default: ''
+    secrets:
+      ROMAN_PLATFORM_SSH_PRIVATE_KEY:
+        required: true
+      ROMAN_PLATFORM_SSH_KNOWN_HOSTS:
+        required: true
+
+permissions:
+  contents: read
+  actions: read
+  packages: write
+
+concurrency:
+  group: roman-platform-production
+  cancel-in-progress: false
+
+jobs:
+  private-release:
+    if: >-
+      github.repository == 'RomanYsrael-cmd/roman-lms' &&
+      github.actor == 'RomanYsrael-cmd' &&
+      github.event_name == 'workflow_dispatch' &&
+      github.ref == 'refs/heads/main' &&
+      ((inputs.operation == 'deploy-stack' && inputs.confirmation == 'DEPLOY PRIVATE ROMANLMS') ||
+       (inputs.operation == 'rollback-stack' && inputs.confirmation == 'ROLLBACK PRIVATE ROMANLMS') ||
+       (inputs.operation == 'verify-stack' && inputs.confirmation == 'VERIFY PRIVATE ROMANLMS') ||
+       (inputs.operation == 'test-stack' && inputs.test_component == 'backend' && inputs.confirmation == 'TEST PRIVATE BACKEND FAILURE') ||
+       (inputs.operation == 'test-stack' && inputs.test_component == 'frontend' && inputs.confirmation == 'TEST PRIVATE FRONTEND FAILURE'))
+    runs-on: [self-hosted, Windows, X64, roman-laptop]
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      PLATFORM_REF: ${{ inputs.platform_ref }}
+      OPERATION: ${{ inputs.operation }}
+      TEST_COMPONENT: ${{ inputs.test_component }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Verify current owner-controlled main and its successful CI
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:PLATFORM_REF -notmatch '^[0-9a-f]{40}$') { throw 'A full pinned infrastructure SHA is required.' }
+          $currentRun = & gh api "repos/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID" | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0 -or $currentRun.path -ne '.github/workflows/romanlms-phase6-staging.yml' -or
+              $currentRun.head_sha -ne $env:GITHUB_SHA -or $currentRun.event -ne 'workflow_dispatch' -or
+              $currentRun.actor.login -ne 'RomanYsrael-cmd') { throw 'The caller workflow is not authorized.' }
+          $expectedWorkflow = 'RomanYsrael-cmd/roman-infrastructure/.github/workflows/romanlms-private-deploy.yml@' + $env:PLATFORM_REF
+          $referenced = @($currentRun.referenced_workflows | Where-Object { $_.path -eq $expectedWorkflow -and $_.sha -eq $env:PLATFORM_REF })
+          if ($referenced.Count -ne 1) { throw 'The executing reusable workflow does not match the supplied infrastructure pin.' }
+          $branch = & gh api "repos/$env:GITHUB_REPOSITORY/branches/main" | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0 -or $branch.commit.sha -ne $env:GITHUB_SHA) { throw 'The requested commit is not current main.' }
+          $runs = & gh api "repos/$env:GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$env:GITHUB_SHA&event=push&per_page=100" | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { throw 'Could not verify required CI.' }
+          $matching = @($runs.workflow_runs | Where-Object {
+            $_.head_sha -eq $env:GITHUB_SHA -and $_.head_branch -eq 'main' -and
+            $_.event -eq 'push'
+          })
+          $latest = $matching | Sort-Object id -Descending | Select-Object -First 1
+          if (-not $latest -or $latest.status -ne 'completed' -or $latest.conclusion -ne 'success' -or $latest.actor.login -ne 'RomanYsrael-cmd') {
+            throw 'The latest RomanLMS CI run for this exact commit must pass under the owner account.'
+          }
+          $os = (& docker info --format '{{.OSType}}' 2>$null).Trim()
+          if ($LASTEXITCODE -ne 0 -or $os -ne 'linux') { throw 'Docker Desktop Linux engine is unavailable.' }
+          $tailscale = 'C:\Program Files\Tailscale\tailscale.exe'
+          if (-not (Test-Path -LiteralPath $tailscale)) { throw 'Tailscale is unavailable.' }
+          $status = (& $tailscale status --json | ConvertFrom-Json)
+          $server = $status.Peer.PSObject.Properties.Value | Where-Object { $_.HostName -eq 'roman-server' -and $_.Online -and $_.TailscaleIPs -contains '100.67.102.11' }
+          if ($status.BackendState -ne 'Running' -or -not $server) { throw 'The approved server is not online on Tailscale.' }
+
+      - name: Check out the verified source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          ref: ${{ github.sha }}
+          path: roman-lms
+          persist-credentials: false
+
+      - name: Check out the pinned controller
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          repository: RomanYsrael-cmd/roman-infrastructure
+          ref: ${{ inputs.platform_ref }}
+          path: platform
+          token: ${{ github.token }}
+          persist-credentials: false
+
+      - name: Run controller policy tests
+        run: |
+          python -m unittest discover -s platform/deploy/tests -v
+          if ($LASTEXITCODE -ne 0) { throw 'Controller policy tests failed.' }
+
+      - name: Build and publish immutable images
+        id: images
+        if: ${{ inputs.operation != 'verify-stack' }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dockerConfig = Join-Path $env:RUNNER_TEMP ('roman-private-docker-' + $env:GITHUB_RUN_ID)
+          New-Item -ItemType Directory -Path $dockerConfig -Force | Out-Null
+          $env:DOCKER_CONFIG = $dockerConfig
+          try {
+            $env:GH_TOKEN | & docker login ghcr.io --username $env:GITHUB_ACTOR --password-stdin
+            if ($LASTEXITCODE -ne 0) { throw 'Registry login failed.' }
+            $metadata = Get-Content -LiteralPath 'roman-lms/ops/deploy/release-metadata.env'
+            $versionLine = @($metadata | Where-Object { $_ -match '^FLYWAY_CLI_VERSION=[0-9]+(\.[0-9]+)+$' })
+            if ($versionLine.Count -ne 1) { throw 'The pinned Flyway version is missing or ambiguous.' }
+            $flywayVersion = ($versionLine[0] -split '=', 2)[1]
+            $specs = @(@{ Name='migrator'; Dockerfile='roman-lms/ops/deploy/migration/Dockerfile'; Context='roman-lms' })
+            if ($env:OPERATION -eq 'deploy-stack' -or $env:OPERATION -eq 'test-stack') {
+              $specs += @{ Name='backend'; Dockerfile='roman-lms/backend/Dockerfile'; Context='roman-lms/backend' }
+              $specs += @{ Name='frontend'; Dockerfile='roman-lms/frontend/Dockerfile'; Context='roman-lms/frontend' }
+            }
+            foreach ($spec in $specs) {
+              $image = 'ghcr.io/romanysrael-cmd/romanlms-phase6-' + $spec.Name
+              $tag = $image + ':sha-' + $env:GITHUB_SHA + '-run-' + $env:GITHUB_RUN_ID + '-' + $env:GITHUB_RUN_ATTEMPT
+              $buildArgs = @('buildx','build','--load','--file',$spec.Dockerfile,'--tag',$tag,
+                '--build-arg',"OCI_REVISION=$env:GITHUB_SHA",'--build-arg',"FLYWAY_CLI_VERSION=$flywayVersion",
+                '--label','org.opencontainers.image.source=https://github.com/RomanYsrael-cmd/roman-lms',
+                '--label',"org.opencontainers.image.revision=$env:GITHUB_SHA",
+                '--label','io.roman.platform.source-repository=https://github.com/RomanYsrael-cmd/roman-infrastructure',
+                '--label',"io.roman.platform.source-revision=$env:PLATFORM_REF",
+                '--label','io.roman.deployment.package-repository=https://github.com/RomanYsrael-cmd/roman-lms',
+                '--label',"io.roman.deployment.caller-revision=$env:GITHUB_SHA",$spec.Context)
+              & docker @buildArgs
+              if ($LASTEXITCODE -ne 0) { throw "Image build failed: $($spec.Name)." }
+              & docker push $tag
+              if ($LASTEXITCODE -ne 0) { throw "Image push failed: $($spec.Name)." }
+              & docker pull $tag
+              if ($LASTEXITCODE -ne 0) { throw "Published image pull failed: $($spec.Name)." }
+              $digest = (& docker image inspect --format '{{index .RepoDigests 0}}' $tag).Trim()
+              if ($digest -notmatch ('^' + [regex]::Escape($image) + '@sha256:[0-9a-f]{64}$')) { throw 'The registry did not return an immutable digest.' }
+              Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value ($spec.Name + '=' + $digest)
+              Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value ('Published ' + $digest)
+            }
+          } finally {
+            & docker logout ghcr.io 2>$null | Out-Null
+            Remove-Item -LiteralPath $dockerConfig -Recurse -Force -ErrorAction SilentlyContinue
+          }
+
+      - name: Send the release through restricted Tailscale SSH
+        env:
+          PLATFORM_SSH_PRIVATE_KEY: ${{ secrets.ROMAN_PLATFORM_SSH_PRIVATE_KEY }}
+          PLATFORM_SSH_KNOWN_HOSTS: ${{ secrets.ROMAN_PLATFORM_SSH_KNOWN_HOSTS }}
+          BACKEND_IMAGE: ${{ steps.images.outputs.backend }}
+          FRONTEND_IMAGE: ${{ steps.images.outputs.frontend }}
+          MIGRATION_IMAGE: ${{ steps.images.outputs.migrator }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $knownHosts = Join-Path $env:RUNNER_TEMP ('roman-private-known-hosts-' + $env:GITHUB_RUN_ID)
+          $key = Join-Path $env:RUNNER_TEMP ('roman-private-key-' + $env:GITHUB_RUN_ID)
+          try {
+            $utf8 = [Text.UTF8Encoding]::new($false)
+            [IO.File]::WriteAllText($knownHosts, $env:PLATFORM_SSH_KNOWN_HOSTS.Trim() + [Environment]::NewLine, $utf8)
+            [IO.File]::WriteAllText($key, $env:PLATFORM_SSH_PRIVATE_KEY.Trim() + [Environment]::NewLine, $utf8)
+            & icacls.exe $key /inheritance:r /grant:r "$($env:USERNAME):(F)" | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw 'Could not secure the temporary deployment key.' }
+            & ssh-keygen.exe -F '100.67.102.11' -f $knownHosts | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw 'The approved server host key is missing.' }
+            $request = @{
+              operation=$env:OPERATION; app_id='romanlms-phase6'; repository=$env:GITHUB_REPOSITORY;
+              branch='main'; commit_sha=$env:GITHUB_SHA; workflow_sha=$env:GITHUB_SHA;
+              platform_sha=$env:PLATFORM_REF; environment='phase6-staging';
+              github_token=$env:GH_TOKEN;
+              release=@{run_id=$env:GITHUB_RUN_ID; run_attempt=$env:GITHUB_RUN_ATTEMPT; actor=$env:GITHUB_ACTOR}
+            }
+            if ($env:OPERATION -eq 'deploy-stack' -or $env:OPERATION -eq 'rollback-stack') {
+              $request.migration_image=$env:MIGRATION_IMAGE
+              $request.registry_token=$env:GH_TOKEN
+            }
+            if ($env:OPERATION -eq 'deploy-stack') {
+              $request.strategy='blue-green'
+              $request.images=@{backend=$env:BACKEND_IMAGE; frontend=$env:FRONTEND_IMAGE}
+            }
+            if ($env:OPERATION -eq 'test-stack') {
+              $request.component=$env:TEST_COMPONENT
+              $request.registry_token=$env:GH_TOKEN
+              $testImage = if ($env:TEST_COMPONENT -eq 'backend') { $env:BACKEND_IMAGE } else { $env:FRONTEND_IMAGE }
+              $request.image=$testImage
+            }
+            $json = $request | ConvertTo-Json -Depth 6 -Compress
+            $json | & ssh.exe -i $key -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o "UserKnownHostsFile=$knownHosts" roman-deploy@100.67.102.11
+            if ($LASTEXITCODE -ne 0) { throw 'The restricted controller rejected the release.' }
+          } finally {
+            Remove-Item -LiteralPath $key, $knownHosts -Force -ErrorAction SilentlyContinue
+          }

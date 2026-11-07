@@ -1,3 +1,4 @@
+import contextlib
 import json
 import os
 import shutil
@@ -33,6 +34,27 @@ CONFIG["applications"]["platform-smoke"] = APP
 
 
 class WorkflowContractTests(unittest.TestCase):
+    def test_server_requires_latest_exact_commit_ci_to_pass(self):
+        app = dict(APP, required_ci_workflow_file="ci.yml")
+        good = {"id": 10, "run_attempt": 1, "head_sha": SHA, "head_branch": "main", "event": "push", "status": "completed", "conclusion": "success", "actor": {"login": "RomanYsrael-cmd"}}
+        with mock.patch.object(deploy, "github_json", return_value={"workflow_runs": [good]}):
+            deploy.verify_required_ci(request(), app)
+        failed = {**good, "id": 11, "conclusion": "failure"}
+        with mock.patch.object(deploy, "github_json", return_value={"workflow_runs": [failed, good]}):
+            with self.assertRaisesRegex(deploy.DeploymentError, "latest required CI"):
+                deploy.verify_required_ci(request(), app)
+        with mock.patch.object(deploy, "github_json", return_value={"workflow_runs": [{**good, "actor": {"login": "other"}}]}):
+            with self.assertRaisesRegex(deploy.DeploymentError, "authorized actor"):
+                deploy.verify_required_ci(request(), app)
+    def test_private_release_requires_owner_manual_main_and_successful_ci(self):
+        workflow = (ROOT / ".github" / "workflows" / "romanlms-private-deploy.yml").read_text(encoding="utf-8")
+        for required in ("github.actor == 'RomanYsrael-cmd'", "github.event_name == 'workflow_dispatch'",
+                         "github.ref == 'refs/heads/main'", "DEPLOY PRIVATE ROMANLMS",
+                         "ROLLBACK PRIVATE ROMANLMS", "actions/workflows/ci.yml/runs?head_sha=",
+                         "$latest.conclusion -ne 'success'", "$currentRun.referenced_workflows",
+                         "actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803"):
+            self.assertIn(required, workflow)
+
     def test_expected_unhealthy_rejection_resets_powershell_exit_code(self):
         workflow = (ROOT / ".github" / "workflows" / "romanlms-smoke-deploy.yml").read_text(encoding="utf-8")
         confirmation = "Write-Host 'Server rejected the unhealthy candidate at the readiness gate.'"
@@ -137,6 +159,344 @@ class RequestValidationTests(unittest.TestCase):
         value["image"] = f"{APP['image_namespace']}@sha256:{DIGEST}"
         with self.assertRaisesRegex(deploy.DeploymentError, "unsupported fields"):
             deploy.validate_request(value, CONFIG)
+
+    def test_phase6_database_validation_accepts_only_the_allowlisted_migrator(self):
+        app = dict(
+            APP,
+            app_id="romanlms-phase6-backend",
+            environment="phase6-staging",
+            image_namespace="ghcr.io/romanysrael-cmd/romanlms-phase6-backend",
+            migration_image_namespace="ghcr.io/romanysrael-cmd/romanlms-phase6-migrator",
+            image_revision_mode="caller",
+        )
+        config = {"applications": {app["app_id"]: app}}
+        value = request(
+            operation="validate-database",
+            app_id=app["app_id"],
+            environment="phase6-staging",
+            migration_image=f"{app['migration_image_namespace']}@sha256:{DIGEST}",
+        )
+        value.pop("image")
+        value.pop("strategy")
+        value["registry_token"] = "ghs_" + "z" * 32
+        selected, accepted = deploy.validate_request(value, config)
+        self.assertEqual(selected["app_id"], "romanlms-phase6-backend")
+        self.assertEqual(accepted["migration_image"], f"{app['migration_image_namespace']}@sha256:{DIGEST}")
+
+    def test_phase6_database_validation_rejects_an_unapproved_migrator_package(self):
+        app = dict(
+            APP,
+            app_id="romanlms-phase6-backend",
+            environment="phase6-staging",
+            image_namespace="ghcr.io/romanysrael-cmd/romanlms-phase6-backend",
+            migration_image_namespace="ghcr.io/romanysrael-cmd/romanlms-phase6-migrator",
+        )
+        config = {"applications": {app["app_id"]: app}}
+        value = request(
+            operation="validate-database",
+            app_id=app["app_id"],
+            environment="phase6-staging",
+            migration_image=f"ghcr.io/attacker/migrator@sha256:{DIGEST}",
+        )
+        value.pop("image")
+        value.pop("strategy")
+        value["registry_token"] = "ghs_" + "z" * 32
+        with self.assertRaisesRegex(deploy.DeploymentError, "allowlisted GHCR package"):
+            deploy.validate_request(value, config)
+
+    def test_unhealthy_test_requires_an_explicit_server_policy(self):
+        value = request(operation="unhealthy-test")
+        value.pop("strategy")
+        with self.assertRaisesRegex(deploy.DeploymentError, "not enabled"):
+            deploy.validate_request(value, CONFIG)
+
+
+class RomanLmsContainerPolicyTests(unittest.TestCase):
+    def test_stack_request_requires_each_allowlisted_immutable_image(self):
+        app = dict(APP, migration_image_namespace="ghcr.io/owner/migrator", components={
+            "backend": {"image_namespace": "ghcr.io/owner/backend"},
+            "frontend": {"image_namespace": "ghcr.io/owner/frontend"},
+        })
+        value = request(operation="deploy-stack", migration_image=f"ghcr.io/owner/migrator@sha256:{DIGEST}", images={
+            "backend": f"ghcr.io/owner/backend@sha256:{DIGEST}",
+            "frontend": f"ghcr.io/owner/frontend@sha256:{DIGEST}",
+        })
+        value.pop("image")
+        config = {"applications": {"platform-smoke": app}}
+        deploy.validate_request(value, config)
+        for bad_images in ({"backend": value["images"]["backend"]}, {**value["images"], "frontend": "ghcr.io/owner/frontend:latest"}):
+            with self.subTest(images=bad_images), self.assertRaises(deploy.DeploymentError):
+                deploy.validate_request({**value, "images": bad_images}, config)
+
+    def test_failure_test_requires_explicit_component_and_allowlisted_digest(self):
+        app = dict(APP, stack_test_enabled=True, components={"backend": {"image_namespace": "ghcr.io/owner/backend"}})
+        value = request(operation="test-stack", component="backend", image=f"ghcr.io/owner/backend@sha256:{DIGEST}")
+        value.pop("strategy")
+        config = {"applications": {"platform-smoke": app}}
+        deploy.validate_request(value, config)
+        for change in ({"component": "frontend"}, {"image": "ghcr.io/other/backend:latest"}):
+            with self.subTest(change=change), self.assertRaises(deploy.DeploymentError):
+                deploy.validate_request({**value, **change}, config)
+
+    def test_stack_route_renders_both_components_for_one_slot(self):
+        components = {
+            "backend": {"route_prefix": "/lms/", "slot_ports": {"blue": 18182, "green": 18184}},
+            "frontend": {"route_prefix": "/", "slot_ports": {"blue": 18181, "green": 18183}},
+        }
+        rendered = deploy._stack_route_content(components, "green")
+        self.assertIn("location ^~ /lms/", rendered)
+        self.assertIn("127.0.0.1:18184", rendered)
+        self.assertIn("location /", rendered)
+        self.assertIn("127.0.0.1:18183", rendered)
+        self.assertNotIn("127.0.0.1:18182", rendered)
+        self.assertIn("proxy_set_header Upgrade $http_upgrade", rendered)
+
+    def test_stack_route_rejects_unsafe_or_ambiguous_routes(self):
+        for prefix in ("/lms/;return 200;", "/missing-trailing", "/../../"):
+            with self.subTest(prefix=prefix), self.assertRaises(deploy.DeploymentError):
+                deploy._stack_route_content({"backend": {"route_prefix": prefix, "slot_ports": {"blue": 18182}}}, "blue")
+        duplicated = {name: {"route_prefix": "/", "slot_ports": {"blue": port}} for name, port in (("one", 18181), ("two", 18182))}
+        with self.assertRaises(deploy.DeploymentError):
+            deploy._stack_route_content(duplicated, "blue")
+
+    def test_stack_route_uses_fixed_internal_addresses(self):
+        components = {
+            "backend": {"route_prefix": "/lms/", "container_port": 8080, "slot_ips": {"blue": "172.30.66.21"}},
+            "frontend": {"route_prefix": "/", "container_port": 3000, "slot_ips": {"blue": "172.30.66.31"}},
+        }
+        rendered = deploy._stack_route_content(components, "blue")
+        self.assertIn("proxy_pass http://172.30.66.21:8080;", rendered)
+        self.assertIn("proxy_pass http://172.30.66.31:3000;", rendered)
+
+    def test_flyway_info_requires_exact_version_and_no_pending_migrations(self):
+        valid = {"schemaVersion": "132", "migrations": [{"version": "132", "state": "Success"}]}
+        deploy._verify_flyway_info(json.dumps(valid), "132")
+        invalid = [
+            {"schemaVersion": "131", "migrations": [{"state": "Success"}]},
+            {"schemaVersion": "132", "migrations": [{"state": "Pending"}]},
+            {"schemaVersion": "132", "migrations": [{"state": "Failed"}]},
+            {"schemaVersion": "132", "migrations": []},
+        ]
+        for report in invalid:
+            with self.subTest(report=report), self.assertRaises(deploy.DeploymentError):
+                deploy._verify_flyway_info(json.dumps(report), "132")
+        with self.assertRaises(deploy.DeploymentError):
+            deploy._verify_flyway_info("not json", "132")
+
+    def test_flyway_info_requires_exact_approved_legacy_history(self):
+        exception = {"state": "Missing", "category": "Repeatable", "type": "SQL", "version": "", "description": "retired seed", "filepath": ""}
+        info = {"schemaVersion": "132", "flywayVersion": "11.14.1", "schemaName": "roman_lms", "migrations": [{"state": "Success"}, exception]}
+        deploy._verify_flyway_info(json.dumps(info), "132", [exception], flyway_version="11.14.1", schema_name="roman_lms")
+        with self.assertRaises(deploy.DeploymentError):
+            deploy._verify_flyway_info(json.dumps(info), "132")
+        with self.assertRaises(deploy.DeploymentError):
+            deploy._verify_flyway_info(json.dumps({**info, "migrations": [{"state": "Success"}]}), "132", [exception])
+
+    def test_database_preflight_rejects_missing_or_invalid_connection_before_registry_access(self):
+        cases = [
+            {"DB_URL": "jdbc:postgresql://db/stage", "DB_USERNAME": "", "DB_PASSWORD": "secret"},
+            {"DB_URL": "not-a-jdbc-url", "DB_USERNAME": "stage", "DB_PASSWORD": "secret"},
+            {"DB_URL": "jdbc:postgresql://db/stage", "DB_USERNAME": "stage"},
+        ]
+        for values in cases:
+            with self.subTest(values=values), \
+                 mock.patch.object(deploy, "_secure_env_file", return_value=Path("/private/env")), \
+                 mock.patch.object(deploy, "_env_file_values", return_value=values), \
+                 mock.patch.object(deploy, "registry_session") as registry:
+                with self.assertRaises(deploy.DeploymentError):
+                    deploy._validate_database({}, {"database_env_file": "/private/env"})
+                registry.assert_not_called()
+
+    def test_missing_environment_file_is_rejected(self):
+        with mock.patch.object(Path, "lstat", side_effect=FileNotFoundError):
+            with self.assertRaisesRegex(deploy.DeploymentError, "unavailable"):
+                deploy._secure_env_file("/private/missing.env")
+
+    def test_container_options_use_private_network_and_root_controlled_slot_values(self):
+        app = dict(
+            APP,
+            app_id="romanlms-phase6-backend",
+            container_network="romanlms-phase6-staging",
+            container_env_file="/etc/roman-platform/romanlms-phase6/runtime.env",
+            container_environment_by_slot={"blue": {"PORT": "8080", "SERVER_ADDRESS": "0.0.0.0"}},
+            container_tmpfs=["/tmp:rw,nosuid,nodev,noexec,size=256m,mode=1777"],
+        )
+        with mock.patch.object(deploy, "_secure_env_file", return_value=Path(app["container_env_file"])):
+            args = deploy._container_run_args(app, "registry/app@sha256:" + DIGEST, "roman-test", "blue", 18182, SHA)
+        self.assertIn("--network", args)
+        self.assertEqual(args[args.index("--network") + 1], "romanlms-phase6-staging")
+        self.assertIn("127.0.0.1:18182:8080", args)
+        self.assertIn("--env-file", args)
+        self.assertIn("PORT=8080", args)
+        self.assertNotIn("host", args)
+
+    def test_app_image_revision_tracks_caller_source_while_smoke_stays_pinned_to_platform(self):
+        with mock.patch.object(deploy, "verify_image_labels") as verify:
+            deploy._verify_image("image", {"commit_sha": SHA, "platform_sha": WORKFLOW_SHA}, {**APP, "image_revision_mode": "caller"}, {})
+        self.assertEqual(verify.call_args.args[1], SHA)
+        with mock.patch.object(deploy, "verify_image_labels") as verify:
+            deploy._verify_image("image", {"commit_sha": SHA, "platform_sha": WORKFLOW_SHA}, APP, {})
+        self.assertEqual(verify.call_args.args[1], WORKFLOW_SHA)
+
+
+class StackDeploymentTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        root = Path(self.directory.name)
+        self.route = root / "route.conf"
+        self.route.write_text("return 503;\n", encoding="utf-8")
+        self.state = root / "state.json"
+        self.app = dict(APP, app_id="test-stack", state_file=str(self.state), route_file=str(self.route),
+                        container_network="private-stack", network_subnet="172.30.66.0/24", private_listener_port=18081, container_publish=False, expected_schema_version="132", components={
+            "backend": {"route_prefix": "/lms/", "container_port": 8080, "slot_ips": {"blue": "172.30.66.21", "green": "172.30.66.22"}, "route_health_url": "http://127.0.0.1:18081/lms/actuator/health"},
+            "frontend": {"route_prefix": "/", "container_port": 3000, "slot_ips": {"blue": "172.30.66.31", "green": "172.30.66.32"}, "route_health_url": "http://127.0.0.1:18081/"},
+        })
+        self.request = request(operation="deploy-stack", images={"backend": "image-b", "frontend": "image-f"}, migration_image="migration")
+
+    def test_deploy_starts_both_components_before_one_route_switch(self):
+        commands = []
+        def run(args, **kwargs):
+            commands.append(args)
+            return subprocess.CompletedProcess(args, 0, "", "")
+        def switch(app, slot):
+            self.assertEqual(sum(args[:2] == ["docker", "run"] for args in commands), 2)
+            self.route.write_text("switched " + slot, encoding="utf-8")
+        with mock.patch.object(deploy, "_validate_database"), mock.patch.object(deploy, "registry_session", return_value=contextlib.nullcontext({})), \
+             mock.patch.object(deploy, "run_command", side_effect=run), mock.patch.object(deploy, "_verify_image"), \
+             mock.patch.object(deploy, "_remove_inactive_slot"), mock.patch.object(deploy, "_stack_release_healthy"), \
+             mock.patch.object(deploy, "verify_release_origin"), mock.patch.object(deploy, "_switch_stack_route", side_effect=switch), \
+             mock.patch.object(deploy, "require_storage_mounts"), mock.patch.object(deploy, "_append_audit"), mock.patch.object(deploy, "_write_metrics"):
+            result = deploy._deploy_stack(self.request, self.app)
+        self.assertEqual(result["slot"], "blue")
+        state = json.loads(self.state.read_text(encoding="utf-8"))
+        self.assertEqual(set(state["active"]["components"]), {"backend", "frontend"})
+        self.assertEqual(self.route.read_text(encoding="utf-8"), "switched blue")
+        candidate_commands = [args for args in commands if args[:2] == ["docker", "run"]]
+        self.assertTrue(all("--publish" not in args and "--ip" in args for args in candidate_commands))
+
+    def test_second_component_failure_removes_started_candidate_and_keeps_route(self):
+        commands = []
+        def run(args, **kwargs):
+            commands.append(args)
+            if args[:2] == ["docker", "run"] and sum(c[:2] == ["docker", "run"] for c in commands) == 2:
+                raise deploy.DeploymentError("candidate failed")
+            return subprocess.CompletedProcess(args, 0, "", "")
+        with mock.patch.object(deploy, "_validate_database"), mock.patch.object(deploy, "registry_session", return_value=contextlib.nullcontext({})), \
+             mock.patch.object(deploy, "run_command", side_effect=run), mock.patch.object(deploy, "_verify_image"), \
+             mock.patch.object(deploy, "_remove_inactive_slot"), mock.patch.object(deploy, "_append_audit"), mock.patch.object(deploy, "_switch_stack_route") as switch:
+            with self.assertRaisesRegex(deploy.DeploymentError, "candidate failed"):
+                deploy._deploy_stack(self.request, self.app)
+        switch.assert_not_called()
+        self.assertEqual(self.route.read_text(encoding="utf-8"), "return 503;\n")
+        self.assertEqual(sum(args[:3] == ["docker", "rm", "-f"] for args in commands), 2)
+
+    def test_failed_migration_preflight_never_pulls_or_switches(self):
+        with mock.patch.object(deploy, "_validate_database", side_effect=deploy.DeploymentError("migration preflight")), \
+             mock.patch.object(deploy, "registry_session") as registry, mock.patch.object(deploy, "_switch_stack_route") as switch:
+            with self.assertRaisesRegex(deploy.DeploymentError, "migration preflight"):
+                deploy._deploy_stack(self.request, self.app)
+        registry.assert_not_called()
+        switch.assert_not_called()
+
+    def test_failure_test_preserves_active_pair_and_records_expected_rejection(self):
+        self.app["stack_test_enabled"] = True
+        self.app["components"]["backend"]["slot_ips"]["test"] = "172.30.66.41"
+        self.app["components"]["frontend"]["slot_ips"]["test"] = "172.30.66.42"
+        self.app["components"]["backend"]["unhealthy_test_environment"] = {"DB_URL": "jdbc:postgresql://invalid.example/test"}
+        self.app["components"]["backend"]["unhealthy_test_timeout_seconds"] = 1
+        active = {"slot": "blue", "commit_sha": SHA}
+        self.state.write_text(json.dumps({"active": active}), encoding="utf-8")
+        value = request(operation="test-stack", component="backend", image="image-b")
+        def run(args, **kwargs):
+            return subprocess.CompletedProcess(args, 1 if args[:2] == ["docker", "inspect"] else 0, "", "")
+        with mock.patch.object(deploy, "_stack_release_healthy") as health, mock.patch.object(deploy, "_stack_route_healthy") as route, \
+             mock.patch.object(deploy, "registry_session", return_value=contextlib.nullcontext({})), mock.patch.object(deploy, "_verify_image"), \
+             mock.patch.object(deploy, "run_command", side_effect=run) as command, mock.patch.object(deploy, "_wait_http", side_effect=deploy.DeploymentError("unhealthy")), \
+             mock.patch.object(deploy, "_append_audit") as audit, mock.patch.object(deploy, "_write_metrics") as metrics:
+            result = deploy._test_stack_failure(value, self.app)
+        self.assertEqual(result["outcome"], "expected-rejection")
+        self.assertEqual(health.call_count, 2)
+        self.assertEqual(route.call_count, 2)
+        self.assertTrue(any(call.args[0][:3] == ["docker", "rm", "-f"] for call in command.call_args_list))
+        self.assertEqual(audit.call_args.args[1]["outcome"], "failure")
+        self.assertEqual(metrics.call_args.args[2], "failure")
+
+    def test_unhealthy_component_removes_both_candidates_without_switching(self):
+        commands = []
+        def run(args, **kwargs):
+            commands.append(args)
+            return subprocess.CompletedProcess(args, 0, "", "")
+        with mock.patch.object(deploy, "_validate_database"), mock.patch.object(deploy, "registry_session", return_value=contextlib.nullcontext({})), \
+             mock.patch.object(deploy, "run_command", side_effect=run), mock.patch.object(deploy, "_verify_image"), \
+             mock.patch.object(deploy, "_remove_inactive_slot"), mock.patch.object(deploy, "_stack_release_healthy", side_effect=deploy.DeploymentError("unhealthy")), \
+             mock.patch.object(deploy, "_append_audit"), mock.patch.object(deploy, "_switch_stack_route") as switch:
+            with self.assertRaisesRegex(deploy.DeploymentError, "unhealthy"):
+                deploy._deploy_stack(self.request, self.app)
+        switch.assert_not_called()
+        self.assertEqual(sum(args[:3] == ["docker", "rm", "-f"] for args in commands), 2)
+        self.assertEqual(self.route.read_text(encoding="utf-8"), "return 503;\n")
+
+    def test_removal_refuses_active_slot_even_when_docker_returns_ids(self):
+        with mock.patch.object(deploy, "_active_containers") as containers:
+            with self.assertRaisesRegex(deploy.DeploymentError, "active release"):
+                deploy._remove_inactive_slot(APP, "blue", {"slot": "blue", "container": "a-name"})
+        containers.assert_not_called()
+
+    def test_rejects_component_address_collision_and_publication(self):
+        self.app["components"]["frontend"]["slot_ips"]["blue"] = "172.30.66.21"
+        with self.assertRaisesRegex(deploy.DeploymentError, "address policy"):
+            deploy._stack_validate_network(self.app)
+        self.app["components"]["frontend"]["slot_ips"]["blue"] = "172.30.66.31"
+        self.app["components"]["frontend"]["container_publish"] = True
+        with self.assertRaisesRegex(deploy.DeploymentError, "without published ports"):
+            deploy._stack_validate_network(self.app)
+
+    def test_rollback_switches_both_components_to_the_retained_release(self):
+        active = {"slot": "green", "commit_sha": "b" * 40, "schema_version": "132"}
+        previous = {"slot": "blue", "commit_sha": "a" * 40, "schema_version": "132"}
+        self.state.write_text(json.dumps({"active": active, "previous": previous}), encoding="utf-8")
+        with mock.patch.object(deploy, "_validate_database"), mock.patch.object(deploy, "_start_retained_stack", return_value=[]) as health, \
+             mock.patch.object(deploy, "verify_release_origin"), mock.patch.object(deploy, "_switch_stack_route") as switch, \
+             mock.patch.object(deploy, "require_storage_mounts"), mock.patch.object(deploy, "_append_audit"), mock.patch.object(deploy, "_write_metrics"):
+            result = deploy._rollback_stack(self.request, self.app)
+        health.assert_called_once_with(self.app, previous)
+        switch.assert_called_once_with(self.app, "blue")
+        self.assertEqual(result["slot"], "blue")
+        state = json.loads(self.state.read_text(encoding="utf-8"))
+        self.assertEqual(state["active"], previous)
+        self.assertEqual(state["previous"], active)
+
+    def test_rollback_rejects_a_different_schema_version(self):
+        self.state.write_text(json.dumps({"active": {"slot": "green"}, "previous": {"slot": "blue", "schema_version": "131"}}), encoding="utf-8")
+        with mock.patch.object(deploy, "_validate_database"), mock.patch.object(deploy, "_switch_stack_route") as switch:
+            with self.assertRaisesRegex(deploy.DeploymentError, "schema policy"):
+                deploy._rollback_stack(self.request, self.app)
+        switch.assert_not_called()
+
+    def test_failed_component_route_health_restores_the_whole_prior_route(self):
+        with mock.patch.object(deploy, "run_command", return_value=subprocess.CompletedProcess([], 0, "", "")) as run, \
+             mock.patch.object(deploy, "_wait_http", side_effect=[None, deploy.DeploymentError("unhealthy")]):
+            with self.assertRaisesRegex(deploy.DeploymentError, "unhealthy"):
+                deploy._switch_stack_route(self.app, "blue")
+        self.assertEqual(self.route.read_text(encoding="utf-8"), "return 503;\n")
+        self.assertEqual(sum(call.args[0] == ["systemctl", "reload", "nginx"] for call in run.call_args_list), 2)
+
+
+class Phase6PolicyTests(unittest.TestCase):
+    def test_private_policy_keeps_network_database_and_publication_closed(self):
+        app = CONFIG["applications"]["romanlms-phase6"]
+        deploy._stack_validate_network(app)
+        self.assertFalse(app["container_publish"])
+        self.assertEqual(app["container_restart_policy"], "no")
+        self.assertEqual(app["allowed_database_urls"], ["jdbc:postgresql://romanlms-phase6-db:5432/romanlms_phase6"])
+        self.assertEqual(app["private_listener_port"], 18081)
+        self.assertEqual(set(app["components"]), {"backend", "frontend"})
+        self.assertTrue(all(len(value) == 40 for value in app["allowed_platform_shas"]))
+        for slot in ("blue", "green"):
+            rendered = deploy._stack_route_content(app["components"], slot)
+            self.assertIn(app["components"]["backend"]["slot_ips"][slot], rendered)
+            self.assertIn(app["components"]["frontend"]["slot_ips"][slot], rendered)
 
 
 class ForcedCommandLauncherTests(unittest.TestCase):
@@ -334,6 +694,21 @@ class GateTests(unittest.TestCase):
             with self.assertRaisesRegex(deploy.DeploymentError, "Insufficient available memory"):
                 deploy.preflight(APP)
 
+    @unittest.skipUnless(os.name == "posix" and hasattr(os, "geteuid") and os.geteuid() == 0, "requires Linux root-owned test files")
+    def test_restore_marker_must_match_approved_backup_and_schema(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            marker = Path(tmp) / "restore.json"
+            marker.write_text(json.dumps({"source_sha256": "a" * 64, "schema_version": "132"}), encoding="utf-8")
+            marker.chmod(0o600)
+            app = dict(APP, backup_marker=str(marker), backup_max_age_hours=24,
+                       backup_marker_expected_source_sha256="a" * 64, expected_schema_version="132")
+            patches = self._healthy_preflight()
+            with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6]:
+                deploy.preflight(app)
+                marker.write_text(json.dumps({"source_sha256": "b" * 64, "schema_version": "132"}), encoding="utf-8")
+                with self.assertRaisesRegex(deploy.DeploymentError, "does not match"):
+                    deploy.preflight(app)
+
     def test_docker_root_must_be_on_apps_drive(self):
         patches = self._healthy_preflight()
         with patches[0], mock.patch.object(deploy, "docker_root", return_value="/var/lib/docker"), patches[2], patches[3], patches[4], patches[5], patches[6]:
@@ -408,9 +783,22 @@ class MetricsTests(unittest.TestCase):
 
 
 class GrafanaAlertProvisioningTests(unittest.TestCase):
+    def test_private_dashboard_includes_release_health_and_resource_queries(self):
+        dashboard = grafana_alerts.desired_dashboard()
+        self.assertIn(grafana_alerts.DASHBOARD_TAG, dashboard["tags"])
+        queries = " ".join(panel["targets"][0]["expr"] for panel in dashboard["panels"])
+        for metric in ("romanlms_phase6_component_up", "romanlms_phase6_http_requests_total", "romanlms_phase6_jvm_memory_used_bytes", "roman_platform_active_release_info", "roman_pgbackrest_last_backup_age_seconds"):
+            self.assertIn(metric, queries)
+
+    def test_dashboard_refuses_to_overwrite_an_unmanaged_uid(self):
+        with mock.patch.object(grafana_alerts, "api_request", return_value={"dashboard": {"tags": []}}) as api:
+            with self.assertRaisesRegex(grafana_alerts.ProvisioningError, "belongs to another dashboard"):
+                grafana_alerts._upsert_dashboard("unused", "folder")
+        self.assertEqual(api.call_count, 1)
     def test_rules_use_existing_warning_route_and_deployment_metrics(self):
-        rules = grafana_alerts.desired_rules("alerts-folder")
-        self.assertEqual(len(rules), 2)
+        self.assertEqual(len(grafana_alerts.desired_rules("alerts-folder")), 2)
+        rules = grafana_alerts.desired_rules("alerts-folder", include_phase6=True)
+        self.assertEqual(len(rules), 6)
         self.assertTrue(all(item["metadata"]["annotations"]["grafana.app/folder"] == "alerts-folder" for item in rules))
         self.assertTrue(all("grafana.app/folder" not in item["metadata"].get("labels", {}) for item in rules))
         self.assertTrue(all("grafana.com/group" not in item["metadata"].get("labels", {}) for item in rules))
@@ -418,6 +806,8 @@ class GrafanaAlertProvisioningTests(unittest.TestCase):
         self.assertTrue(all(item["spec"]["labels"]["severity"] == "warning" for item in rules))
         self.assertIn('outcome="failure"', rules[0]["spec"]["expressions"]["A"]["model"]["expr"])
         self.assertIn("bool 120", rules[1]["spec"]["expressions"]["A"]["model"]["expr"])
+        self.assertIn('app_id="romanlms-phase6"', rules[2]["spec"]["expressions"]["A"]["model"]["expr"])
+        self.assertIn('app_id="romanlms-phase6"', rules[3]["spec"]["expressions"]["A"]["model"]["expr"])
         self.assertTrue(all(item["spec"]["noDataState"] == "Ok" for item in rules))
 
     def test_upsert_skips_an_unchanged_rule_when_grafana_omits_zero_for(self):

@@ -1,0 +1,21 @@
+[Unit]
+Description=Start isolated RomanLMS Phase 6 services after their storage mounts
+Requires=docker.service
+After=docker.service nginx.service
+RequiresMountsFor=/srv/apps /srv/databases /srv/data
+ConditionPathIsMountPoint=/srv/apps
+ConditionPathIsMountPoint=/srv/databases
+ConditionPathIsMountPoint=/srv/data
+ConditionPathExists=/srv/data/romanlms-phase6/restore-ready.json
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStartPre=/usr/bin/mountpoint -q /srv/apps
+ExecStartPre=/usr/bin/mountpoint -q /srv/databases
+ExecStartPre=/usr/bin/mountpoint -q /srv/data
+ExecStart=/usr/bin/python3 /opt/roman-platform/bin/start-romanlms-phase6
+TimeoutStartSec=600
+
+[Install]
+WantedBy=multi-user.target

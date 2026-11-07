@@ -12,6 +12,10 @@
     platform_repo_root: "{{ playbook_dir }}/../.."
     nginx_site_file: /etc/nginx/conf.d/roman-platform-smoke.conf
     nginx_route_file: /etc/roman-platform/nginx/active-smoke.conf
+    romanlms_phase6_root: /srv/apps/romanlms-phase6
+    romanlms_phase6_site_file: /etc/nginx/conf.d/romanlms-phase6-private.conf
+    romanlms_phase6_route: /etc/roman-platform/nginx/active-romanlms-phase6.conf
+    install_romanlms_phase6: false
 
   tasks:
     - name: Require a dedicated Ed25519 deployment public key
@@ -32,6 +36,14 @@
         that:
           - ansible_mounts | selectattr('mount', 'equalto', '/srv/apps') | list | length == 1
         fail_msg: /srv/apps is not mounted; no controller files will be installed.
+
+    - name: Require the configured database and data storage mounts
+      ansible.builtin.assert:
+        that:
+          - ansible_mounts | selectattr('mount', 'equalto', '/srv/databases') | list | length == 1
+          - ansible_mounts | selectattr('mount', 'equalto', '/srv/data') | list | length == 1
+        fail_msg: /srv/databases or /srv/data is not mounted; Phase 6 remains closed.
+      when: install_romanlms_phase6 | bool
 
     - name: Read service state
       ansible.builtin.service_facts:
@@ -99,6 +111,32 @@
           - listener_check.stdout | trim == '' or platform_nginx_site.stat.exists
         fail_msg: Port 18080 is already in use and is not managed by this platform.
 
+    - name: Check whether the Phase 6 private listener is already managed
+      ansible.builtin.stat:
+        path: "{{ romanlms_phase6_site_file }}"
+      register: romanlms_phase6_nginx_site
+      when: install_romanlms_phase6 | bool
+
+    - name: Check whether the Phase 6 private listener port is already occupied
+      ansible.builtin.command:
+        argv:
+          - ss
+          - -ltnH
+          - sport
+          - '='
+          - :18081
+      register: romanlms_phase6_listener_check
+      changed_when: false
+      failed_when: false
+      when: install_romanlms_phase6 | bool
+
+    - name: Refuse to claim an unrelated Phase 6 listener
+      ansible.builtin.assert:
+        that:
+          - romanlms_phase6_listener_check.stdout | trim == '' or romanlms_phase6_nginx_site.stat.exists
+        fail_msg: Port 18081 is already in use and is not managed by the Phase 6 private route.
+      when: install_romanlms_phase6 | bool
+
     - name: Create root-owned controller directories
       ansible.builtin.file:
         path: "{{ item.path }}"
@@ -114,6 +152,20 @@
         - { path: "{{ platform_storage_root }}/logs", mode: "0750" }
         - { path: /run/roman-platform, mode: "0700" }
         - { path: /run/lock/roman-platform, mode: "0750" }
+
+    - name: Create root-owned Phase 6 directories
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "{{ item.mode }}"
+      loop:
+        - { path: "{{ romanlms_phase6_root }}/state", mode: "0750" }
+        - { path: "{{ romanlms_phase6_root }}/logs", mode: "0750" }
+        - { path: "{{ platform_config_dir }}/romanlms-phase6", mode: "0700" }
+        - { path: /etc/systemd/system/roman-monitoring-collector.service.d, mode: "0755" }
+      when: install_romanlms_phase6 | bool
 
     - name: Install the Python controller
       ansible.builtin.copy:
@@ -146,6 +198,53 @@
         owner: root
         group: root
         mode: "0750"
+
+    - name: Install the isolated Phase 6 restore bootstrap
+      ansible.builtin.copy:
+        src: "{{ platform_repo_root }}/deploy/staging/prepare_romanlms_phase6.py"
+        dest: "{{ platform_root }}/bin/prepare-romanlms-phase6"
+        owner: root
+        group: root
+        mode: "0750"
+      when: install_romanlms_phase6 | bool
+
+    - name: Install the mount-checked Phase 6 startup helper
+      ansible.builtin.copy:
+        src: "{{ platform_repo_root }}/deploy/staging/start_romanlms_phase6.py"
+        dest: "{{ platform_root }}/bin/start-romanlms-phase6"
+        owner: root
+        group: root
+        mode: "0750"
+      when: install_romanlms_phase6 | bool
+
+    - name: Install the bounded private application metric collector
+      ansible.builtin.copy:
+        src: "{{ platform_repo_root }}/deploy/monitoring/collect_romanlms_phase6.py"
+        dest: "{{ platform_root }}/bin/collect-romanlms-phase6"
+        owner: root
+        group: root
+        mode: "0750"
+      when: install_romanlms_phase6 | bool
+
+    - name: Add private application metrics to the existing collector schedule
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/roman-monitoring-collector.service.d/romanlms-phase6.conf
+        content: "[Service]\nTimeoutStartSec=150s\nExecStart=-/usr/bin/python3 {{ platform_root }}/bin/collect-romanlms-phase6\n"
+        owner: root
+        group: root
+        mode: "0644"
+      notify: Reload systemd manager
+      when: install_romanlms_phase6 | bool
+
+    - name: Install the mount-checked Phase 6 startup service
+      ansible.builtin.template:
+        src: templates/romanlms-phase6.service.j2
+        dest: /etc/systemd/system/romanlms-phase6.service
+        owner: root
+        group: root
+        mode: "0644"
+      notify: Reload systemd manager
+      when: install_romanlms_phase6 | bool
 
     - name: Install the server allowlist
       ansible.builtin.copy:
@@ -200,6 +299,16 @@
         mode: "0644"
         force: false
 
+    - name: Create a closed Phase 6 application route
+      ansible.builtin.copy:
+        dest: "{{ romanlms_phase6_route }}"
+        content: "return 503;\n"
+        owner: root
+        group: root
+        mode: "0644"
+        force: false
+      when: install_romanlms_phase6 | bool
+
     - name: Install an isolated loopback-only Nginx listener
       ansible.builtin.template:
         src: templates/roman-platform-smoke.conf.j2
@@ -209,15 +318,29 @@
         mode: "0644"
       notify: Reload Roman platform Nginx
 
+    - name: Install an isolated loopback-only RomanLMS Phase 6 listener
+      ansible.builtin.template:
+        src: templates/romanlms-phase6-private.conf.j2
+        dest: "{{ romanlms_phase6_site_file }}"
+        owner: root
+        group: root
+        mode: "0644"
+      notify: Reload Roman platform Nginx
+      when: install_romanlms_phase6 | bool
+
     - name: Apply and validate the private Nginx listener before alert setup
       ansible.builtin.meta: flush_handlers
 
     - name: Add deployment outcome rules to the existing Telegram route
-      ansible.builtin.command: "{{ platform_root }}/bin/provision-grafana-alerts"
+      ansible.builtin.command: "{{ platform_root }}/bin/provision-grafana-alerts{{ ' --include-phase6' if install_romanlms_phase6 | bool else '' }}"
       register: deployment_alert_setup
       changed_when: "'changed=true' in deployment_alert_setup.stdout"
 
   handlers:
+    - name: Reload systemd manager
+      ansible.builtin.systemd_service:
+        daemon_reload: true
+
     - name: Validate Nginx configuration
       ansible.builtin.command: nginx -t
       listen: Reload Roman platform Nginx

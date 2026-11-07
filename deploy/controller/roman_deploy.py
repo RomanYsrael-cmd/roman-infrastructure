@@ -4,10 +4,12 @@
 from __future__ import annotations
 
 import contextlib
+import ipaddress
 import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -51,10 +53,23 @@ def validate_request(request: Any, config: dict[str, Any]) -> tuple[dict[str, An
         "operation", "app_id", "repository", "branch", "commit_sha",
         "workflow_sha", "platform_sha", "environment", "release", "github_token",
     }
-    allowed = common | ({"image", "strategy", "registry_token"} if operation == "deploy" else set())
-    if operation not in {"deploy", "rollback"} or set(request) - allowed:
+    operation_fields = {
+        "deploy": {"image", "strategy", "registry_token"},
+        "unhealthy-test": {"image", "registry_token"},
+        "validate-database": {"migration_image", "registry_token"},
+        "deploy-stack": {"images", "strategy", "migration_image", "registry_token"},
+        "rollback-stack": {"migration_image", "registry_token"},
+        "test-stack": {"image", "component", "registry_token"},
+        "verify-stack": set(),
+        "verify": set(),
+        "rollback": set(),
+    }
+    if operation not in operation_fields:
         raise DeploymentError("Request contains unsupported fields or operation.")
-    required = common | ({"image", "strategy", "registry_token"} if operation == "deploy" else set())
+    allowed = common | operation_fields[operation]
+    if set(request) - allowed:
+        raise DeploymentError("Request contains unsupported fields or operation.")
+    required = common | operation_fields[operation]
     if required - set(request):
         raise DeploymentError("Request is missing required deployment metadata.")
 
@@ -93,14 +108,54 @@ def validate_request(request: Any, config: dict[str, Any]) -> tuple[dict[str, An
     _text(release["actor"], "workflow actor", 100)
     _secret(request["github_token"], "GitHub token")
 
-    if operation == "deploy":
-        if request["strategy"] != app["strategy"]:
+    if operation in {"deploy", "unhealthy-test"}:
+        if operation == "unhealthy-test" and not app.get("unhealthy_test_enabled"):
+            raise DeploymentError("Unhealthy-candidate testing is not enabled for this application.")
+        if operation == "deploy" and request.get("strategy") != app["strategy"]:
             raise DeploymentError("Deployment strategy does not match server policy.")
         image = _text(request["image"], "image digest reference", 300)
         image_namespace = re.escape(app["image_namespace"])
         if not re.fullmatch(image_namespace + r"@sha256:[0-9a-f]{64}", image):
             raise DeploymentError("Image must use the allowlisted GHCR package and immutable digest.")
         _secret(request["registry_token"], "registry token")
+    elif operation in {"validate-database", "deploy-stack", "rollback-stack"}:
+        namespace = app.get("migration_image_namespace")
+        if not isinstance(namespace, str) or not namespace:
+            raise DeploymentError("Database validation is not configured for this application.")
+        image = _text(request["migration_image"], "migration image digest reference", 300)
+        if not re.fullmatch(re.escape(namespace) + r"@sha256:[0-9a-f]{64}", image):
+            raise DeploymentError("Migration image must use the allowlisted GHCR package and immutable digest.")
+        _secret(request["registry_token"], "registry token")
+
+    if operation in {"deploy-stack", "rollback-stack"}:
+        components = app.get("components")
+        if not isinstance(components, dict) or not components:
+            raise DeploymentError("Application components are not configured.")
+        if operation == "deploy-stack":
+            if request["strategy"] != app["strategy"]:
+                raise DeploymentError("Deployment strategy does not match server policy.")
+            images = request["images"]
+            if not isinstance(images, dict) or set(images) != set(components):
+                raise DeploymentError("A digest is required for every approved application component.")
+            for name, component in components.items():
+                if not isinstance(component, dict) or not isinstance(component.get("image_namespace"), str):
+                    raise DeploymentError("Application component image policy is invalid.")
+                image = _text(images[name], "component image digest", 300)
+                if not re.fullmatch(re.escape(component["image_namespace"]) + r"@sha256:[0-9a-f]{64}", image):
+                    raise DeploymentError("Component image must use an allowlisted immutable digest.")
+    elif operation == "test-stack":
+        components = app.get("components")
+        name = request.get("component")
+        if not app.get("stack_test_enabled") or not isinstance(components, dict) or not isinstance(name, str) or name not in components:
+            raise DeploymentError("The requested application failure test is not enabled.")
+        namespace = components[name].get("image_namespace") if isinstance(components[name], dict) else None
+        image = _text(request["image"], "component image digest", 300)
+        if not isinstance(namespace, str) or not re.fullmatch(re.escape(namespace) + r"@sha256:[0-9a-f]{64}", image):
+            raise DeploymentError("Component image must use an allowlisted immutable digest.")
+        _secret(request["registry_token"], "registry token")
+    elif operation == "verify-stack" and not isinstance(app.get("components"), dict):
+        raise DeploymentError("Application components are not configured.")
+
     return app, request
 
 
@@ -173,6 +228,25 @@ def verify_release_origin(request: dict[str, Any], app: dict[str, Any]) -> None:
     commit_info = github_json(repo, f"commits/{request['commit_sha']}", request["github_token"])
     if commit_info.get("sha") != request["commit_sha"]:
         raise DeploymentError("GitHub did not confirm the requested commit.")
+    if request["operation"] in {"deploy-stack", "rollback-stack", "test-stack", "verify-stack"}:
+        verify_required_ci(request, app)
+
+
+def verify_required_ci(request: dict[str, Any], app: dict[str, Any]) -> None:
+    workflow = app.get("required_ci_workflow_file")
+    if not isinstance(workflow, str) or not re.fullmatch(r"[A-Za-z0-9_.-]+\.ya?ml", workflow):
+        raise DeploymentError("The required CI workflow is not configured.")
+    payload = github_json(app["repository"], f"actions/workflows/{workflow}/runs?head_sha={request['commit_sha']}&event=push&per_page=20", request["github_token"])
+    runs = payload.get("workflow_runs")
+    if not isinstance(runs, list):
+        raise DeploymentError("The required CI result is unavailable.")
+    matching = [item for item in runs if isinstance(item, dict) and item.get("head_sha") == request["commit_sha"] and item.get("head_branch") == app["production_branch"] and item.get("event") == "push" and isinstance(item.get("id"), int)]
+    if not matching:
+        raise DeploymentError("The required CI has not run for this release commit.")
+    latest = max(matching, key=lambda item: (item["id"], item.get("run_attempt") if isinstance(item.get("run_attempt"), int) else 0))
+    actor = latest.get("actor") or {}
+    if latest.get("status") != "completed" or latest.get("conclusion") != "success" or not isinstance(actor, dict) or actor.get("login") not in app.get("authorized_actors", []):
+        raise DeploymentError("The latest required CI run for this release did not pass under an authorized actor.")
 
 
 def run_command(
@@ -225,6 +299,57 @@ def service_is_active(service: str) -> bool:
     return result.returncode == 0
 
 
+def _secure_env_file(path_value: Any) -> Path:
+    if not isinstance(path_value, str) or not path_value.startswith("/"):
+        raise DeploymentError("A root-controlled environment file is not configured.")
+    path = Path(path_value)
+    try:
+        info = path.lstat()
+    except OSError as exc:
+        raise DeploymentError("A required root-controlled environment file is unavailable.") from exc
+    if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode) or stat.S_IMODE(info.st_mode) & 0o077:
+        raise DeploymentError("A required environment file is not a private regular file.")
+    if os.name == "posix" and info.st_uid != 0:
+        raise DeploymentError("A required environment file is not root-owned.")
+    return path
+
+
+def _env_file_values(path: Path) -> dict[str, str]:
+    values: dict[str, str] = {}
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        raise DeploymentError("A required environment file cannot be read.") from exc
+    for line in lines:
+        if not line or line.lstrip().startswith("#"):
+            continue
+        if "=" not in line:
+            raise DeploymentError("A required environment file has invalid syntax.")
+        key, value = line.split("=", 1)
+        if not re.fullmatch(r"[A-Z][A-Z0-9_]*", key) or "\n" in value or "\r" in value:
+            raise DeploymentError("A required environment file has invalid syntax.")
+        values[key] = value
+    return values
+
+
+def _image_source_revision(request: dict[str, Any], app: dict[str, Any]) -> str:
+    if app.get("image_revision_mode", "platform") == "caller":
+        return request["commit_sha"]
+    return request["platform_sha"]
+
+
+def _verify_image(image: str, request: dict[str, Any], app: dict[str, Any], env: dict[str, str]) -> None:
+    verify_image_labels(
+        image,
+        _image_source_revision(request, app),
+        request["commit_sha"],
+        request["platform_sha"],
+        app["image_package_repository"],
+        app["image_source_repository"],
+        env,
+    )
+
+
 def preflight(app: dict[str, Any]) -> None:
     require_storage_mounts(app)
     root = os.path.realpath(docker_root())
@@ -245,12 +370,58 @@ def preflight(app: dict[str, Any]) -> None:
     for service in app["required_services"]:
         if not service_is_active(service):
             raise DeploymentError(f"Required service is not active: {service}.")
+    network = app.get("container_network")
+    if network:
+        if not isinstance(network, str) or not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}", network):
+            raise DeploymentError("The configured private container network name is invalid.")
+        result = run_command(
+            ["docker", "network", "inspect", "--format", "{{.Internal}}", network],
+            timeout=15,
+            check=False,
+        )
+        if result.returncode != 0 or result.stdout.strip().lower() != "true":
+            raise DeploymentError("The required container network is missing or not isolated from external networks.")
+        if app.get("network_subnet"):
+            result = run_command(["docker", "network", "inspect", "--format", "{{json .IPAM.Config}}", network], timeout=15, check=False)
+            try:
+                entries = json.loads(result.stdout)
+                subnets = {entry["Subnet"] for entry in entries if isinstance(entry, dict) and "Subnet" in entry}
+                expected_subnet = str(ipaddress.ip_network(app["network_subnet"], strict=True))
+            except (ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
+                raise DeploymentError("The approved private network subnet is invalid.") from exc
+            if result.returncode != 0 or subnets != {expected_subnet}:
+                raise DeploymentError("The isolated network subnet does not match server policy.")
+            gateways = {entry.get("Gateway") for entry in entries if isinstance(entry, dict) and entry.get("Gateway")}
+            component_ips = {address for component in app.get("components", {}).values() for address in component.get("slot_ips", {}).values()}
+            if gateways & component_ips:
+                raise DeploymentError("A component address conflicts with the private network gateway.")
+    for container in app.get("required_healthy_containers", []):
+        if not isinstance(container, str) or not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}", container):
+            raise DeploymentError("The required service container name is invalid.")
+        result = run_command(
+            ["docker", "inspect", "--format", "{{.State.Health.Status}}", container],
+            timeout=15,
+            check=False,
+        )
+        if result.returncode != 0 or result.stdout.strip().lower() != "healthy":
+            raise DeploymentError(f"Required service container is not healthy: {container}.")
+    for key in ("container_env_file", "database_env_file"):
+        if app.get(key):
+            _secure_env_file(app[key])
     marker = app.get("backup_marker")
     if marker:
         path = Path(marker)
         max_age = int(app["backup_max_age_hours"]) * 3600
         if not path.is_file() or time.time() - path.stat().st_mtime > max_age:
             raise DeploymentError("The application backup gate is not satisfied.")
+        if app.get("backup_marker_expected_source_sha256"):
+            _secure_env_file(marker)
+            try:
+                evidence = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise DeploymentError("The staging restore evidence is invalid.") from exc
+            if not isinstance(evidence, dict) or evidence.get("source_sha256") != app["backup_marker_expected_source_sha256"] or evidence.get("schema_version") != str(app["expected_schema_version"]):
+                raise DeploymentError("The staging restore evidence does not match the approved backup and schema.")
 
 
 @contextlib.contextmanager
@@ -274,6 +445,76 @@ def registry_session(app: dict[str, Any], request: dict[str, Any]):
             yield env
         finally:
             run_command(["docker", "logout", "ghcr.io"], env=env, timeout=15, check=False)
+
+
+def _container_run_args(
+    app: dict[str, Any],
+    image: str,
+    container_name: str,
+    slot: str,
+    port: int,
+    caller_revision: str,
+    *,
+    test_mode: bool = False,
+) -> list[str]:
+    restart_policy = "no" if test_mode else app.get("container_restart_policy", "unless-stopped")
+    if restart_policy not in {"no", "unless-stopped", "on-failure:3"}:
+        raise DeploymentError("The configured container restart policy is invalid.")
+    args = [
+        "docker", "run", "--detach",
+        "--name", container_name,
+        "--restart", restart_policy,
+        "--read-only",
+    ]
+    tmpfs_mounts = app.get("container_tmpfs", ["/tmp:rw,nosuid,nodev,noexec,size=16m,mode=1777"])
+    if not isinstance(tmpfs_mounts, list) or any(not isinstance(item, str) or "\n" in item or "\r" in item for item in tmpfs_mounts):
+        raise DeploymentError("The configured temporary mounts are invalid.")
+    for mount in tmpfs_mounts:
+        args.extend(["--tmpfs", mount])
+    args.extend([
+        "--cap-drop", "ALL",
+        "--security-opt", "no-new-privileges:true",
+        "--pids-limit", str(int(app["pids_limit"])),
+        "--memory", app["container_memory"],
+        "--cpus", str(app["container_cpus"]),
+    ])
+    network = app.get("container_network")
+    if network:
+        args.extend(["--network", network])
+    slot_ips = app.get("slot_ips")
+    if slot_ips:
+        try:
+            address = str(ipaddress.IPv4Address(slot_ips[slot]))
+        except (ValueError, KeyError, TypeError) as exc:
+            raise DeploymentError("The configured private component address is invalid.") from exc
+        args.extend(["--ip", address])
+    if app.get("container_publish", True):
+        args.extend(["--publish", f"127.0.0.1:{port}:{int(app['container_port'])}"])
+    env_file = app.get("container_env_file")
+    if env_file:
+        args.extend(["--env-file", str(_secure_env_file(env_file))])
+    env_sets = app.get("container_environment_by_slot", {})
+    if test_mode:
+        env_sets = {**env_sets, "test": app.get("unhealthy_test_environment", {})}
+    env_values = env_sets.get(slot, {}) if isinstance(env_sets, dict) else {}
+    if not isinstance(env_values, dict):
+        raise DeploymentError("The configured slot environment is invalid.")
+    for key, value in sorted(env_values.items()):
+        if not re.fullmatch(r"[A-Z][A-Z0-9_]*", key) or not isinstance(value, str) or "\n" in value or "\r" in value:
+            raise DeploymentError("The configured slot environment is invalid.")
+        args.extend(["--env", f"{key}={value}"])
+    revision_env = app.get("revision_environment_variable")
+    if revision_env:
+        if not isinstance(revision_env, str) or not re.fullmatch(r"[A-Z][A-Z0-9_]*", revision_env) or revision_env in env_values or not SHA_RE.fullmatch(caller_revision):
+            raise DeploymentError("The configured release revision environment is invalid.")
+        args.extend(["--env", f"{revision_env}={caller_revision}"])
+    args.extend([
+        "--label", f"roman.platform.app={app['app_id']}",
+        "--label", f"roman.platform.slot={slot}",
+        "--label", f"io.roman.deployment.caller-revision={caller_revision}",
+        image,
+    ])
+    return args
 
 
 def verify_image_labels(
@@ -463,6 +704,54 @@ def _route_content(app: dict[str, Any], port: int) -> str:
     )
 
 
+def _stack_route_content(components: dict[str, Any], slot: str) -> str:
+    """Render all component routes together so a release switches in one reload."""
+    if slot not in {"blue", "green"} or not isinstance(components, dict) or not components:
+        raise DeploymentError("The application route policy is invalid.")
+    prefixes: set[str] = set()
+    endpoints: set[tuple[str, int]] = set()
+    blocks: list[str] = []
+    for name, component in sorted(components.items()):
+        if not isinstance(name, str) or not APP_ID_RE.fullmatch(name) or not isinstance(component, dict):
+            raise DeploymentError("The application component policy is invalid.")
+        prefix = component.get("route_prefix")
+        if not isinstance(prefix, str) or not re.fullmatch(r"/(?:[A-Za-z0-9_-]+/)*", prefix) or prefix in prefixes:
+            raise DeploymentError("The application route prefix is invalid or duplicated.")
+        prefixes.add(prefix)
+        try:
+            if component.get("slot_ips"):
+                address = str(ipaddress.IPv4Address(component["slot_ips"][slot]))
+                port = component["container_port"]
+            else:
+                address = "127.0.0.1"
+                port = component["slot_ports"][slot]
+        except (KeyError, TypeError, ValueError) as exc:
+            raise DeploymentError("The application component port is missing.") from exc
+        if isinstance(port, bool) or not isinstance(port, int) or not 1024 <= port <= 65535:
+            raise DeploymentError("The application component port is invalid.")
+        if (address, port) in endpoints:
+            raise DeploymentError("Application components cannot share a slot endpoint.")
+        endpoints.add((address, port))
+        modifier = "^~ " if prefix != "/" else ""
+        blocks.append(
+            f"location {modifier}{prefix} {{\n"
+            f"    proxy_pass http://{address}:{port};\n"
+            "    proxy_http_version 1.1;\n"
+            "    proxy_set_header Host $host;\n"
+            "    proxy_set_header X-Real-IP $remote_addr;\n"
+            "    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n"
+            "    proxy_set_header X-Forwarded-Proto $scheme;\n"
+            "    proxy_set_header Upgrade $http_upgrade;\n"
+            "    proxy_set_header Connection $http_connection;\n"
+            "    proxy_connect_timeout 2s;\n"
+            "    proxy_read_timeout 300s;\n"
+            "}\n"
+        )
+    if "/" not in prefixes:
+        raise DeploymentError("The application route policy has no root component.")
+    return "\n".join(blocks)
+
+
 def switch_route(app: dict[str, Any], port: int) -> None:
     route_file = Path(app["route_file"])
     try:
@@ -497,7 +786,7 @@ def _active_containers(app: dict[str, Any], slot: str) -> list[str]:
 def _release_container_available(app: dict[str, Any], release: dict[str, Any]) -> bool:
     slot = release.get("slot")
     commit_sha = release.get("commit_sha")
-    if slot not in app["slot_ports"] or not isinstance(commit_sha, str) or not re.fullmatch(r"[0-9a-f]{40}", commit_sha):
+    if slot not in app.get("slot_ips", app.get("slot_ports", {})) or not isinstance(commit_sha, str) or not re.fullmatch(r"[0-9a-f]{40}", commit_sha):
         return False
     expected_name = _container_name(app, slot, commit_sha)
     if release.get("container") != expected_name:
@@ -518,9 +807,9 @@ def _release_container_available(app: dict[str, Any], release: dict[str, Any]) -
 
 
 def _remove_inactive_slot(app: dict[str, Any], slot: str, active: dict[str, Any] | None) -> None:
-    containers = _active_containers(app, slot)
-    if active and active.get("slot") == slot and active.get("container") in containers:
+    if active and active.get("slot") == slot:
         raise DeploymentError("Refusing to remove the currently active release.")
+    containers = _active_containers(app, slot)
     for container in containers:
         run_command(["docker", "rm", "-f", container], timeout=30)
 
@@ -538,15 +827,7 @@ def _deploy(request: dict[str, Any], app: dict[str, Any]) -> dict[str, Any]:
 
     with registry_session(app, request) as env:
         run_command(["docker", "pull", request["image"]], env=env, timeout=600)
-        verify_image_labels(
-            request["image"],
-            request["platform_sha"],
-            request["commit_sha"],
-            request["platform_sha"],
-            app["image_package_repository"],
-            app["image_source_repository"],
-            env,
-        )
+        _verify_image(request["image"], request, app, env)
 
     previous = state.get("previous")
     if previous:
@@ -557,23 +838,10 @@ def _deploy(request: dict[str, Any], app: dict[str, Any]) -> dict[str, Any]:
     else:
         _remove_inactive_slot(app, candidate_slot, active)
 
-    run_command([
-        "docker", "run", "--detach",
-        "--name", candidate_name,
-        "--restart", "unless-stopped",
-        "--read-only",
-        "--tmpfs", "/tmp:rw,nosuid,nodev,noexec,size=16m",
-        "--cap-drop", "ALL",
-        "--security-opt", "no-new-privileges:true",
-        "--pids-limit", str(int(app["pids_limit"])),
-        "--memory", app["container_memory"],
-        "--cpus", str(app["container_cpus"]),
-        "--publish", f"127.0.0.1:{candidate_port}:{int(app['container_port'])}",
-        "--label", f"roman.platform.app={app['app_id']}",
-        "--label", f"roman.platform.slot={candidate_slot}",
-        "--label", f"io.roman.deployment.caller-revision={request['commit_sha']}",
-        request["image"],
-    ], timeout=60)
+    run_command(
+        _container_run_args(app, request["image"], candidate_name, candidate_slot, candidate_port, request["commit_sha"]),
+        timeout=60,
+    )
 
     route_path = Path(app["route_file"])
     prior_route = route_path.read_text(encoding="utf-8")
@@ -639,7 +907,7 @@ def _deploy(request: dict[str, Any], app: dict[str, Any]) -> dict[str, Any]:
             "slot": candidate_slot,
             "metrics_warning": metrics_warning,
         }
-    except Exception:
+    except Exception as exc:
         if route_switched:
             _atomic_write(route_path, prior_route)
             run_command(["nginx", "-t"], timeout=20, check=False)
@@ -649,7 +917,536 @@ def _deploy(request: dict[str, Any], app: dict[str, Any]) -> dict[str, Any]:
             else:
                 _atomic_write(state_path, prior_state)
         run_command(["docker", "rm", "-f", candidate_name], timeout=30, check=False)
+        if not route_switched and active:
+            try:
+                active_port = int(app["slot_ports"][active["slot"]])
+                _wait_http(
+                    f"http://127.0.0.1:{active_port}{app['health_path']}",
+                    app["expected_health_text"],
+                    int(app["readiness_timeout_seconds"]),
+                )
+                _wait_http(
+                    app["route_health_url"],
+                    app["expected_health_text"],
+                    int(app["readiness_timeout_seconds"]),
+                )
+            except Exception as health_exc:
+                raise DeploymentError("The candidate was rejected and the retained release failed its health check.") from health_exc
+        raise exc
+
+
+def _verify_flyway_info(output: str, expected_version: str, allowed_exceptions: list[dict[str, str]] | None = None, *, flyway_version: str | None = None, schema_name: str | None = None) -> None:
+    try:
+        info = json.loads(output)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise DeploymentError("Flyway did not return a valid database compatibility report.") from exc
+    if not isinstance(info, dict) or str(info.get("schemaVersion")) != expected_version:
+        raise DeploymentError("Database schema version does not match the approved release.")
+    if flyway_version and info.get("flywayVersion") != flyway_version:
+        raise DeploymentError("Flyway version does not match the approved release.")
+    if schema_name and info.get("schemaName") != schema_name:
+        raise DeploymentError("Flyway selected an unapproved database schema.")
+    if info.get("warnings") not in (None, []):
+        raise DeploymentError("Flyway reported warnings requiring review.")
+    migrations = info.get("migrations")
+    if not isinstance(migrations, list) or not migrations:
+        raise DeploymentError("Flyway migration history is unavailable.")
+    remaining = list(allowed_exceptions or [])
+    fields = {"state", "category", "type", "version", "description", "filepath"}
+    if any(not isinstance(rule, dict) or set(rule) != fields or any(not isinstance(value, str) for value in rule.values()) for rule in remaining):
+        raise DeploymentError("The approved migration history exceptions are invalid.")
+    for item in migrations:
+        if not isinstance(item, dict) or not isinstance(item.get("state"), str):
+            raise DeploymentError("Flyway migration history is invalid.")
+        if item["state"] != "Success":
+            match = next((rule for rule in remaining if all(item.get(key) == value for key, value in rule.items())), None)
+            if match is None:
+                raise DeploymentError("Database migration history is not compatible with the approved release.")
+            remaining.remove(match)
+    if remaining:
+        raise DeploymentError("Approved migration history exceptions are missing.")
+
+
+def _validate_database(request: dict[str, Any], app: dict[str, Any]) -> dict[str, Any]:
+    env_file = _secure_env_file(app.get("database_env_file"))
+    env_values = _env_file_values(env_file)
+    required = {"DB_URL", "DB_USERNAME", "DB_PASSWORD"}
+    if required - set(env_values) or any(not env_values.get(key, "").strip() for key in required):
+        raise DeploymentError("The staging database environment is incomplete.")
+    if not re.fullmatch(r"jdbc:postgresql://[^\s/]+/[^\s]+", env_values["DB_URL"]):
+        raise DeploymentError("The staging database connection URL is invalid.")
+    allowed_urls = app.get("allowed_database_urls")
+    if request.get("operation") in {"deploy-stack", "rollback-stack"} and (not isinstance(allowed_urls, list) or not allowed_urls):
+        raise DeploymentError("The isolated database destination is not allowlisted.")
+    if allowed_urls is not None and (not isinstance(allowed_urls, list) or env_values["DB_URL"] not in allowed_urls):
+        raise DeploymentError("The database destination is not allowlisted.")
+    image = request["migration_image"]
+    started = time.time()
+    with registry_session(app, request) as env:
+        run_command(["docker", "pull", image], env=env, timeout=600)
+        _verify_image(image, request, app, env)
+        args = [
+            "docker", "run", "--rm", "--read-only",
+            "--network", app["container_network"],
+            "--cap-drop", "ALL",
+            "--security-opt", "no-new-privileges:true",
+            "--pids-limit", "64",
+            "--memory", app.get("migration_memory", "512m"),
+            "--cpus", "1",
+            "--tmpfs", "/tmp:rw,nosuid,nodev,noexec,size=16m,mode=1777",
+            "--env-file", str(env_file),
+            "--env", f"EXPECTED_TARGET_VERSION={app['expected_schema_version']}",
+            "--env", f"FLYWAY_CLI_VERSION={app['flyway_cli_version']}",
+            image,
+            "validate",
+        ]
+        run_command(
+            args,
+            env=env,
+            timeout=int(app.get("migration_timeout_seconds", 180)),
+            redactions=(env_values["DB_URL"], env_values["DB_USERNAME"], env_values["DB_PASSWORD"]),
+        )
+        info_args = args[:-1] + ["info", "-outputType=json"]
+        result = run_command(
+            info_args,
+            env=env,
+            timeout=int(app.get("migration_timeout_seconds", 180)),
+            redactions=(env_values["DB_URL"], env_values["DB_USERNAME"], env_values["DB_PASSWORD"]),
+        )
+        _verify_flyway_info(result.stdout, str(app["expected_schema_version"]), app.get("flyway_history_exceptions"), flyway_version=app["flyway_cli_version"], schema_name=app.get("flyway_schema"))
+    duration = round(time.time() - started, 3)
+    timestamp = datetime.now(timezone.utc).isoformat()
+    _append_audit(app, {
+        "operation": "validate-database",
+        "outcome": "success",
+        "commit_sha": request["commit_sha"],
+        "migration_image": image,
+        "expected_schema_version": str(app["expected_schema_version"]),
+        "workflow_run_id": request["release"]["run_id"],
+        "actor": request["release"]["actor"],
+        "duration_seconds": duration,
+        "timestamp": timestamp,
+    })
+    metrics_warning = False
+    try:
+        _write_metrics(
+            app,
+            _read_state(app["state_file"]),
+            "success",
+            "validate-database",
+            duration,
+            request["release"]["run_id"],
+            request["commit_sha"],
+        )
+    except OSError:
+        metrics_warning = True
+    return {
+        "outcome": "success",
+        "app_id": app["app_id"],
+        "operation": "validate-database",
+        "expected_schema_version": str(app["expected_schema_version"]),
+        "migration_image": image,
+        "metrics_warning": metrics_warning,
+    }
+
+
+def _verify_active(request: dict[str, Any], app: dict[str, Any]) -> dict[str, Any]:
+    state = _read_state(app["state_file"])
+    active = state.get("active")
+    if not active or not _release_container_available(app, active):
+        raise DeploymentError("There is no verified active release for this application.")
+    port = int(app["slot_ports"][active["slot"]])
+    _wait_http(
+        f"http://127.0.0.1:{port}{app['health_path']}",
+        app["expected_health_text"],
+        int(app["readiness_timeout_seconds"]),
+    )
+    _wait_http(app["route_health_url"], app["expected_health_text"], int(app["readiness_timeout_seconds"]))
+    return {
+        "outcome": "healthy",
+        "app_id": app["app_id"],
+        "commit_sha": active["commit_sha"],
+        "image": active["image"],
+        "slot": active["slot"],
+    }
+
+
+def _unhealthy_test(request: dict[str, Any], app: dict[str, Any]) -> dict[str, Any]:
+    if not app.get("unhealthy_test_enabled"):
+        raise DeploymentError("Unhealthy-candidate testing is not enabled for this application.")
+    state = _read_state(app["state_file"])
+    active = state.get("active")
+    if not active or not _release_container_available(app, active):
+        raise DeploymentError("A healthy retained release is required before an unhealthy-candidate test.")
+    _verify_active(request, app)
+
+    image = request["image"]
+    with registry_session(app, request) as env:
+        run_command(["docker", "pull", image], env=env, timeout=600)
+        _verify_image(image, request, app, env)
+
+    run_id = request["release"]["run_id"]
+    attempt = request["release"]["run_attempt"]
+    container_name = f"roman-platform-{app['app_id']}-unhealthy-{run_id}-{attempt}"
+    port = int(app["unhealthy_test_port"])
+    started = time.time()
+    run_command(
+        _container_run_args(app, image, container_name, "test", port, request["commit_sha"], test_mode=True),
+        timeout=60,
+    )
+    readiness_failed = False
+    try:
+        deadline = time.monotonic() + int(app["unhealthy_test_timeout_seconds"])
+        url = f"http://127.0.0.1:{port}{app['health_path']}"
+        while time.monotonic() < deadline:
+            try:
+                with urllib.request.urlopen(url, timeout=2) as response:
+                    body = response.read(8192).decode("utf-8", errors="replace")
+                    if response.status == 200 and app["expected_health_text"] in body:
+                        raise DeploymentError("The deliberately unhealthy candidate unexpectedly passed readiness.")
+                    readiness_failed = True
+                    break
+            except urllib.error.HTTPError:
+                readiness_failed = True
+                break
+            except (urllib.error.URLError, TimeoutError, OSError):
+                time.sleep(1)
+        if not readiness_failed:
+            raise DeploymentError("The unhealthy-candidate test did not produce a readiness failure in time.")
+    finally:
+        run_command(["docker", "rm", "-f", container_name], timeout=30, check=False)
+
+    # The failed candidate must not disturb either the retained container or its route.
+    _verify_active(request, app)
+    duration = round(time.time() - started, 3)
+    timestamp = datetime.now(timezone.utc).isoformat()
+    _append_audit(app, {
+        "operation": "unhealthy-test",
+        "outcome": "failure",
+        "commit_sha": request["commit_sha"],
+        "image": image,
+        "platform_sha": request["platform_sha"],
+        "retained_commit_sha": active["commit_sha"],
+        "workflow_run_id": run_id,
+        "actor": request["release"]["actor"],
+        "error": "The candidate failed the configured application readiness check; the prior release stayed healthy.",
+        "duration_seconds": duration,
+        "timestamp": timestamp,
+    })
+    metrics_warning = False
+    try:
+        _write_metrics(
+            app,
+            _read_state(app["state_file"]),
+            "failure",
+            "unhealthy-test",
+            duration,
+            run_id,
+            request["commit_sha"],
+        )
+    except OSError:
+        metrics_warning = True
+    return {
+        "outcome": "expected-rejection",
+        "app_id": app["app_id"],
+        "candidate_image": image,
+        "retained_commit_sha": active["commit_sha"],
+        "metrics_warning": metrics_warning,
+    }
+
+
+def _stack_component_app(app: dict[str, Any], name: str) -> dict[str, Any]:
+    component = app["components"][name]
+    if not APP_ID_RE.fullmatch(name) or not isinstance(component, dict):
+        raise DeploymentError("The application component policy is invalid.")
+    component_app = {**app, **component, "app_id": f"{app['app_id']}-{name}"}
+    if not APP_ID_RE.fullmatch(component_app["app_id"]):
+        raise DeploymentError("The application component identifier is too long.")
+    if not app.get("container_network") or component_app.get("container_network") != app["container_network"]:
+        raise DeploymentError("Every component must use the approved isolated application network.")
+    if component_app.get("container_publish", True) or not component_app.get("slot_ips"):
+        raise DeploymentError("Stack components must use private fixed addresses without published ports.")
+    listener_port = app.get("private_listener_port")
+    if isinstance(listener_port, bool) or not isinstance(listener_port, int) or not 1024 <= listener_port <= 65535:
+        raise DeploymentError("The private listener port is invalid.")
+    if not re.fullmatch(rf"http://127\.0\.0\.1:{listener_port}/[^\s]*", str(component_app.get("route_health_url", ""))):
+        raise DeploymentError("Component route health checks must use a loopback URL.")
+    return component_app
+
+
+def _stack_validate_network(app: dict[str, Any]) -> None:
+    try:
+        network = ipaddress.ip_network(app["network_subnet"], strict=True)
+        if not isinstance(network, ipaddress.IPv4Network) or not any(network.subnet_of(private) for private in (
+            ipaddress.ip_network("10.0.0.0/8"), ipaddress.ip_network("172.16.0.0/12"), ipaddress.ip_network("192.168.0.0/16")
+        )):
+            raise ValueError("network must be private IPv4")
+        reserved = {ipaddress.IPv4Address(value) for value in app.get("reserved_network_ips", [])}
+        if any(address not in network or address in {network.network_address, network.broadcast_address} for address in reserved):
+            raise ValueError("reserved address is outside the subnet")
+        used = set(reserved)
+        for name in sorted(app["components"]):
+            component = _stack_component_app(app, name)
+            slots = ("blue", "green", "test") if app.get("stack_test_enabled") else ("blue", "green")
+            for slot in slots:
+                address = ipaddress.IPv4Address(component["slot_ips"][slot])
+                if address not in network or address in {network.network_address, network.broadcast_address} or address in used:
+                    raise ValueError("component address is outside subnet or duplicated")
+                used.add(address)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise DeploymentError("The application private network address policy is invalid.") from exc
+
+
+def _stack_release_healthy(app: dict[str, Any], release: dict[str, Any]) -> None:
+    slot = release.get("slot")
+    components = release.get("components")
+    if slot not in {"blue", "green"} or not isinstance(components, dict) or set(components) != set(app["components"]):
+        raise DeploymentError("The retained application release state is invalid.")
+    for name in sorted(components):
+        component_app = _stack_component_app(app, name)
+        record = components[name]
+        if not isinstance(record, dict) or record.get("slot") != slot or record.get("commit_sha") != release.get("commit_sha"):
+            raise DeploymentError("The retained component does not belong to the application release.")
+        if not _release_container_available(component_app, record):
+            raise DeploymentError("A retained application component is unavailable.")
+        result = run_command(["docker", "inspect", "--format", "{{json .NetworkSettings.Networks}}", record["container"]], timeout=15, check=False)
+        try:
+            networks = json.loads(result.stdout)
+            actual_ip = networks[app["container_network"]]["IPAddress"]
+        except (KeyError, TypeError, json.JSONDecodeError) as exc:
+            raise DeploymentError("The application component network could not be verified.") from exc
+        if result.returncode != 0 or actual_ip != component_app["slot_ips"][slot] or set(networks) != {app["container_network"]}:
+            raise DeploymentError("The application component is not on its approved private address.")
+        _wait_http(
+            f"http://{actual_ip}:{int(component_app['container_port'])}{component_app['health_path']}",
+            component_app["expected_health_text"], int(component_app["readiness_timeout_seconds"]),
+        )
+
+
+def _stack_route_healthy(app: dict[str, Any]) -> None:
+    for name in sorted(app["components"]):
+        component = _stack_component_app(app, name)
+        _wait_http(component["route_health_url"], component["expected_health_text"], int(component["readiness_timeout_seconds"]))
+
+
+def _verify_stack_active(request: dict[str, Any], app: dict[str, Any]) -> dict[str, Any]:
+    started = time.time()
+    _stack_validate_network(app)
+    state = _read_state(app["state_file"])
+    active = state.get("active")
+    if not isinstance(active, dict):
+        raise DeploymentError("There is no active application release to verify.")
+    _stack_release_healthy(app, active)
+    _stack_route_healthy(app)
+    _append_audit(app, {"operation": "verify-stack", "outcome": "success", "commit_sha": active["commit_sha"], "workflow_run_id": request["release"]["run_id"], "actor": request["release"]["actor"], "timestamp": datetime.now(timezone.utc).isoformat()})
+    metrics_warning = False
+    try:
+        _write_metrics(app, state, "success", "verify-stack", time.time() - started, request["release"]["run_id"], request["commit_sha"])
+    except OSError:
+        metrics_warning = True
+    return {"outcome": "healthy", "app_id": app["app_id"], "slot": active["slot"], "commit_sha": active["commit_sha"], "metrics_warning": metrics_warning}
+
+
+def _test_stack_failure(request: dict[str, Any], app: dict[str, Any]) -> dict[str, Any]:
+    started = time.time()
+    _stack_validate_network(app)
+    active = _read_state(app["state_file"]).get("active")
+    if not isinstance(active, dict):
+        raise DeploymentError("A healthy active release is required for a failure test.")
+    _stack_release_healthy(app, active)
+    _stack_route_healthy(app)
+    name = request["component"]
+    component = _stack_component_app(app, name)
+    test_env = component.get("unhealthy_test_environment")
+    if not isinstance(test_env, dict) or not test_env:
+        raise DeploymentError("The fixed unhealthy component configuration is unavailable.")
+    image = request["image"]
+    with registry_session(app, request) as env:
+        run_command(["docker", "pull", image], env=env, timeout=600)
+        _verify_image(image, request, app, env)
+    container = f"roman-platform-{app['app_id']}-{name}-test-{request['release']['run_id']}-{request['release']['run_attempt']}"
+    if len(container) > 180 or run_command(["docker", "inspect", container], timeout=15, check=False).returncode == 0:
+        raise DeploymentError("The isolated failure-test container name is unavailable.")
+    _append_audit(app, {"operation": "test-stack", "outcome": "started", "component": name, "commit_sha": request["commit_sha"], "image": image, "workflow_run_id": request["release"]["run_id"], "actor": request["release"]["actor"], "timestamp": datetime.now(timezone.utc).isoformat()})
+    attempted = False
+    try:
+        attempted = True
+        run_command(_container_run_args(component, image, container, "test", int(component["container_port"]), request["commit_sha"], test_mode=True), timeout=60)
+        try:
+            _wait_http(f"http://{component['slot_ips']['test']}:{int(component['container_port'])}{component['health_path']}", component["expected_health_text"], int(component["unhealthy_test_timeout_seconds"]))
+        except DeploymentError:
+            pass
+        else:
+            raise DeploymentError("The deliberately unhealthy component unexpectedly passed readiness.")
+    finally:
+        if attempted:
+            run_command(["docker", "rm", "-f", container], timeout=30)
+    _stack_release_healthy(app, active)
+    _stack_route_healthy(app)
+    duration = round(time.time() - started, 3)
+    _append_audit(app, {"operation": "test-stack", "outcome": "failure", "component": name, "commit_sha": request["commit_sha"], "image": image, "retained_commit_sha": active["commit_sha"], "workflow_run_id": request["release"]["run_id"], "actor": request["release"]["actor"], "timestamp": datetime.now(timezone.utc).isoformat(), "error": "The fixed unhealthy candidate was rejected; the active application remained healthy."})
+    metrics_warning = False
+    try:
+        _write_metrics(app, _read_state(app["state_file"]), "failure", "test-stack", duration, request["release"]["run_id"], request["commit_sha"])
+    except OSError:
+        metrics_warning = True
+    return {"outcome": "expected-rejection", "app_id": app["app_id"], "component": name, "retained_commit_sha": active["commit_sha"], "metrics_warning": metrics_warning}
+
+
+def _switch_stack_route(app: dict[str, Any], slot: str) -> None:
+    route_path = Path(app["route_file"])
+    try:
+        previous_route = route_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise DeploymentError("The managed application route is unavailable.") from exc
+    _atomic_write(route_path, _stack_route_content(app["components"], slot))
+    try:
+        run_command(["nginx", "-t"], timeout=20)
+        run_command(["systemctl", "reload", "nginx"], timeout=20)
+        _stack_route_healthy(app)
+    except Exception:
+        _atomic_write(route_path, previous_route)
+        run_command(["nginx", "-t"], timeout=20, check=False)
+        run_command(["systemctl", "reload", "nginx"], timeout=20, check=False)
         raise
+
+
+def _deploy_stack(request: dict[str, Any], app: dict[str, Any]) -> dict[str, Any]:
+    started = time.time()
+    _validate_database(request, app)
+    state_path = Path(app["state_file"])
+    state = _read_state(str(state_path))
+    active = state.get("active")
+    if not active and state.get("previous"):
+        raise DeploymentError("Application release state has a previous release without an active release.")
+    if active:
+        _stack_release_healthy(app, active)
+    slot = "green" if active and active["slot"] == "blue" else "blue"
+    # Validate the entire route before pulling images or disturbing retained containers.
+    _stack_validate_network(app)
+    _stack_route_content(app["components"], "blue")
+    _stack_route_content(app["components"], "green")
+    with registry_session(app, request) as env:
+        for name in sorted(app["components"]):
+            image = request["images"][name]
+            run_command(["docker", "pull", image], env=env, timeout=600)
+            _verify_image(image, request, app, env)
+    _append_audit(app, {"operation": "deploy-stack", "outcome": "started", "commit_sha": request["commit_sha"], "images": request["images"], "platform_sha": request["platform_sha"], "slot": slot, "workflow_run_id": request["release"]["run_id"], "actor": request["release"]["actor"], "timestamp": datetime.now(timezone.utc).isoformat()})
+    if state.get("previous"):
+        # The candidate reuses the retained slot. Clear the pointer before removing
+        # anything so an interrupted cleanup cannot advertise a nonexistent rollback.
+        state["previous"] = None
+        require_storage_mounts(app)
+        _atomic_write(state_path, json.dumps(state, indent=2, sort_keys=True) + "\n")
+    route_path = Path(app["route_file"])
+    prior_route = route_path.read_text(encoding="utf-8")
+    prior_state = state_path.read_text(encoding="utf-8") if state_path.exists() else None
+    started_names: list[str] = []
+    route_switched = False
+    records: dict[str, Any] = {}
+    try:
+        for name in sorted(app["components"]):
+            component_app = _stack_component_app(app, name)
+            active_component = (active.get("components") or {}).get(name) if active else None
+            _remove_inactive_slot(component_app, slot, active_component)
+            container = _container_name(component_app, slot, request["commit_sha"])
+            # A Docker client timeout can occur after the daemon created the container.
+            # Record its fixed name first so cleanup also covers that case.
+            started_names.append(container)
+            run_command(_container_run_args(component_app, request["images"][name], container, slot, int(component_app["container_port"]), request["commit_sha"]), timeout=60)
+            records[name] = {"slot": slot, "commit_sha": request["commit_sha"], "container": container, "image": request["images"][name]}
+        release = {"app_id": app["app_id"], "slot": slot, "commit_sha": request["commit_sha"], "platform_sha": request["platform_sha"], "schema_version": str(app["expected_schema_version"]), "components": records, "deployed_at": datetime.now(timezone.utc).isoformat()}
+        _stack_release_healthy(app, release)
+        verify_release_origin(request, app)
+        _switch_stack_route(app, slot)
+        route_switched = True
+        new_state = {"active": release, "previous": active, "updated_at": release["deployed_at"]}
+        require_storage_mounts(app)
+        _atomic_write(state_path, json.dumps(new_state, indent=2, sort_keys=True) + "\n")
+        _append_audit(app, {"operation": "deploy-stack", "outcome": "success", "commit_sha": request["commit_sha"], "images": request["images"], "platform_sha": request["platform_sha"], "slot": slot, "workflow_run_id": request["release"]["run_id"], "actor": request["release"]["actor"], "timestamp": release["deployed_at"]})
+    except Exception:
+        if route_switched:
+            _atomic_write(route_path, prior_route)
+            run_command(["nginx", "-t"], timeout=20, check=False)
+            run_command(["systemctl", "reload", "nginx"], timeout=20, check=False)
+            if prior_state is None:
+                state_path.unlink(missing_ok=True)
+            else:
+                _atomic_write(state_path, prior_state)
+        for container in reversed(started_names):
+            run_command(["docker", "rm", "-f", container], timeout=30, check=False)
+        raise
+    metrics_warning = False
+    try:
+        _write_metrics(app, new_state, "success", "deploy-stack", time.time() - started, request["release"]["run_id"], request["commit_sha"])
+    except OSError:
+        metrics_warning = True
+    return {"outcome": "success", "app_id": app["app_id"], "slot": slot, "commit_sha": request["commit_sha"], "images": request["images"], "metrics_warning": metrics_warning}
+
+
+def _start_retained_stack(app: dict[str, Any], release: dict[str, Any]) -> list[str]:
+    components = release.get("components")
+    if not isinstance(components, dict) or set(components) != set(app["components"]):
+        raise DeploymentError("The retained application release state is invalid.")
+    started: list[str] = []
+    try:
+        for name in sorted(components):
+            component = _stack_component_app(app, name)
+            record = components[name]
+            if not isinstance(record, dict) or record.get("slot") != release.get("slot") or record.get("commit_sha") != release.get("commit_sha") or not _release_container_available(component, record):
+                raise DeploymentError("A retained application component has an invalid identity.")
+            result = run_command(["docker", "inspect", "--format", "{{.State.Running}}", record["container"]], timeout=15)
+            if result.stdout.strip().lower() != "true":
+                started.append(record["container"])
+                run_command(["docker", "start", record["container"]], timeout=60)
+        _stack_release_healthy(app, release)
+        return started
+    except Exception:
+        for name in reversed(started):
+            run_command(["docker", "stop", name], timeout=60, check=False)
+        raise
+
+
+def _rollback_stack(request: dict[str, Any], app: dict[str, Any]) -> dict[str, Any]:
+    started = time.time()
+    _validate_database(request, app)
+    state_path = Path(app["state_file"])
+    state = _read_state(str(state_path))
+    active, previous = state.get("active"), state.get("previous")
+    if not active or not previous or previous.get("schema_version") != str(app["expected_schema_version"]) or active.get("slot") == previous.get("slot"):
+        raise DeploymentError("No retained application release matches the current schema policy.")
+    _stack_validate_network(app)
+    _append_audit(app, {"operation": "rollback-stack", "outcome": "started", "from_commit_sha": active["commit_sha"], "to_commit_sha": previous["commit_sha"], "workflow_run_id": request["release"]["run_id"], "actor": request["release"]["actor"], "timestamp": datetime.now(timezone.utc).isoformat()})
+    route_path = Path(app["route_file"])
+    prior_route = route_path.read_text(encoding="utf-8")
+    prior_state = state_path.read_text(encoding="utf-8")
+    switched = False
+    started_names: list[str] = []
+    try:
+        started_names = _start_retained_stack(app, previous)
+        verify_release_origin(request, app)
+        _switch_stack_route(app, previous["slot"])
+        switched = True
+        timestamp = datetime.now(timezone.utc).isoformat()
+        new_state = {"active": previous, "previous": active, "updated_at": timestamp}
+        require_storage_mounts(app)
+        _atomic_write(state_path, json.dumps(new_state, indent=2, sort_keys=True) + "\n")
+        _append_audit(app, {"operation": "rollback-stack", "outcome": "success", "from_commit_sha": active["commit_sha"], "to_commit_sha": previous["commit_sha"], "workflow_run_id": request["release"]["run_id"], "actor": request["release"]["actor"], "timestamp": timestamp})
+    except Exception:
+        if switched:
+            _atomic_write(route_path, prior_route)
+            run_command(["nginx", "-t"], timeout=20, check=False)
+            run_command(["systemctl", "reload", "nginx"], timeout=20, check=False)
+            _atomic_write(state_path, prior_state)
+        for name in reversed(started_names):
+            run_command(["docker", "stop", name], timeout=60, check=False)
+        raise
+    metrics_warning = False
+    try:
+        _write_metrics(app, new_state, "success", "rollback-stack", time.time() - started, request["release"]["run_id"], request["commit_sha"])
+    except OSError:
+        metrics_warning = True
+    return {"outcome": "success", "app_id": app["app_id"], "slot": previous["slot"], "commit_sha": previous["commit_sha"], "operation": "rollback-stack", "metrics_warning": metrics_warning}
 
 def _rollback(request: dict[str, Any], app: dict[str, Any]) -> dict[str, Any]:
     started = time.time()
@@ -729,13 +1526,30 @@ def execute(request: Any, config: dict[str, Any]) -> dict[str, Any]:
             verify_release_origin(request, app)
             if request["operation"] == "deploy":
                 return _deploy(request, app)
-            return _rollback(request, app)
+            if request["operation"] == "rollback":
+                return _rollback(request, app)
+            if request["operation"] == "validate-database":
+                return _validate_database(request, app)
+            if request["operation"] == "verify":
+                return _verify_active(request, app)
+            if request["operation"] == "unhealthy-test":
+                return _unhealthy_test(request, app)
+            if request["operation"] == "deploy-stack":
+                return _deploy_stack(request, app)
+            if request["operation"] == "rollback-stack":
+                return _rollback_stack(request, app)
+            if request["operation"] == "test-stack":
+                return _test_stack_failure(request, app)
+            if request["operation"] == "verify-stack":
+                return _verify_stack_active(request, app)
+            raise DeploymentError("Coordinated application deployment is not yet enabled.")
         except Exception as exc:
             event = {
                 "operation": request["operation"],
                 "outcome": "failure",
                 "commit_sha": request["commit_sha"],
                 "image": request.get("image"),
+                "migration_image": request.get("migration_image"),
                 "workflow_run_id": request["release"]["run_id"],
                 "actor": request["release"]["actor"],
                 "error": str(exc)[:400],
