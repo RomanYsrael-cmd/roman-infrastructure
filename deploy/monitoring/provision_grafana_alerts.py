@@ -204,7 +204,7 @@ def _matches(current: dict[str, Any], desired: dict[str, Any]) -> bool:
         and spec.get("trigger") == wanted["trigger"]
         and spec.get("labels") == wanted["labels"]
         and spec.get("annotations") == wanted["annotations"]
-        and spec.get("for") == wanted["for"]
+        and (spec.get("for") or "0s") == (wanted.get("for") or "0s")
         and spec.get("noDataState") == wanted["noDataState"]
         and spec.get("execErrState") == wanted["execErrState"]
         and spec.get("expressions", {}).get("A", {}).get("model", {}).get("expr")

@@ -287,11 +287,13 @@ class GrafanaAlertProvisioningTests(unittest.TestCase):
         self.assertIn("bool 120", rules[1]["spec"]["expressions"]["A"]["model"]["expr"])
         self.assertTrue(all(item["spec"]["noDataState"] == "Ok" for item in rules))
 
-    def test_upsert_skips_an_unchanged_rule(self):
+    def test_upsert_skips_an_unchanged_rule_when_grafana_omits_zero_for(self):
         desired = grafana_alerts.desired_rules("alerts-folder")[0]
+        current_spec = dict(desired["spec"])
+        current_spec.pop("for")
         current = {
             "metadata": {"annotations": desired["metadata"]["annotations"]},
-            "spec": desired["spec"],
+            "spec": current_spec,
         }
         with mock.patch.object(grafana_alerts, "api_request", return_value=current) as api:
             self.assertFalse(grafana_alerts._upsert_rule("unused", desired))
