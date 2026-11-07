@@ -252,6 +252,7 @@ jobs:
               }
               Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value 'Server rejected the unhealthy image at the candidate readiness check; no route switch was accepted.'
               Write-Host 'Server rejected the unhealthy candidate at the readiness gate.'
+              $global:LASTEXITCODE = 0
             } elseif ($controllerExit -ne 0) {
               throw 'The restricted deployment controller rejected the request.'
             }

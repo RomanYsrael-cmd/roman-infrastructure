@@ -32,6 +32,14 @@ APP = dict(CONFIG["applications"]["platform-smoke"], allowed_platform_shas=[WORK
 CONFIG["applications"]["platform-smoke"] = APP
 
 
+class WorkflowContractTests(unittest.TestCase):
+    def test_expected_unhealthy_rejection_resets_powershell_exit_code(self):
+        workflow = (ROOT / ".github" / "workflows" / "romanlms-smoke-deploy.yml").read_text(encoding="utf-8")
+        confirmation = "Write-Host 'Server rejected the unhealthy candidate at the readiness gate.'"
+        self.assertIn(confirmation, workflow)
+        self.assertIn(confirmation + "\n              $global:LASTEXITCODE = 0", workflow)
+
+
 def request(**overrides):
     value = {
         "operation": "deploy",
