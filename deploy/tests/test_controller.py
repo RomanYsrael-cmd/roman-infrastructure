@@ -1,6 +1,7 @@
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -335,6 +336,8 @@ class MetricsTests(unittest.TestCase):
             self.assertIn('roman_platform_last_deployment_info{app_id="platform-smoke",operation="deploy",outcome="failure",workflow_run_id="12345",request_sha="' + SHA + '"} 1', metrics)
             self.assertIn('roman_platform_last_deployment_duration_seconds{app_id="platform-smoke",operation="deploy",outcome="failure",workflow_run_id="12345",request_sha="' + SHA + '"} 2.750', metrics)
             self.assertIn(f'roman_platform_active_release_info{{app_id="platform-smoke",revision="{SHA}",slot="blue"}} 1', metrics)
+            if os.name == "posix":
+                self.assertEqual(stat.S_IMODE(metrics_path.stat().st_mode), 0o644)
 
     def test_escapes_prometheus_label_values(self):
         self.assertEqual(deploy._prometheus_label('a"b\\c\nd'), 'a\\"b\\\\c\\nd')

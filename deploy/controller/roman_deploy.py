@@ -403,7 +403,10 @@ def _write_metrics(
             "# TYPE roman_platform_active_platform_revision_info gauge",
             f'roman_platform_active_platform_revision_info{{{app_labels},revision="{_prometheus_label(active["platform_sha"])}"}} 1',
         ])
-    _atomic_write(app["metrics_file"], "\n".join(lines) + "\n", 0o640)
+    # Node Exporter reads this root-owned directory as its unprivileged user.
+    # The metric labels contain release metadata only, so the scrape file must
+    # be world-readable while remaining atomically replaced by the root controller.
+    _atomic_write(app["metrics_file"], "\n".join(lines) + "\n", 0o644)
 
 
 def _lock(app: dict[str, Any]):
