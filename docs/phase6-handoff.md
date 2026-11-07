@@ -1,22 +1,17 @@
 # RomanLMS Phase 6 handoff
 
-RomanLMS production restoration and cutover remain out of scope for Phase 5.
+Phase 5 completed an isolated smoke deployment only. The restricted controller is installed on `roman-server`; the active smoke release is the retained blue release, and `127.0.0.1:18080/health` returns HTTP 200. No RomanLMS production database or public traffic was changed.
 
-The restricted deployment controller is installed on `roman-server` for the harmless `platform-smoke` app. It accepts only reviewed infrastructure workflow SHA `ed7f0067b23bb5b1e0126c8c783ee63066d6e025`. The RomanLMS main-branch caller is still pinned to `2981677b61d3b80e0d87f7767f401f1509a53c82`; the deploy gate must remain closed until the caller is updated to the reviewed SHA, includes its unhealthy-candidate test, and its required CI passes.
-
-RomanLMS CI run [42324069539](https://github.com/RomanYsrael-cmd/roman-lms/actions/runs/42324069539) failed the required-check aggregate: backend PostgreSQL/Testcontainers had 137 failures and 2 errors, and Android Gradle could not open its persistent wrapper-cache lock. The deployment contract, workflow security, frontend, backend unit, shell, dependency, Compose, and documentation checks passed. The CI failure details are recorded in [status.md](status.md). Do not dispatch a deployment while this gate is failing.
+The RomanLMS caller is at `cfa0d607ef9f35643149fb3a4b71b508a0446299`, with required CI run [42347455950](https://github.com/RomanYsrael-cmd/roman-lms/actions/runs/42347455950) green. It calls reusable workflow SHA `d95b276cf3d257a685fe7bb7464197c44f4b4ea8`; the server allowlist is restricted to that SHA. The successful smoke deploy, unhealthy rejection, and rollback are recorded in [status.md](status.md).
 
 Before a RomanLMS production release:
 
-- Keep the existing laptop runner scoped to RomanLMS; do not move or replace it.
-- Keep Docker Desktop's Linux engine available and maintain its storage reserve.
-- Resolve the backend integration failures and Android Gradle cache permission issue, then require the full CI suite to pass.
-- Restore and validate production database backups separately; the Phase 5 smoke controller does not touch the RomanLMS database.
-- Add RomanLMS-specific server allowlist, resource policy, health/readiness tests, and migration/backup gates.
-- Verify deployment SSH scope and GHCR package permissions without exposing secrets.
-- Decide whether the server can safely run two Java releases concurrently. Otherwise, document and approve a maintenance-window recreate strategy.
-- Preserve RomanLMS's migration, backup, smoke-check, release-health, Android build, retention, and rollback protections.
-- Add and test a RomanLMS workflow that cannot execute deployment secrets on pull requests.
-- Complete an isolated successful deployment, failure test, rollback test, persistence check, and monitoring scrape before public traffic or database restoration.
+- Restore and validate production database backups separately from the smoke app.
+- Define a RomanLMS-specific server allowlist, resource limits, health/readiness checks, migration policy, backup gate, retention policy, and rollback strategy.
+- Confirm the server can run two actual RomanLMS releases at once. If not, document an approved maintenance-window recreate strategy.
+- Validate persistence, migrations, backups, and backup recovery with non-production data.
+- Preserve the laptop runner boundary, full reusable-workflow pin, actor/repository/ref checks, deployment secret restrictions, and server-side verification.
+- Verify the release and rollback workflow against the RomanLMS application before changing production traffic.
+- Treat database restoration, public Cloudflare routes, DNS, and production cutover as separately authorized Phase 6 work.
 
-Do not restore the production database or change public DNS, Cloudflare, or production routes as part of the smoke application test.
+Keep `main` unprotected as requested for the zero-cost setup. Continue using the existing `ROMAN-LAPTOP` runner; do not add a production runner.

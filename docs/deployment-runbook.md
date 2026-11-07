@@ -1,39 +1,36 @@
 # Deployment runbook
 
-## Current state
+## Current smoke state
 
-The controller, restricted deployment account, SSH key, loopback route, and Grafana alert rules are installed on `roman-server`. The deployment route is private and returns 503 until an application is deployed. Do not dispatch the smoke workflow until the root-owned pre-sudo SSH gate is installed and verified, RomanLMS CI is green, and its caller is pinned to an SHA approved by the server policy.
+- The controller, restricted `roman-deploy` account, Ed25519 key, private Nginx route, and deployment Grafana alerts are installed on `roman-server`.
+- The active harmless release is in the blue slot. `http://127.0.0.1:18080/health` returns HTTP 200. The green release is retained as the previous release.
+- The RomanLMS caller requires the owner actor, `main`, `workflow_dispatch`, the expected caller workflow path, and the exact pinned reusable workflow SHA `d95b276cf3d257a685fe7bb7464197c44f4b4ea8`.
+- The server allowlist contains only that reusable workflow SHA. The SSH key and verified host key are stored in the RomanLMS repository secrets; never print or paste their values.
+- The route listens only on loopback. Do not add a public DNS, Cloudflare, or production route for the smoke app.
 
-## Refresh the server bootstrap
+## Run the smoke workflow
 
-1. Verify the independent administrative SSH session to `100.67.102.11` remains available.
-2. Keep the existing dedicated Ed25519 deployment key private and continue using only the verified host-key secret. Never copy the private key into the repository.
-3. Re-run `deploy/ansible/install.yml` from the trusted WSL environment with the public deployment key. This installs the pre-sudo forced-command gate and refreshes the root-owned controller policy.
-4. Verify Nginx syntax, the local 503 route, the exact sudo rule, and the forced-command rejection tests. Verify the admin SSH session again.
-5. Keep the caller and server policy on the same full SHA. The currently installed policy approves `2981677b61d3b80e0d87f7767f401f1509a53c82`; the updated unhealthy-test workflow uses `ed7f0067b23bb5b1e0126c8c783ee63066d6e025`. Reapply Ansible for the updated allowlist and update the RomanLMS caller to that pin only after CI passes.
-6. Confirm all existing RomanLMS CI checks pass before dispatching. The latest run failed in the backend integration and Android checks.
-7. The two RomanLMS repository secrets already exist by the required names. Verify their presence without printing values.
+1. Confirm the existing `ROMAN-LAPTOP` runner is online and Docker Desktop's Linux engine is available.
+2. Confirm required RomanLMS CI is green on the current `main` commit.
+3. In RomanLMS Actions, run **Roman platform smoke deployment** on `main` and choose `DEPLOY SMOKE`. This publishes the harmless candidate to GHCR, obtains its immutable digest, and sends it through restricted Tailscale SSH.
+4. Verify the private health endpoint returns HTTP 200 and Prometheus reports the active slot and successful deployment run.
+5. Choose `TEST UNHEALTHY SMOKE`. The workflow succeeds only when the server rejects the candidate at its HTTP 503 readiness gate. Confirm the existing route remains healthy and the failure alert reaches Telegram.
+6. Choose `DEPLOY SMOKE` again to make a new healthy slot active while retaining the former slot.
+7. Choose `ROLLBACK SMOKE`. Confirm the previous release is active, the private health endpoint remains HTTP 200, the server audit says `operation=rollback` and `outcome=success`, and Telegram receives the rollback success alert.
 
-## Manual smoke deployment
+The expected-unhealthy workflow run is a passing test even though the controller records a failed deployment attempt. Its `Roman Platform Deployment Failed` Telegram alert should resolve after a healthy operation. The success alert is temporary and resolves automatically after two minutes.
 
-1. Ensure the existing ROMAN-LAPTOP runner is online and Docker Desktop is running its Linux engine.
-2. Confirm RomanLMS CI has passed for the current main head and the deployment caller pins the exact server-allowlisted workflow SHA.
-3. Open RomanLMS Actions and choose Roman platform smoke deployment on `main`. Choose `DEPLOY SMOKE` twice to retain two releases, then `ROLLBACK SMOKE` to verify the prior release is restored.
-4. Choose `TEST UNHEALTHY SMOKE`. The fixed candidate returns HTTP 503; the job passes only if the server rejects it at readiness and does not switch the Nginx route.
-5. Deploy a healthy smoke release again to clear the failure alert and verify the success alert path.
-6. The jobs validate the runner, Tailscale peer, private SSH port, health fixture, digest, OCI labels, workflow origin, and server response. A missing secret or failed gate stops before an unintended route change.
-7. Verify the controller's active state and audit record on `/srv/apps/roman-platform`, check the Prometheus textfile metric, and request the private local route on `roman-server` at `127.0.0.1:18080/health`.
-8. Confirm the route remains inaccessible from the public internet and no Cloudflare route was added.
+## Verify server evidence
 
-## Inspect and troubleshoot
+- Private route: `curl -fsS http://127.0.0.1:18080/health` from `roman-server`.
+- Prometheus scrape: `curl -fsS http://127.0.0.1:9100/metrics`.
+- Prometheus API: query `roman_platform_active_release_info` and `roman_platform_last_deployment_info` at `http://127.0.0.1:9090`.
+- Active and retained release state: `/srv/apps/roman-platform/state/platform-smoke.json` (admin access only).
+- Deployment audit: `/srv/apps/roman-platform/logs/deployments.jsonl` (admin access only).
+- Running test containers: inspect only containers labeled `roman.platform.app=platform-smoke`.
 
-- Workflow: RomanLMS Actions run summary and step logs.
-- Controller output: the restricted SSH command returns a JSON outcome without secret values.
-- Server audit: /srv/apps/roman-platform/logs/deployments.jsonl.
-- Active and previous releases: /srv/apps/roman-platform/state/platform-smoke.json.
-- Controller invocation log: SSH and sudo journal entries on roman-server.
-- Container state: inspect only the controller-labeled platform-smoke containers.
-- Nginx: nginx -t, systemctl status nginx, and the managed file under /etc/roman-platform/nginx.
-- Storage: findmnt /srv/apps and docker info --format '{{.DockerRootDir}}'.
+Keep logs limited to deployment metadata. Never print SSH credentials, GHCR tokens, repository secrets, or private keys.
 
-Never run a deploy request by pasting a token into a shell command. Never disable a mount, stop PostgreSQL, change Cloudflare routing, or reboot the server as a deployment test.
+## Phase 6 boundary
+
+This controller policy is for the harmless smoke app. Do not use it to restore the RomanLMS production database or route production traffic. Phase 6 needs its own application policy for resource limits, readiness, migrations, backups, retention, production database recovery, and rollback. See [phase6-handoff.md](phase6-handoff.md).
