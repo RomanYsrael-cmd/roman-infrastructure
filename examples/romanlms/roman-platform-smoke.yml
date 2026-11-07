@@ -4,13 +4,14 @@ on:
   workflow_dispatch:
     inputs:
       confirmation:
-        description: Choose DEPLOY SMOKE or ROLLBACK SMOKE to authorize one isolated operation
+        description: Choose one isolated smoke deployment, rollback, or unhealthy-candidate test
         required: true
         type: choice
         options:
           - CANCEL
           - DEPLOY SMOKE
           - ROLLBACK SMOKE
+          - TEST UNHEALTHY SMOKE
 
 permissions:
   contents: read
@@ -24,11 +25,11 @@ jobs:
       github.event_name == 'workflow_dispatch' &&
       github.ref == 'refs/heads/main' &&
       inputs.confirmation == 'DEPLOY SMOKE'
-    uses: RomanYsrael-cmd/roman-infrastructure/.github/workflows/romanlms-smoke-deploy.yml@2981677b61d3b80e0d87f7767f401f1509a53c82
+    uses: RomanYsrael-cmd/roman-infrastructure/.github/workflows/romanlms-smoke-deploy.yml@ed7f0067b23bb5b1e0126c8c783ee63066d6e025
     with:
       confirmation: ${{ inputs.confirmation }}
       operation: deploy
-      platform_ref: 2981677b61d3b80e0d87f7767f401f1509a53c82
+      platform_ref: ed7f0067b23bb5b1e0126c8c783ee63066d6e025
     secrets:
       ROMAN_PLATFORM_SSH_PRIVATE_KEY: ${{ secrets.ROMAN_PLATFORM_SSH_PRIVATE_KEY }}
       ROMAN_PLATFORM_SSH_KNOWN_HOSTS: ${{ secrets.ROMAN_PLATFORM_SSH_KNOWN_HOSTS }}
@@ -39,11 +40,26 @@ jobs:
       github.event_name == 'workflow_dispatch' &&
       github.ref == 'refs/heads/main' &&
       inputs.confirmation == 'ROLLBACK SMOKE'
-    uses: RomanYsrael-cmd/roman-infrastructure/.github/workflows/romanlms-smoke-deploy.yml@2981677b61d3b80e0d87f7767f401f1509a53c82
+    uses: RomanYsrael-cmd/roman-infrastructure/.github/workflows/romanlms-smoke-deploy.yml@ed7f0067b23bb5b1e0126c8c783ee63066d6e025
     with:
       confirmation: ROLLBACK SMOKE
       operation: rollback
-      platform_ref: 2981677b61d3b80e0d87f7767f401f1509a53c82
+      platform_ref: ed7f0067b23bb5b1e0126c8c783ee63066d6e025
+    secrets:
+      ROMAN_PLATFORM_SSH_PRIVATE_KEY: ${{ secrets.ROMAN_PLATFORM_SSH_PRIVATE_KEY }}
+      ROMAN_PLATFORM_SSH_KNOWN_HOSTS: ${{ secrets.ROMAN_PLATFORM_SSH_KNOWN_HOSTS }}
+
+  smoke-unhealthy-test:
+    if: >-
+      github.repository == 'RomanYsrael-cmd/roman-lms' &&
+      github.event_name == 'workflow_dispatch' &&
+      github.ref == 'refs/heads/main' &&
+      inputs.confirmation == 'TEST UNHEALTHY SMOKE'
+    uses: RomanYsrael-cmd/roman-infrastructure/.github/workflows/romanlms-smoke-deploy.yml@ed7f0067b23bb5b1e0126c8c783ee63066d6e025
+    with:
+      confirmation: TEST UNHEALTHY SMOKE
+      operation: unhealthy-test
+      platform_ref: ed7f0067b23bb5b1e0126c8c783ee63066d6e025
     secrets:
       ROMAN_PLATFORM_SSH_PRIVATE_KEY: ${{ secrets.ROMAN_PLATFORM_SSH_PRIVATE_KEY }}
       ROMAN_PLATFORM_SSH_KNOWN_HOSTS: ${{ secrets.ROMAN_PLATFORM_SSH_KNOWN_HOSTS }}

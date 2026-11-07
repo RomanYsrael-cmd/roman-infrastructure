@@ -17,7 +17,7 @@ Phase 5 is in progress. The infrastructure controller and deployment alerts are 
 ## Current release gates
 
 - RomanLMS CI run [42317669874](https://github.com/RomanYsrael-cmd/roman-lms/actions/runs/42317669874) failed its required-check aggregation. Backend PostgreSQL/Testcontainers and Android checks reported failures; deployment contract and security checks passed. Run [42324069539](https://github.com/RomanYsrael-cmd/roman-lms/actions/runs/42324069539) is testing the caller pin update. Do not dispatch until current RomanLMS CI passes.
-- The RomanLMS caller is pinned to `2981677b61d3b80e0d87f7767f401f1509a53c82`, the SHA allowed by the installed server policy. The new unhealthy-candidate mode needs a separately reviewed full SHA added to the policy before the caller is updated and used.
+- The current RomanLMS caller is pinned to `2981677b61d3b80e0d87f7767f401f1509a53c82`, which the installed server policy allows. The new unhealthy-candidate workflow is pinned to `ed7f0067b23bb5b1e0126c8c783ee63066d6e025`; the matching policy and example caller update are prepared locally, but the server policy must be refreshed before using that workflow. The live RomanLMS caller remains at the old allowed pin until the current CI gate is cleared.
 - The Ansible refresh installed the launcher and controller. A forced `id` command returned exit 2 immediately, an unallowlisted app request returned the expected rejection, the private listener still returned 503, and the sudo rule parsed successfully. The independent administrative SSH session remains active.
 
 ## Not yet verified

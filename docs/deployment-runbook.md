@@ -10,7 +10,7 @@ The controller, restricted deployment account, SSH key, loopback route, and Graf
 2. Keep the existing dedicated Ed25519 deployment key private and continue using only the verified host-key secret. Never copy the private key into the repository.
 3. Re-run `deploy/ansible/install.yml` from the trusted WSL environment with the public deployment key. This installs the pre-sudo forced-command gate and refreshes the root-owned controller policy.
 4. Verify Nginx syntax, the local 503 route, the exact sudo rule, and the forced-command rejection tests. Verify the admin SSH session again.
-5. Update the RomanLMS caller to the approved full SHA in `platform/applications.json`. The current server allowlist approves `2981677b61d3b80e0d87f7767f401f1509a53c82`; retain that pin unless the server policy is reviewed and updated with another immutable SHA.
+5. Keep the caller and server policy on the same full SHA. The currently installed policy approves `2981677b61d3b80e0d87f7767f401f1509a53c82`; the updated unhealthy-test workflow uses `ed7f0067b23bb5b1e0126c8c783ee63066d6e025`. Reapply Ansible for the updated allowlist and update the RomanLMS caller to that pin only after CI passes.
 6. Confirm all existing RomanLMS CI checks pass before dispatching. The latest run failed in the backend integration and Android checks.
 7. The two RomanLMS repository secrets already exist by the required names. Verify their presence without printing values.
 
