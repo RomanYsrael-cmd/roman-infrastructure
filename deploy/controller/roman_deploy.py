@@ -444,6 +444,8 @@ def _wait_http(url: str, expected_text: str, timeout_seconds: int) -> None:
                 if response.status == 200 and expected_text in body:
                     return
                 last_error = f"HTTP {response.status} or unexpected response"
+        except urllib.error.HTTPError as exc:
+            last_error = f"HTTP {exc.code} or unexpected response"
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
             last_error = type(exc).__name__
         time.sleep(1)

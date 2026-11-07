@@ -147,6 +147,29 @@ class SmokeFixtureTests(unittest.TestCase):
                 thread.join(timeout=2)
 
 
+class ReadinessCheckTests(unittest.TestCase):
+    def test_http_error_reports_the_candidate_status_code(self):
+        error = urllib.error.HTTPError(
+            "http://127.0.0.1:19082/health",
+            503,
+            "Service Unavailable",
+            {},
+            None,
+        )
+        with mock.patch.object(deploy.urllib.request, "urlopen", side_effect=error):
+            with mock.patch.object(deploy.time, "monotonic", side_effect=[0, 0, 2]):
+                with mock.patch.object(deploy.time, "sleep"):
+                    with self.assertRaisesRegex(
+                        deploy.DeploymentError,
+                        "Readiness check failed: HTTP 503 or unexpected response",
+                    ):
+                        deploy._wait_http(
+                            "http://127.0.0.1:19082/health",
+                            '"status":"ok"',
+                            1,
+                        )
+
+
 class WorkflowOriginTests(unittest.TestCase):
     def setUp(self):
         self.app = dict(APP, allowed_platform_shas=[WORKFLOW_SHA])
