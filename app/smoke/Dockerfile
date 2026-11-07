@@ -5,6 +5,7 @@ ARG SOURCE_REPO
 ARG REVISION
 ARG PLATFORM_REF
 ARG CALLER_REVISION
+ARG SMOKE_HEALTH_MODE=healthy
 
 LABEL org.opencontainers.image.source="${PACKAGE_REPO}" \
       org.opencontainers.image.revision="${REVISION}" \
@@ -15,7 +16,8 @@ LABEL org.opencontainers.image.source="${PACKAGE_REPO}" \
       io.roman.deployment.caller-revision="${CALLER_REVISION}"
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    SMOKE_HEALTH_MODE=${SMOKE_HEALTH_MODE}
 
 WORKDIR /app
 COPY server.py /app/server.py

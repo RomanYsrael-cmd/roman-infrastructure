@@ -18,10 +18,12 @@ The controller, restricted deployment account, SSH key, loopback route, and Graf
 
 1. Ensure the existing ROMAN-LAPTOP runner is online and Docker Desktop is running its Linux engine.
 2. Confirm RomanLMS CI has passed for the current main head and the deployment caller pins the exact server-allowlisted workflow SHA.
-3. Open RomanLMS Actions, choose Roman platform smoke deployment, select main, and choose DEPLOY SMOKE.
-4. The job validates the runner, Tailscale peer, private SSH port, image health, digest, OCI labels, and server response. A missing secret or failed gate stops before a server change.
-5. After success, verify the controller's active state and audit record on `/srv/apps/roman-platform`, check the Prometheus textfile metric, and request the private local route on `roman-server` at `127.0.0.1:18080/health`.
-6. Confirm the route remains inaccessible from the public internet and no Cloudflare route was added.
+3. Open RomanLMS Actions and choose Roman platform smoke deployment on `main`. Choose `DEPLOY SMOKE` twice to retain two releases, then `ROLLBACK SMOKE` to verify the prior release is restored.
+4. Choose `TEST UNHEALTHY SMOKE`. The fixed candidate returns HTTP 503; the job passes only if the server rejects it at readiness and does not switch the Nginx route.
+5. Deploy a healthy smoke release again to clear the failure alert and verify the success alert path.
+6. The jobs validate the runner, Tailscale peer, private SSH port, health fixture, digest, OCI labels, workflow origin, and server response. A missing secret or failed gate stops before an unintended route change.
+7. Verify the controller's active state and audit record on `/srv/apps/roman-platform`, check the Prometheus textfile metric, and request the private local route on `roman-server` at `127.0.0.1:18080/health`.
+8. Confirm the route remains inaccessible from the public internet and no Cloudflare route was added.
 
 ## Inspect and troubleshoot
 

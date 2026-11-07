@@ -11,13 +11,14 @@ Phase 5 is in progress. The infrastructure controller and deployment alerts are 
 - The dedicated deployment key was generated, the server's Ed25519 host key was verified against the known local trust record, and the two repository secrets are configured by name.
 - The Ansible bootstrap installed the `roman-deploy` account, a root-owned controller and application policy, one exact sudo permission, and a loopback-only Nginx listener at `127.0.0.1:18080`. The initial route returns 503 until a smoke app is deployed.
 - The bootstrap provisioned the success and failure deployment alert rules under the existing Grafana folder and Telegram notification route. Existing contact points and notification policies were left in place.
-- The forced SSH key was tested. That test exposed a command-line rejection check placed after sudo, which could wait for request input when given an SSH remote command. A root-owned pre-sudo gate is now being added and must be installed and integration-tested before any deployment request is allowed.
+- The forced SSH key was tested. A root-owned pre-sudo gate now rejects remote commands in under a second before sudo; the normal JSON request channel remains available for policy validation.
+- A fixed unhealthy smoke image mode is implemented for the explicit `TEST UNHEALTHY SMOKE` manual choice. It returns HTTP 503, and the reusable workflow treats only the server's readiness rejection as a passing failure test.
 
 ## Current release gates
 
-- RomanLMS CI run [42317669874](https://github.com/RomanYsrael-cmd/roman-lms/actions/runs/42317669874) failed its required-check aggregation. The backend PostgreSQL/Testcontainers and Android checks reported failures; deployment contract and security checks passed. No smoke workflow may be dispatched until the repository's checks pass.
-- RomanLMS's current deployment caller is pinned to `06ceaeb...`, but the server policy allowlist contains `2981677...`. Update the caller to the approved full SHA before dispatching.
-- The latest Ansible change must be applied to install the new root-owned pre-sudo launcher. Then verify remote commands fail immediately, an unapproved app request is rejected, and the approved request interface remains available.
+- RomanLMS CI run [42317669874](https://github.com/RomanYsrael-cmd/roman-lms/actions/runs/42317669874) failed its required-check aggregation. Backend PostgreSQL/Testcontainers and Android checks reported failures; deployment contract and security checks passed. Run [42324069539](https://github.com/RomanYsrael-cmd/roman-lms/actions/runs/42324069539) is testing the caller pin update. Do not dispatch until current RomanLMS CI passes.
+- The RomanLMS caller is pinned to `2981677b61d3b80e0d87f7767f401f1509a53c82`, the SHA allowed by the installed server policy. The new unhealthy-candidate mode needs a separately reviewed full SHA added to the policy before the caller is updated and used.
+- The Ansible refresh installed the launcher and controller. A forced `id` command returned exit 2 immediately, an unallowlisted app request returned the expected rejection, the private listener still returned 503, and the sudo rule parsed successfully. The independent administrative SSH session remains active.
 
 ## Not yet verified
 

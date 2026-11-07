@@ -4,7 +4,11 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
+import urllib.error
+import urllib.request
+from http.server import ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -12,9 +16,11 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "deploy" / "controller"))
 sys.path.insert(0, str(ROOT / "deploy" / "monitoring"))
+sys.path.insert(0, str(ROOT / "app" / "smoke"))
 
 import roman_deploy as deploy
 import provision_grafana_alerts as grafana_alerts
+import server as smoke_server
 
 
 CONFIG = json.loads((ROOT / "platform" / "applications.json").read_text(encoding="utf-8"))
@@ -117,6 +123,27 @@ class ForcedCommandLauncherTests(unittest.TestCase):
             self.assertEqual(result.returncode, 2)
             self.assertIn("Remote commands are not accepted", result.stderr)
             self.assertFalse(marker.exists(), "remote commands must be rejected before sudo")
+
+
+class SmokeFixtureTests(unittest.TestCase):
+    def test_unhealthy_mode_returns_503_and_explicit_status(self):
+        with mock.patch.dict(os.environ, {"SMOKE_HEALTH_MODE": "unhealthy"}):
+            httpd = ThreadingHTTPServer(("127.0.0.1", 0), smoke_server.Handler)
+            thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+            thread.start()
+            try:
+                with self.assertRaises(urllib.error.HTTPError) as raised:
+                    urllib.request.urlopen(f"http://127.0.0.1:{httpd.server_port}/health", timeout=2)
+                self.assertEqual(raised.exception.code, 503)
+                try:
+                    body = json.loads(raised.exception.read().decode("utf-8"))
+                finally:
+                    raised.exception.close()
+                self.assertEqual(body["status"], "unhealthy")
+            finally:
+                httpd.shutdown()
+                httpd.server_close()
+                thread.join(timeout=2)
 
 
 class WorkflowOriginTests(unittest.TestCase):
