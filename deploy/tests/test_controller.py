@@ -278,9 +278,10 @@ class GrafanaAlertProvisioningTests(unittest.TestCase):
     def test_rules_use_existing_warning_route_and_deployment_metrics(self):
         rules = grafana_alerts.desired_rules("alerts-folder")
         self.assertEqual(len(rules), 2)
-        self.assertTrue(all(item["metadata"]["labels"]["grafana.app/folder"] == "alerts-folder" for item in rules))
-        self.assertTrue(all("grafana.com/group" not in item["metadata"]["labels"] for item in rules))
-        self.assertTrue(all("grafana.com/group-index" not in item["metadata"]["labels"] for item in rules))
+        self.assertTrue(all(item["metadata"]["annotations"]["grafana.app/folder"] == "alerts-folder" for item in rules))
+        self.assertTrue(all("grafana.app/folder" not in item["metadata"].get("labels", {}) for item in rules))
+        self.assertTrue(all("grafana.com/group" not in item["metadata"].get("labels", {}) for item in rules))
+        self.assertTrue(all("grafana.com/group-index" not in item["metadata"].get("labels", {}) for item in rules))
         self.assertTrue(all(item["spec"]["labels"]["severity"] == "warning" for item in rules))
         self.assertIn('outcome="failure"', rules[0]["spec"]["expressions"]["A"]["model"]["expr"])
         self.assertIn("bool 120", rules[1]["spec"]["expressions"]["A"]["model"]["expr"])
@@ -289,7 +290,7 @@ class GrafanaAlertProvisioningTests(unittest.TestCase):
     def test_upsert_skips_an_unchanged_rule(self):
         desired = grafana_alerts.desired_rules("alerts-folder")[0]
         current = {
-            "metadata": {"labels": desired["metadata"]["labels"]},
+            "metadata": {"annotations": desired["metadata"]["annotations"]},
             "spec": desired["spec"],
         }
         with mock.patch.object(grafana_alerts, "api_request", return_value=current) as api:

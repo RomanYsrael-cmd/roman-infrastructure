@@ -92,7 +92,7 @@ def _rule_resource(
         "metadata": {
             "name": name,
             "namespace": NAMESPACE,
-            "labels": {
+            "annotations": {
                 "grafana.app/folder": folder_uid,
             },
         },
@@ -198,8 +198,8 @@ def _matches(current: dict[str, Any], desired: dict[str, Any]) -> bool:
     spec = current.get("spec", {})
     wanted = desired["spec"]
     return (
-        metadata.get("labels", {}).get("grafana.app/folder")
-        == desired["metadata"]["labels"]["grafana.app/folder"]
+        metadata.get("annotations", {}).get("grafana.app/folder")
+        == desired["metadata"]["annotations"]["grafana.app/folder"]
         and spec.get("title") == wanted["title"]
         and spec.get("trigger") == wanted["trigger"]
         and spec.get("labels") == wanted["labels"]
