@@ -1,43 +1,46 @@
-# Phase 5 implementation status
+# Roman Infrastructure V2 implementation status
 
-Phase 5 is complete for the isolated `platform-smoke` application. The RomanLMS deployment caller passed its required CI, the reviewed image was published to GHCR and deployed through `ROMAN-LAPTOP`, the unhealthy candidate was rejected without switching traffic, and the retained release was restored successfully. Deployment failure, success, and recovery notices reached Telegram.
+## Phase 6: RomanLMS private integration (2026-11-08)
 
-## Cost and scope
+**Private staging integration is complete and verified. Production cutover has not been performed.** The application is running on roman-server behind Nginx bound only to 127.0.0.1:18081. No production database, public route, DNS, or Cloudflare configuration was changed.
 
-- No paid services, additional infrastructure, production runner, public route, Cloudflare DNS change, or RomanLMS production database restoration was added.
-- `main` remains unprotected as requested. No branch protection was changed.
-- The existing `ROMAN-LAPTOP` runner remains online and scoped to `RomanYsrael-cmd/roman-lms`.
-- The only repository deployment secrets are `ROMAN_PLATFORM_SSH_PRIVATE_KEY` and `ROMAN_PLATFORM_SSH_KNOWN_HOSTS`. Their values were not retrieved or printed.
-- The deployment host fingerprint was verified as `SHA256:Ou1kYNVRN74lXu5SSxa5mVop82fvxgK8P0zD+ymkIh4`.
+### Active private release
 
-## Reviewed workflow and server policy
+- RomanLMS source: df7c3bf12d6bd09fd5ed08626bacfad308bb4e21.
+- Deployment controller revision: 60c74abfec435dd3eb20ea71b9246d7de476615e.
+- Active slot: blue; schema V132.
+- Backend image: ghcr.io/romanysrael-cmd/romanlms-phase6-backend@sha256:f4ca922870570787dc52cd19f0cce17e671515dafbfb70ddf8b5bada8e00d53f.
+- Frontend image: ghcr.io/romanysrael-cmd/romanlms-phase6-frontend@sha256:16bcb1e2f349c19c2d1ad21fb7f7268366da10c22ea715b9327d70d96424e785.
+- Private frontend, backend health, and Prometheus routes returned HTTP 200; romanlms_phase6_metrics_up was 1.
+- Staging uses romanlms_phase6_test and isolated object storage. Mail and FCM are disabled, automatic Flyway application is disabled, and application schedulers are enabled only against staging.
 
-- RomanLMS CI run [42347455950](https://github.com/RomanYsrael-cmd/roman-lms/actions/runs/42347455950) passed for caller commit `cfa0d607ef9f35643149fb3a4b71b508a0446299` before any smoke deployment was dispatched.
-- The caller pins the reusable workflow to `d95b276cf3d257a685fe7bb7464197c44f4b4ea8`. The server allowlist contains only that SHA.
-- Infrastructure CI run [42353698237](https://github.com/RomanYsrael-cmd/roman-infrastructure/actions/runs/42353698237) passed with the final allowlist. Run [42353359569](https://github.com/RomanYsrael-cmd/roman-infrastructure/actions/runs/42353359569) passed the retained-container rollback fix.
-- The server controller and allowlist were refreshed with the reviewed Ansible playbook; the latest play recap was `ok=26 changed=1 unreachable=0 failed=0`.
-- The `roman-deploy` account remains restricted to the forced deployment command and the single reviewed sudo command. Independent administrative SSH/Tailscale access remained available.
-- The isolated Nginx route listens only on `127.0.0.1:18080`; it returned HTTP 200 after deployment and rollback. No public route was configured.
+### CI and controlled deployment evidence
 
-## End-to-end evidence
+- Infrastructure main is 65aa5ad2cd6f1c3dcb72cf2bab6b883a62f66f1a. Infrastructure CI [run 42459234210](https://github.com/RomanYsrael-cmd/roman-infrastructure/actions/runs/42459234210) passed.
+- RomanLMS main is df7c3bf12d6bd09fd5ed08626bacfad308bb4e21. Exact-commit CI [run 42452119200](https://github.com/RomanYsrael-cmd/roman-lms/actions/runs/42452119200) passed.
+- Private deploy [run 42459327787](https://github.com/RomanYsrael-cmd/roman-lms/actions/runs/42459327787) succeeded.
+- Backend and frontend unhealthy candidate rejection [run 42459983275](https://github.com/RomanYsrael-cmd/roman-lms/actions/runs/42459983275) and [run 42460323434](https://github.com/RomanYsrael-cmd/roman-lms/actions/runs/42460323434) succeeded as negative tests; the active release and route were retained.
+- Coordinated rollback [run 42460564776](https://github.com/RomanYsrael-cmd/roman-lms/actions/runs/42460564776) and reactivation of the corrected blue release [run 42460785540](https://github.com/RomanYsrael-cmd/roman-lms/actions/runs/42460785540) both succeeded. The final active release is the blue release listed above.
+- A synthetic live acceptance run verified three synthetic group members, persisted group messaging, student SSE delivery, private PDF preview, group archival, and revocation of three synthetic sessions. It used only the disposable staging database and storage.
 
-| Scenario | GitHub run | Outcome and server evidence |
-| --- | --- | --- |
-| Expected unhealthy candidate | [42352201188](https://github.com/RomanYsrael-cmd/roman-lms/actions/runs/42352201188) | Passed as a negative test. GHCR image `sha256:b33e39c91d61aa8e2fe4c1207970033fb24ddb957e66ef0bb34b386aa09af1a6` was rejected at the HTTP 503 readiness gate. Nginx continued serving the existing blue release; Prometheus recorded `outcome="failure"`. Telegram received the firing and recovery notices. |
-| Healthy deployment | [42352509205](https://github.com/RomanYsrael-cmd/roman-lms/actions/runs/42352509205) | Passed. GHCR image `sha256:1beef0981ff31e653bab4b69fc506403b6bf01687215a6e73a97ca81e357b77f` became active in the green slot. The private health route returned 200; Prometheus recorded the success and active release. Telegram received the firing success notice and its automatic resolution. |
-| Rollback defect found | [42353133628](https://github.com/RomanYsrael-cmd/roman-lms/actions/runs/42353133628) | The first rollback attempt exposed a name-versus-container-ID comparison bug. The controller rejected it before changing the route. The stored blue container remained healthy. The fix verifies the expected container name and its app/slot labels. |
-| Successful rollback | [42353471254](https://github.com/RomanYsrael-cmd/roman-lms/actions/runs/42353471254) | Passed after infrastructure CI and Ansible refresh. The server restored blue commit `48436c11fed3d451f4eeaf3f524df3572e130afc`; the route returned 200. The server audit and Prometheus show `operation="rollback", outcome="success"`. Telegram received the rollback success alert. |
+### Monitoring and alert delivery
 
-Final server observations: the active release was blue at revision `48436c11fed3d451f4eeaf3f524df3572e130afc`, the most recent operation was successful rollback run `42353471254`, and the private health route returned HTTP 200.
+The monitoring collector and Healthchecks heartbeat timers are active. The staging health and metrics endpoints are healthy. The Telegram alert chat showed the successful private deployment notification and firing notices for both expected unhealthy-candidate runs. The latest rollback-specific Telegram notices were not visible in the inspected chat view, so their individual delivery is not claimed as verified. The Grafana and Healthchecks firing/recovery paths had also been confirmed in earlier controlled tests.
 
-## Phase 6 prerequisites
+### Safety, CI triggers, and preserved work
 
-Phase 5 only deployed the harmless smoke application. Before restoring or routing production RomanLMS traffic:
+- Pushes to either repository's main branch trigger CI only. The RomanLMS private deployment remains owner-dispatched, actor/repository/main/CI gated, and pinned to the reviewed reusable workflow. No pending GitHub Actions jobs remain from the listed runs.
+- Production PostgreSQL was not modified. The November 6 source dump hash remains b9a1d013332c7692d11b84c2503e51195b8e6ec36e71a5fa223640fa9a617890. Both the preserved romanlms_phase6 baseline and the disposable romanlms_phase6_test database report schema 132 and 135 successful Flyway history records. No Phase 6 migration was applied.
+- Existing administrative SSH and Tailscale access were preserved. The private application listener has no public bind. No production route or Cloudflare/DNS changes were made.
+- Seven untracked Phase 5 log files remain in the RomanLMS worktree and were not staged or included in evidence. One contains credential-like fixture material and must remain private; do not package or publish any of these logs.
+- main remains unprotected as requested. No paid service or additional runner was added.
 
-- Restore and independently validate production database backups.
-- Define a RomanLMS-specific application policy for repository, resources, readiness, migrations, backups, retention, and rollback.
-- Confirm capacity for two actual RomanLMS releases on the server, or prepare an approved maintenance-window deployment strategy.
-- Validate application persistence, database migration behavior, release health, backup recovery, and rollback without using production data in the smoke test.
-- Review the production workflow and its secret boundaries before any DNS, Cloudflare, or production route change.
+### Remaining production prerequisites
 
-Production database restoration, public Cloudflare routing, and production traffic cutover remain out of scope.
+Private integration does not certify production cutover. The recovered November 6 database may omit later writes and original object-storage contents were not restored. Before a separately authorized cutover, identify the current production source of truth and later writes; take and verify a fresh consistent backup; validate production roles, grants, extensions, and object storage; review migration compatibility and recovery policy; freeze approved image digests and secrets; prepare a maintenance window and public routing plan; and obtain separate approval for any production database or public traffic change.
+
+Account activation/reset email is unverified because outbound mail is disabled. Android device/emulator behavior and peak-load capacity remain unverified. Chat real-time delivery is authenticated SSE; no WebSocket endpoint was identified or tested. The server's 7.1 GiB usable RAM had about 4.0 GiB available in the final observation, but this is a point-in-time sample rather than a load certification. See the [Phase 6 evidence report](evidence/phase6-romanlms-production-integration.md) and [handoff](phase6-handoff.md).
+
+## Phase 5 smoke deployment
+
+Phase 5 remains functional and isolated on 127.0.0.1:18080. The restricted deployment controller, roman-deploy account, pinned caller, SSH host verification, monitoring, and rollback support remain in place. Smoke deployment and rollback were previously exercised through ROMAN-LAPTOP. RomanLMS uses its separate private staging policy and listener.

@@ -31,6 +31,32 @@ The expected-unhealthy workflow run is a passing test even though the controller
 
 Keep logs limited to deployment metadata. Never print SSH credentials, GHCR tokens, repository secrets, or private keys.
 
-## Phase 6 boundary
+## RomanLMS private staging
 
-This controller policy is for the harmless smoke app. Do not use it to restore the RomanLMS production database or route production traffic. Phase 6 needs its own application policy for resource limits, readiness, migrations, backups, retention, production database recovery, and rollback. See [phase6-handoff.md](phase6-handoff.md).
+RomanLMS uses a separate application policy, loopback listener `127.0.0.1:18081`, internal Docker network, isolated PostgreSQL and object storage, and paired frontend/backend release. The application containers have no published host ports. Keep the smoke application and its `127.0.0.1:18080` listener independent.
+
+### Latest verified release
+
+The active release is blue at source SHA `df7c3bf12d6bd09fd5ed08626bacfad308bb4e21`, schema V132. The backend digest is `sha256:f4ca922870570787dc52cd19f0cce17e671515dafbfb70ddf8b5bada8e00d53f`; the frontend digest is `sha256:16bcb1e2f349c19c2d1ad21fb7f7268366da10c22ea715b9327d70d96424e785`. Exact-commit CI [42452119200](https://github.com/RomanYsrael-cmd/roman-lms/actions/runs/42452119200), deployment [42459327787](https://github.com/RomanYsrael-cmd/roman-lms/actions/runs/42459327787), backend/frontend rejection tests [42459983275](https://github.com/RomanYsrael-cmd/roman-lms/actions/runs/42459983275) and [42460323434](https://github.com/RomanYsrael-cmd/roman-lms/actions/runs/42460323434), and successful coordinated rollbacks [42460564776](https://github.com/RomanYsrael-cmd/roman-lms/actions/runs/42460564776) and [42460785540](https://github.com/RomanYsrael-cmd/roman-lms/actions/runs/42460785540) are complete. The final route serves the corrected blue pair. The private frontend, backend health, and Prometheus endpoints returned HTTP 200; Prometheus reports `romanlms_phase6_metrics_up=1`.
+
+Telegram showed the private deployment success and firing notices for both expected unhealthy-candidate runs. The newest rollback-specific Telegram notices were not visible in the inspected chat view; verify them on the next owner-observed rollback exercise if individual rollback-notice evidence is required.
+
+The only supported release path is the owner-dispatched **RomanLMS private staging deployment** workflow on current `main`. The caller workflow, reusable workflow SHA, server authorization allowlist, actor, repository, branch, exact commit, and latest required CI result must all match. Pushes to `main` run CI only. Never use a direct SSH command as a release mechanism.
+
+For each operation:
+
+1. Confirm the current RomanLMS `main` commit and its required CI result are green on `ROMAN-LAPTOP`.
+2. Confirm the requested operation is one of `DEPLOY PRIVATE ROMANLMS`, `TEST PRIVATE BACKEND FAILURE`, `TEST PRIVATE FRONTEND FAILURE`, `VERIFY PRIVATE ROMANLMS`, or `ROLLBACK PRIVATE ROMANLMS`.
+3. Dispatch the workflow from `main` with the exact confirmation choice. The build publishes frontend and backend images with immutable GHCR digests; the server verifies metadata and repository policy before starting containers.
+4. For deploy, confirm database connectivity, exact schema/history validation, storage mounts, network policy and memory preflight. Flyway application is disabled; preflight must not apply a migration.
+5. Verify the private frontend root and `/lms/actuator/health`; verify both components are healthy, the expected release identity is active, and the deployment audit and Prometheus metrics record the operation.
+6. For expected-unhealthy tests, treat a passing workflow as proof only that the named candidate was rejected and the active route remained healthy. Confirm the relevant failure/recovery notification reaches Telegram.
+7. After rollback, verify both frontend and backend route to the retained release, readiness returns healthy, the active/previous pointer is coherent, and the audit records a successful rollback. Database state is never rolled back by this action.
+
+The monitoring collector must report `romanlms_phase6_metrics_up=1` after the metrics matcher build is deployed. If it remains zero, diagnose the exact Nginx-to-backend source address and compare it with the single IP literal in the root-owned runtime environment file. Never broaden the trusted address range to clear an alert.
+
+The server should have at least 3 GiB available before a candidate starts. Current limits are PostgreSQL 1 GiB, object storage 512 MiB, backend 1.5 GiB per instance with JVM `-Xmx640m`, and frontend 256 MiB per instance. These are caps, not peak guarantees. If the gate fails, keep the current release active and use only a separately reviewed maintenance-window strategy; do not force an overlap.
+
+## Production cutover boundary
+
+The private Phase 6 release is not a production cutover. It does not authorize restoring or migrating the live RomanLMS production database, changing public Nginx routes, DNS, or Cloudflare. The November 6 staging restore may omit later writes and does not recover original object storage. See [romanlms-phase6-private.md](romanlms-phase6-private.md) and [phase6-handoff.md](phase6-handoff.md) for the remaining production prerequisites.
