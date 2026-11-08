@@ -151,6 +151,126 @@
           "readiness_timeout_seconds": 30
         }
       }
+    },
+    "romanlms-production": {
+      "app_id": "romanlms-production",
+      "repository": "RomanYsrael-cmd/roman-lms",
+      "workflow_repository": "RomanYsrael-cmd/roman-lms",
+      "workflow_path": ".github/workflows/romanlms-production-deploy.yml",
+      "reusable_workflow_path": "RomanYsrael-cmd/roman-infrastructure/.github/workflows/romanlms-private-deploy.yml",
+      "required_ci_workflow_file": "ci.yml",
+      "authorized_actors": ["RomanYsrael-cmd"],
+      "allowed_platform_shas": ["1a583cb114bb327fbd61c97b9d9b0b98865ebd56"],
+      "workflow_event": "workflow_dispatch",
+      "production_branch": "main",
+      "environment": "production",
+      "strategy": "blue-green",
+      "image_revision_mode": "caller",
+      "image_package_repository": "RomanYsrael-cmd/roman-lms",
+      "image_source_repository": "RomanYsrael-cmd/roman-infrastructure",
+      "migration_image_namespace": "ghcr.io/romanysrael-cmd/romanlms-prod-migrator",
+      "database_env_file": "/etc/roman-platform/romanlms-production/database.env",
+      "allowed_database_urls": ["jdbc:postgresql://127.0.0.1:5432/romanlms_prod"],
+      "flyway_cli_version": "11.14.1",
+      "flyway_schema": "roman_lms",
+      "expected_schema_version": "132",
+      "flyway_history_exceptions": [],
+      "migration_memory": "512m",
+      "migration_timeout_seconds": 180,
+      "required_mounts": ["/srv/apps", "/srv/databases"],
+      "docker_root_prefix": "/srv/apps",
+      "storage_root": "/srv/apps/romanlms-production",
+      "minimum_free_gib": 10,
+      "minimum_cpu_cores": 6,
+      "minimum_available_memory_mb": 3072,
+      "required_services": ["docker.service", "nginx.service", "postgresql@18-main.service", "cloudflared.service"],
+      "container_network": "host",
+      "container_network_mode": "host",
+      "allow_host_network": true,
+      "container_publish": false,
+      "container_restart_policy": "unless-stopped",
+      "stack_test_enabled": false,
+      "backup_marker": null,
+      "runtime_tmp_dir": "/run/roman-platform",
+      "lock_dir": "/run/lock/roman-platform",
+      "state_file": "/srv/apps/romanlms-production/state/romanlms-production.json",
+      "history_file": "/srv/apps/romanlms-production/logs/deployments.jsonl",
+      "metrics_file": "/srv/apps/monitoring/textfile_collector/romanlms_production_deploy.prom",
+      "route_file": "/etc/roman-platform/nginx/active-romanlms-production.conf",
+      "private_listener_port": 8081,
+      "components": {
+        "backend": {
+          "image_namespace": "ghcr.io/romanysrael-cmd/romanlms-prod-backend",
+          "route_prefix": "/lms/",
+          "slot_ports": {"blue": 18100, "green": 18102},
+          "container_port": 8080,
+          "container_memory": "1024m",
+          "container_cpus": 1.0,
+          "pids_limit": 256,
+          "container_env_file": "/etc/roman-platform/romanlms-production/runtime.env",
+          "container_tmpfs": ["/tmp:rw,nosuid,nodev,noexec,size=128m,mode=1777"],
+          "revision_environment_variable": "APP_DEPLOYMENT_SHA",
+          "host_network_bind_environment_variable": "SERVER_ADDRESS",
+          "host_network_port_environment_variable": "PORT",
+          "container_environment_by_slot": {
+            "blue": {
+              "SERVER_ADDRESS": "127.0.0.1",
+              "PORT": "18100",
+              "SPRING_FLYWAY_ENABLED": "false",
+              "SERVER_FORWARD_HEADERS_STRATEGY": "framework",
+              "MANAGEMENT_ENDPOINTS_WEB_EXPOSURE_INCLUDE": "health,prometheus",
+              "MANAGEMENT_ENDPOINT_HEALTH_SHOW_DETAILS": "never",
+              "MANAGEMENT_ENDPOINT_HEALTH_SHOW_COMPONENTS": "never",
+              "JAVA_TOOL_OPTIONS": "-Xms128m -Xmx640m -XX:MaxMetaspaceSize=192m -XX:+UseContainerSupport -XX:+ExitOnOutOfMemoryError"
+            },
+            "green": {
+              "SERVER_ADDRESS": "127.0.0.1",
+              "PORT": "18102",
+              "SPRING_FLYWAY_ENABLED": "false",
+              "SERVER_FORWARD_HEADERS_STRATEGY": "framework",
+              "MANAGEMENT_ENDPOINTS_WEB_EXPOSURE_INCLUDE": "health,prometheus",
+              "MANAGEMENT_ENDPOINT_HEALTH_SHOW_DETAILS": "never",
+              "MANAGEMENT_ENDPOINT_HEALTH_SHOW_COMPONENTS": "never",
+              "JAVA_TOOL_OPTIONS": "-Xms128m -Xmx640m -XX:MaxMetaspaceSize=192m -XX:+UseContainerSupport -XX:+ExitOnOutOfMemoryError"
+            }
+          },
+          "forwarded_proto_variable": "$http_x_forwarded_proto",
+          "proxy_read_timeout_seconds": 900,
+          "sse_enabled": true,
+          "public_health_path": "/lms/actuator/health",
+          "health_path": "/lms/actuator/health",
+          "route_health_url": "http://127.0.0.1:8081/lms/actuator/health",
+          "expected_health_text": "\"status\":\"UP\"",
+          "readiness_timeout_seconds": 180
+        },
+        "frontend": {
+          "image_namespace": "ghcr.io/romanysrael-cmd/romanlms-prod-frontend",
+          "route_prefix": "/",
+          "slot_ports": {"blue": 18101, "green": 18103},
+          "container_port": 3000,
+          "container_memory": "128m",
+          "container_cpus": 0.5,
+          "pids_limit": 64,
+          "container_tmpfs": [
+            "/tmp:rw,nosuid,nodev,noexec,size=8m,mode=1777",
+            "/var/cache/nginx:rw,nosuid,nodev,noexec,size=32m,mode=0777",
+            "/var/run:rw,nosuid,nodev,noexec,size=8m,mode=0777",
+            "/etc/nginx/conf.d:rw,nosuid,nodev,noexec,size=1m,mode=0777"
+          ],
+          "host_network_bind_environment_variable": "FRONTEND_BIND_ADDRESS",
+          "host_network_port_environment_variable": "FRONTEND_PORT",
+          "container_environment_by_slot": {
+            "blue": {"FRONTEND_BIND_ADDRESS": "127.0.0.1", "FRONTEND_PORT": "18101"},
+            "green": {"FRONTEND_BIND_ADDRESS": "127.0.0.1", "FRONTEND_PORT": "18103"}
+          },
+          "forwarded_proto_variable": "$http_x_forwarded_proto",
+          "proxy_read_timeout_seconds": 300,
+          "health_path": "/",
+          "route_health_url": "http://127.0.0.1:8081/",
+          "expected_health_text": "<!doctype html>",
+          "readiness_timeout_seconds": 30
+        }
+      }
     }
   }
 }
