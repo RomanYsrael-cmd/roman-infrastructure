@@ -980,13 +980,19 @@ class ProductionMetricsTests(unittest.TestCase):
         self.assertNotIn("synthetic", repr(aggregated))
 
     def test_docker_health_requires_the_exact_production_host_network_identity(self):
-        name = "roman-platform-romanlms-production-backend-blue-" + SHA[:12]
-        result = subprocess.CompletedProcess([], 0, "host|healthy|romanlms-production\n", "")
-        with mock.patch.object(production_metrics.subprocess, "run", return_value=result):
-            self.assertEqual(production_metrics.docker_health(name), 1)
-        wrong = subprocess.CompletedProcess([], 0, "bridge|healthy|romanlms-production\n", "")
-        with mock.patch.object(production_metrics.subprocess, "run", return_value=wrong):
-            self.assertEqual(production_metrics.docker_health(name), 0)
+        for component in ("backend", "frontend"):
+            name = f"roman-platform-romanlms-production-{component}-blue-" + SHA[:12]
+            result = subprocess.CompletedProcess([], 0, f"host|healthy|romanlms-production-{component}\n", "")
+            with mock.patch.object(production_metrics.subprocess, "run", return_value=result):
+                self.assertEqual(production_metrics.docker_health(name), 1)
+
+            wrong_label = subprocess.CompletedProcess([], 0, "host|healthy|romanlms-production\n", "")
+            with mock.patch.object(production_metrics.subprocess, "run", return_value=wrong_label):
+                self.assertEqual(production_metrics.docker_health(name), 0)
+
+            wrong_network = subprocess.CompletedProcess([], 0, f"bridge|healthy|romanlms-production-{component}\n", "")
+            with mock.patch.object(production_metrics.subprocess, "run", return_value=wrong_network):
+                self.assertEqual(production_metrics.docker_health(name), 0)
 
     def test_upsert_skips_an_unchanged_rule_when_grafana_omits_zero_for(self):
         desired = grafana_alerts.desired_rules("alerts-folder")[0]

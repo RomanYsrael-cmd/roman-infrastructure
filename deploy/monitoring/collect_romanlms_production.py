@@ -68,8 +68,10 @@ def aggregate_metrics(text: str) -> dict[str, float]:
 
 
 def docker_health(name: str) -> int:
-    if not re.fullmatch(r"roman-platform-romanlms-production-(?:backend|frontend)-(?:blue|green)-[0-9a-f]{12}", name):
+    match = re.fullmatch(r"roman-platform-romanlms-production-(backend|frontend)-(?:blue|green)-[0-9a-f]{12}", name)
+    if not match:
         return 0
+    expected_app = f"romanlms-production-{match.group(1)}"
     try:
         result = subprocess.run(
             ["docker", "inspect", "--format", "{{.HostConfig.NetworkMode}}|{{if .State.Health}}{{.State.Health.Status}}{{end}}|{{index .Config.Labels \"roman.platform.app\"}}", name],
@@ -78,7 +80,7 @@ def docker_health(name: str) -> int:
             timeout=10,
             check=False,
         )
-        return int(result.returncode == 0 and result.stdout.strip() == "host|healthy|romanlms-production")
+        return int(result.returncode == 0 and result.stdout.strip() == f"host|healthy|{expected_app}")
     except (OSError, subprocess.TimeoutExpired):
         return 0
 
