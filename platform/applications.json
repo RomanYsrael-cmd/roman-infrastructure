@@ -74,7 +74,10 @@
       "image_source_repository": "RomanYsrael-cmd/roman-infrastructure",
       "migration_image_namespace": "ghcr.io/romanysrael-cmd/romanlms-phase6-migrator",
       "database_env_file": "/etc/roman-platform/romanlms-phase6/database.env",
-      "allowed_database_urls": ["jdbc:postgresql://romanlms-phase6-db:5432/romanlms_phase6"],
+      "allowed_database_urls": [
+        "jdbc:postgresql://romanlms-phase6-db:5432/romanlms_phase6",
+        "jdbc:postgresql://romanlms-phase6-db:5432/romanlms_phase6_test"
+      ],
       "flyway_cli_version": "11.14.1",
       "flyway_schema": "roman_lms",
       "expected_schema_version": "132",

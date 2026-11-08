@@ -498,7 +498,13 @@ class Phase6PolicyTests(unittest.TestCase):
         deploy._stack_validate_network(app)
         self.assertFalse(app["container_publish"])
         self.assertEqual(app["container_restart_policy"], "no")
-        self.assertEqual(app["allowed_database_urls"], ["jdbc:postgresql://romanlms-phase6-db:5432/romanlms_phase6"])
+        self.assertEqual(
+            app["allowed_database_urls"],
+            [
+                "jdbc:postgresql://romanlms-phase6-db:5432/romanlms_phase6",
+                "jdbc:postgresql://romanlms-phase6-db:5432/romanlms_phase6_test",
+            ],
+        )
         self.assertEqual(app["private_listener_port"], 18081)
         self.assertEqual(set(app["components"]), {"backend", "frontend"})
         self.assertTrue(all(len(value) == 40 for value in app["allowed_platform_shas"]))
