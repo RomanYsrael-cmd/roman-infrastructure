@@ -1,0 +1,9 @@
+name = "romanlms-production-edge-proxy"
+main = "worker.mjs"
+compatibility_date = "2026-11-09"
+workers_dev = false
+preview_urls = false
+
+routes = [
+  { pattern = "romanlms.com/*", zone_name = "romanlms.com" }
+]
