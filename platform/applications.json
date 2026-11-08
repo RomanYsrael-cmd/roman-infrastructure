@@ -61,7 +61,10 @@
       "reusable_workflow_path": "RomanYsrael-cmd/roman-infrastructure/.github/workflows/romanlms-private-deploy.yml",
       "required_ci_workflow_file": "ci.yml",
       "authorized_actors": ["RomanYsrael-cmd"],
-      "allowed_platform_shas": ["a9153164e3ecc2a10f24f2d36c2f32a99a433ff2"],
+      "allowed_platform_shas": [
+        "a9153164e3ecc2a10f24f2d36c2f32a99a433ff2",
+        "60c74abfec435dd3eb20ea71b9246d7de476615e"
+      ],
       "workflow_event": "workflow_dispatch",
       "production_branch": "main",
       "environment": "phase6-staging",
