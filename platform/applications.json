@@ -160,7 +160,7 @@
       "reusable_workflow_path": "RomanYsrael-cmd/roman-infrastructure/.github/workflows/romanlms-private-deploy.yml",
       "required_ci_workflow_file": "ci.yml",
       "authorized_actors": ["RomanYsrael-cmd"],
-      "allowed_platform_shas": ["1a583cb114bb327fbd61c97b9d9b0b98865ebd56"],
+      "allowed_platform_shas": ["5dde31ba87ad8e21ad31bb61c0ad06fff94384c1"],
       "workflow_event": "workflow_dispatch",
       "production_branch": "main",
       "environment": "production",
