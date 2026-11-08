@@ -55,6 +55,15 @@ class WorkflowContractTests(unittest.TestCase):
                          "actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803"):
             self.assertIn(required, workflow)
 
+    def test_private_release_publishes_with_buildkit_and_verifies_immutable_digest(self):
+        workflow = (ROOT / ".github" / "workflows" / "romanlms-private-deploy.yml").read_text(encoding="utf-8")
+        self.assertIn("'buildx','build','--push','--metadata-file'", workflow)
+        self.assertIn("$publishMetadata.'containerimage.digest'", workflow)
+        self.assertIn("& docker pull $digestReference", workflow)
+        self.assertIn("$repoDigests -notcontains $digestReference", workflow)
+        self.assertNotIn("'--load'", workflow)
+        self.assertNotIn("& docker push $tag", workflow)
+
     def test_expected_unhealthy_rejection_resets_powershell_exit_code(self):
         workflow = (ROOT / ".github" / "workflows" / "romanlms-smoke-deploy.yml").read_text(encoding="utf-8")
         confirmation = "Write-Host 'Server rejected the unhealthy candidate at the readiness gate.'"

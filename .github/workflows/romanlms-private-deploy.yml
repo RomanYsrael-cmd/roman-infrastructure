@@ -129,7 +129,8 @@ jobs:
             foreach ($spec in $specs) {
               $image = 'ghcr.io/romanysrael-cmd/romanlms-phase6-' + $spec.Name
               $tag = $image + ':sha-' + $env:GITHUB_SHA + '-run-' + $env:GITHUB_RUN_ID + '-' + $env:GITHUB_RUN_ATTEMPT
-              $buildArgs = @('buildx','build','--load','--file',$spec.Dockerfile,'--tag',$tag,
+              $metadataPath = Join-Path $env:RUNNER_TEMP ('roman-image-' + $env:GITHUB_RUN_ID + '-' + $env:GITHUB_RUN_ATTEMPT + '-' + $spec.Name + '.json')
+              $buildArgs = @('buildx','build','--push','--metadata-file',$metadataPath,'--file',$spec.Dockerfile,'--tag',$tag,
                 '--build-arg',"OCI_REVISION=$env:GITHUB_SHA",'--build-arg',"FLYWAY_CLI_VERSION=$flywayVersion",
                 '--label','org.opencontainers.image.source=https://github.com/RomanYsrael-cmd/roman-lms',
                 '--label',"org.opencontainers.image.revision=$env:GITHUB_SHA",
@@ -138,18 +139,25 @@ jobs:
                 '--label','io.roman.deployment.package-repository=https://github.com/RomanYsrael-cmd/roman-lms',
                 '--label',"io.roman.deployment.caller-revision=$env:GITHUB_SHA",$spec.Context)
               & docker @buildArgs
-              if ($LASTEXITCODE -ne 0) { throw "Image build failed: $($spec.Name)." }
-              & docker push $tag
-              if ($LASTEXITCODE -ne 0) { throw "Image push failed: $($spec.Name)." }
-              & docker pull $tag
+              if ($LASTEXITCODE -ne 0) { throw "Image build or registry push failed: $($spec.Name)." }
+              if (-not (Test-Path -LiteralPath $metadataPath -PathType Leaf)) { throw 'BuildKit did not return image metadata.' }
+              $publishMetadata = Get-Content -LiteralPath $metadataPath -Raw | ConvertFrom-Json
+              $digest = [string]$publishMetadata.'containerimage.digest'
+              if ($digest -notmatch '^sha256:[0-9a-f]{64}$') { throw 'BuildKit did not return an immutable image digest.' }
+              $digestReference = $image + '@' + $digest
+              & docker pull $digestReference
               if ($LASTEXITCODE -ne 0) { throw "Published image pull failed: $($spec.Name)." }
-              $digest = (& docker image inspect --format '{{index .RepoDigests 0}}' $tag).Trim()
-              if ($digest -notmatch ('^' + [regex]::Escape($image) + '@sha256:[0-9a-f]{64}$')) { throw 'The registry did not return an immutable digest.' }
-              Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value ($spec.Name + '=' + $digest)
-              Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value ('Published ' + $digest)
+              $repoDigestJson = & docker image inspect --format '{{json .RepoDigests}}' $digestReference
+              if ($LASTEXITCODE -ne 0) { throw 'Could not inspect the pulled registry image.' }
+              $repoDigests = @($repoDigestJson | ConvertFrom-Json)
+              if ($repoDigests -notcontains $digestReference) { throw 'The pulled registry image did not match the BuildKit digest.' }
+              Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value ($spec.Name + '=' + $digestReference)
+              Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value ('Published ' + $digestReference)
+              Remove-Item -LiteralPath $metadataPath -Force -ErrorAction SilentlyContinue
             }
           } finally {
             & docker logout ghcr.io 2>$null | Out-Null
+            if ($metadataPath) { Remove-Item -LiteralPath $metadataPath -Force -ErrorAction SilentlyContinue }
             Remove-Item -LiteralPath $dockerConfig -Recurse -Force -ErrorAction SilentlyContinue
           }
 
