@@ -588,6 +588,7 @@ class RomanLmsProductionPolicyTests(unittest.TestCase):
 
     def test_production_policy_isolated_from_staging_and_uses_only_the_restored_database(self):
         self.assertEqual(self.app["environment"], "production")
+        self.assertEqual(self.app["allowed_platform_shas"], ["f14001afa20e54681826394dd06a485dafbdcdac"])
         self.assertEqual(self.app["allowed_database_urls"], ["jdbc:postgresql://127.0.0.1:5432/romanlms_prod"])
         self.assertEqual(self.app["expected_schema_version"], "132")
         self.assertEqual(
