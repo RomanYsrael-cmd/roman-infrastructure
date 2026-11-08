@@ -13,6 +13,18 @@ setup = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(setup)
 
 
+class StagingEnvironmentTests(unittest.TestCase):
+    def test_runtime_disables_external_side_effects_and_trusts_only_the_private_proxy(self):
+        runtime = setup.runtime_environment("synthetic-db-password", "synthetic-object-key", "synthetic-object-secret")
+
+        self.assertEqual(runtime["ROMANLMS_METRICS_TRUSTED_PROXY_ADDRESSES"], "172.30.66.1")
+        self.assertEqual(runtime["APP_RUNTIME_ENV"], "phase6-staging")
+        self.assertEqual(runtime["ROMANLMS_MAIL_ENABLED"], "false")
+        self.assertEqual(runtime["ROMANLMS_NOTIFICATIONS_FCM_ENABLED"], "false")
+        self.assertEqual(runtime["ROMANLMS_SCHEDULING_ENABLED"], "false")
+        self.assertEqual(runtime["SPRING_FLYWAY_ENABLED"], "false")
+
+
 @unittest.skipUnless(os.name == "posix" and hasattr(os, "geteuid") and os.geteuid() == 0, "requires an isolated Linux root test container")
 class StagingSetupSafetyTests(unittest.TestCase):
     def setUp(self):

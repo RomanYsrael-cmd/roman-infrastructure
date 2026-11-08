@@ -55,6 +55,22 @@ def write_private(path: Path, values: dict[str, str]) -> None:
         os.fsync(stream.fileno())
 
 
+def runtime_environment(app_password: str, object_access: str, object_secret: str) -> dict[str, str]:
+    return {
+        "DB_URL": DB_URL, "DB_USERNAME": "phase6_app", "DB_PASSWORD": app_password,
+        "APP_RUNTIME_ENV": "phase6-staging", "APP_RUNTIME_FORBIDDEN_DB_URL_SUBSTRINGS": "romanlms_prod,neon.tech",
+        "ROMANLMS_METRICS_TRUSTED_PROXY_ADDRESSES": "172.30.66.1",
+        "ROMANLMS_STORAGE_PREFIX": "phase6/", "ROMANLMS_MAIL_ENABLED": "false", "ROMANLMS_NOTIFICATIONS_FCM_ENABLED": "false",
+        "ROMANLMS_SCHEDULING_ENABLED": "false", "SPRING_FLYWAY_ENABLED": "false", "SERVER_ADDRESS": "0.0.0.0", "PORT": "8080",
+        "DB_POOL_MAX_SIZE": "5", "DB_POOL_MIN_IDLE": "0", "HOME": "/tmp", "REQUEST_MAPPING_LOG_LEVEL": "INFO", "S3_ENDPOINT": "http://romanlms-phase6-object:8333",
+        "S3_BUCKET": "romanlms-phase6", "S3_ACCESS_KEY_ID": object_access, "S3_SECRET_ACCESS_KEY": object_secret,
+        "S3_REGION": "us-east-1", "S3_PATH_STYLE_ACCESS_ENABLED": "true", "JWT_SECRET": secrets.token_urlsafe(64),
+        "REFRESH_TOKEN_PEPPER": secrets.token_urlsafe(48), "AUTH_EMAIL_TOKEN_PEPPER": secrets.token_urlsafe(48),
+        "NOTIFICATION_DEVICE_TOKEN_ENCRYPTION_KEY": base64.b64encode(secrets.token_bytes(32)).decode("ascii"),
+        "JAVA_TOOL_OPTIONS": "-Xms128m -Xmx640m -XX:MaxMetaspaceSize=256m -XX:+ExitOnOutOfMemoryError",
+    }
+
+
 def ensure_fresh() -> None:
     if os.geteuid() != 0:
         raise SetupError("Run this setup as root through the existing administrative mechanism.")
@@ -141,18 +157,7 @@ def main() -> int:
     write_private(CONFIG / "postgres.env", {"POSTGRES_USER": "phase6_owner", "POSTGRES_PASSWORD": owner_password, "POSTGRES_DB": "romanlms_phase6", "PGDATA": "/var/lib/postgresql/data/pgdata"})
     write_private(CONFIG / "database.env", {"DB_URL": DB_URL, "DB_USERNAME": "phase6_app", "DB_PASSWORD": app_password})
     write_private(CONFIG / "object.env", {"AWS_ACCESS_KEY_ID": object_access, "AWS_SECRET_ACCESS_KEY": object_secret, "S3_BUCKET": "romanlms-phase6"})
-    write_private(CONFIG / "runtime.env", {
-        "DB_URL": DB_URL, "DB_USERNAME": "phase6_app", "DB_PASSWORD": app_password,
-        "APP_RUNTIME_ENV": "phase6-staging", "APP_RUNTIME_FORBIDDEN_DB_URL_SUBSTRINGS": "romanlms_prod,neon.tech",
-        "ROMANLMS_STORAGE_PREFIX": "phase6/", "ROMANLMS_MAIL_ENABLED": "false", "ROMANLMS_NOTIFICATIONS_FCM_ENABLED": "false",
-        "ROMANLMS_SCHEDULING_ENABLED": "false", "SPRING_FLYWAY_ENABLED": "false", "SERVER_ADDRESS": "0.0.0.0", "PORT": "8080",
-        "DB_POOL_MAX_SIZE": "5", "DB_POOL_MIN_IDLE": "0", "HOME": "/tmp", "REQUEST_MAPPING_LOG_LEVEL": "INFO", "S3_ENDPOINT": "http://romanlms-phase6-object:8333",
-        "S3_BUCKET": "romanlms-phase6", "S3_ACCESS_KEY_ID": object_access, "S3_SECRET_ACCESS_KEY": object_secret,
-        "S3_REGION": "us-east-1", "S3_PATH_STYLE_ACCESS_ENABLED": "true", "JWT_SECRET": secrets.token_urlsafe(64),
-        "REFRESH_TOKEN_PEPPER": secrets.token_urlsafe(48), "AUTH_EMAIL_TOKEN_PEPPER": secrets.token_urlsafe(48),
-        "NOTIFICATION_DEVICE_TOKEN_ENCRYPTION_KEY": base64.b64encode(secrets.token_bytes(32)).decode("ascii"),
-        "JAVA_TOOL_OPTIONS": "-Xms128m -Xmx640m -XX:MaxMetaspaceSize=256m -XX:+ExitOnOutOfMemoryError",
-    })
+    write_private(CONFIG / "runtime.env", runtime_environment(app_password, object_access, object_secret))
     command(["docker", "network", "create", "--internal", "--subnet", SUBNET, NETWORK], timeout=30)
     for image in (POSTGRES_IMAGE, OBJECT_IMAGE):
         command(["docker", "pull", image], timeout=900)
