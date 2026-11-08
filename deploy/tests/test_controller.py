@@ -310,13 +310,24 @@ class RomanLmsContainerPolicyTests(unittest.TestCase):
             deploy._verify_flyway_info("not json", "132")
 
     def test_flyway_info_requires_exact_approved_legacy_history(self):
-        exception = {"state": "Missing", "category": "Repeatable", "type": "SQL", "version": "", "description": "retired seed", "filepath": ""}
-        info = {"schemaVersion": "132", "flywayVersion": "11.14.1", "schemaName": "roman_lms", "migrations": [{"state": "Success"}, exception]}
-        deploy._verify_flyway_info(json.dumps(info), "132", [exception], flyway_version="11.14.1", schema_name="roman_lms")
+        exceptions = [
+            {"state": state, "category": "Repeatable", "type": "SQL", "version": "", "description": "seed dev data", "filepath": ""}
+            for state in ("Deleted", "Missing")
+        ]
+        info = {
+            "schemaVersion": "132",
+            "flywayVersion": "11.14.1",
+            "schemaName": "roman_lms",
+            "migrations": [{"state": "Success"}, *exceptions],
+        }
+        deploy._verify_flyway_info(json.dumps(info), "132", exceptions, flyway_version="11.14.1", schema_name="roman_lms")
         with self.assertRaises(deploy.DeploymentError):
             deploy._verify_flyway_info(json.dumps(info), "132")
         with self.assertRaises(deploy.DeploymentError):
-            deploy._verify_flyway_info(json.dumps({**info, "migrations": [{"state": "Success"}]}), "132", [exception])
+            deploy._verify_flyway_info(json.dumps(info), "132", exceptions[:1])
+        mismatched = {**info, "migrations": [{"state": "Success"}, {**exceptions[0], "description": "unexpected migration"}, exceptions[1]]}
+        with self.assertRaises(deploy.DeploymentError):
+            deploy._verify_flyway_info(json.dumps(mismatched), "132", exceptions, flyway_version="11.14.1", schema_name="roman_lms")
 
     def test_database_preflight_rejects_missing_or_invalid_connection_before_registry_access(self):
         cases = [
@@ -579,7 +590,13 @@ class RomanLmsProductionPolicyTests(unittest.TestCase):
         self.assertEqual(self.app["environment"], "production")
         self.assertEqual(self.app["allowed_database_urls"], ["jdbc:postgresql://127.0.0.1:5432/romanlms_prod"])
         self.assertEqual(self.app["expected_schema_version"], "132")
-        self.assertEqual(self.app["flyway_history_exceptions"], [])
+        self.assertEqual(
+            self.app["flyway_history_exceptions"],
+            [
+                {"state": state, "category": "Repeatable", "type": "SQL", "version": "", "description": "seed dev data", "filepath": ""}
+                for state in ("Deleted", "Missing")
+            ],
+        )
         self.assertFalse(self.app["container_publish"])
         self.assertEqual(self.app["container_network_mode"], "host")
         deploy._stack_validate_network(self.app)

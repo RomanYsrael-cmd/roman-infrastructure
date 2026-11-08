@@ -174,7 +174,10 @@
       "flyway_cli_version": "11.14.1",
       "flyway_schema": "roman_lms",
       "expected_schema_version": "132",
-      "flyway_history_exceptions": [],
+      "flyway_history_exceptions": [
+        {"state": "Deleted", "category": "Repeatable", "type": "SQL", "version": "", "description": "seed dev data", "filepath": ""},
+        {"state": "Missing", "category": "Repeatable", "type": "SQL", "version": "", "description": "seed dev data", "filepath": ""}
+      ],
       "migration_memory": "512m",
       "migration_timeout_seconds": 180,
       "required_mounts": ["/srv/apps", "/srv/databases"],
