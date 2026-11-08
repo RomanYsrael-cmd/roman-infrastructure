@@ -21,7 +21,7 @@ class StagingEnvironmentTests(unittest.TestCase):
         self.assertEqual(runtime["APP_RUNTIME_ENV"], "phase6-staging")
         self.assertEqual(runtime["ROMANLMS_MAIL_ENABLED"], "false")
         self.assertEqual(runtime["ROMANLMS_NOTIFICATIONS_FCM_ENABLED"], "false")
-        self.assertEqual(runtime["ROMANLMS_SCHEDULING_ENABLED"], "false")
+        self.assertEqual(runtime["ROMANLMS_SCHEDULING_ENABLED"], "true")
         self.assertEqual(runtime["SPRING_FLYWAY_ENABLED"], "false")
 
 

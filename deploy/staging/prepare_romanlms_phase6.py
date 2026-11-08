@@ -61,7 +61,9 @@ def runtime_environment(app_password: str, object_access: str, object_secret: st
         "APP_RUNTIME_ENV": "phase6-staging", "APP_RUNTIME_FORBIDDEN_DB_URL_SUBSTRINGS": "romanlms_prod,neon.tech",
         "ROMANLMS_METRICS_TRUSTED_PROXY_ADDRESSES": "172.30.66.1",
         "ROMANLMS_STORAGE_PREFIX": "phase6/", "ROMANLMS_MAIL_ENABLED": "false", "ROMANLMS_NOTIFICATIONS_FCM_ENABLED": "false",
-        "ROMANLMS_SCHEDULING_ENABLED": "false", "SPRING_FLYWAY_ENABLED": "false", "SERVER_ADDRESS": "0.0.0.0", "PORT": "8080",
+        # Keep core application work such as authenticated chat SSE polling active.
+        # Outbound email and FCM remain explicitly disabled above.
+        "ROMANLMS_SCHEDULING_ENABLED": "true", "SPRING_FLYWAY_ENABLED": "false", "SERVER_ADDRESS": "0.0.0.0", "PORT": "8080",
         "DB_POOL_MAX_SIZE": "5", "DB_POOL_MIN_IDLE": "0", "HOME": "/tmp", "REQUEST_MAPPING_LOG_LEVEL": "INFO", "S3_ENDPOINT": "http://romanlms-phase6-object:8333",
         "S3_BUCKET": "romanlms-phase6", "S3_ACCESS_KEY_ID": object_access, "S3_SECRET_ACCESS_KEY": object_secret,
         "S3_REGION": "us-east-1", "S3_PATH_STYLE_ACCESS_ENABLED": "true", "JWT_SECRET": secrets.token_urlsafe(64),
