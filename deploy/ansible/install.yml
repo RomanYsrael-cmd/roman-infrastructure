@@ -16,6 +16,11 @@
     romanlms_phase6_site_file: /etc/nginx/conf.d/romanlms-phase6-private.conf
     romanlms_phase6_route: /etc/roman-platform/nginx/active-romanlms-phase6.conf
     install_romanlms_phase6: false
+    romanlms_production_root: /srv/apps/romanlms-production
+    romanlms_production_site_file: /etc/nginx/conf.d/romanlms-production.conf
+    romanlms_production_route: /etc/roman-platform/nginx/active-romanlms-production.conf
+    install_romanlms_production: false
+    provision_romanlms_production_alerts: false
 
   tasks:
     - name: Require a dedicated Ed25519 deployment public key
@@ -137,6 +142,32 @@
         fail_msg: Port 18081 is already in use and is not managed by the Phase 6 private route.
       when: install_romanlms_phase6 | bool
 
+    - name: Check whether the RomanLMS production listener is already managed
+      ansible.builtin.stat:
+        path: "{{ romanlms_production_site_file }}"
+      register: romanlms_production_nginx_site
+      when: install_romanlms_production | bool
+
+    - name: Check whether the RomanLMS production listener port is occupied
+      ansible.builtin.command:
+        argv:
+          - ss
+          - -ltnH
+          - sport
+          - '='
+          - :8081
+      register: romanlms_production_listener_check
+      changed_when: false
+      failed_when: false
+      when: install_romanlms_production | bool
+
+    - name: Refuse to claim an unrelated RomanLMS production listener
+      ansible.builtin.assert:
+        that:
+          - romanlms_production_listener_check.stdout | trim == '' or romanlms_production_nginx_site.stat.exists
+        fail_msg: Port 8081 is already in use and is not managed by the RomanLMS production gateway.
+      when: install_romanlms_production | bool
+
     - name: Create root-owned controller directories
       ansible.builtin.file:
         path: "{{ item.path }}"
@@ -166,6 +197,20 @@
         - { path: "{{ platform_config_dir }}/romanlms-phase6", mode: "0700" }
         - { path: /etc/systemd/system/roman-monitoring-collector.service.d, mode: "0755" }
       when: install_romanlms_phase6 | bool
+
+    - name: Create root-owned RomanLMS production directories
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "{{ item.mode }}"
+      loop:
+        - { path: "{{ romanlms_production_root }}/state", mode: "0750" }
+        - { path: "{{ romanlms_production_root }}/logs", mode: "0750" }
+        - { path: "{{ platform_config_dir }}/romanlms-production", mode: "0700" }
+        - { path: /etc/systemd/system/roman-monitoring-collector.service.d, mode: "0755" }
+      when: install_romanlms_production | bool
 
     - name: Install the Python controller
       ansible.builtin.copy:
@@ -226,6 +271,15 @@
         mode: "0750"
       when: install_romanlms_phase6 | bool
 
+    - name: Install the bounded production application metric collector
+      ansible.builtin.copy:
+        src: "{{ platform_repo_root }}/deploy/monitoring/collect_romanlms_production.py"
+        dest: "{{ platform_root }}/bin/collect-romanlms-production"
+        owner: root
+        group: root
+        mode: "0750"
+      when: install_romanlms_production | bool
+
     - name: Add private application metrics to the existing collector schedule
       ansible.builtin.copy:
         dest: /etc/systemd/system/roman-monitoring-collector.service.d/romanlms-phase6.conf
@@ -235,6 +289,16 @@
         mode: "0644"
       notify: Reload systemd manager
       when: install_romanlms_phase6 | bool
+
+    - name: Add production application metrics to the existing collector schedule
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/roman-monitoring-collector.service.d/romanlms-production.conf
+        content: "[Service]\nTimeoutStartSec=150s\nExecStart=-/usr/bin/python3 {{ platform_root }}/bin/collect-romanlms-production\n"
+        owner: root
+        group: root
+        mode: "0644"
+      notify: Reload systemd manager
+      when: install_romanlms_production | bool
 
     - name: Install the mount-checked Phase 6 startup service
       ansible.builtin.template:
@@ -309,6 +373,16 @@
         force: false
       when: install_romanlms_phase6 | bool
 
+    - name: Create a closed RomanLMS production route
+      ansible.builtin.copy:
+        dest: "{{ romanlms_production_route }}"
+        content: "return 503;\n"
+        owner: root
+        group: root
+        mode: "0644"
+        force: false
+      when: install_romanlms_production | bool
+
     - name: Install an isolated loopback-only Nginx listener
       ansible.builtin.template:
         src: templates/roman-platform-smoke.conf.j2
@@ -328,11 +402,24 @@
       notify: Reload Roman platform Nginx
       when: install_romanlms_phase6 | bool
 
+    - name: Install the loopback-only RomanLMS production gateway
+      ansible.builtin.template:
+        src: templates/romanlms-production.conf.j2
+        dest: "{{ romanlms_production_site_file }}"
+        owner: root
+        group: root
+        mode: "0644"
+      notify: Reload Roman platform Nginx
+      when: install_romanlms_production | bool
+
     - name: Apply and validate the private Nginx listener before alert setup
       ansible.builtin.meta: flush_handlers
 
     - name: Add deployment outcome rules to the existing Telegram route
-      ansible.builtin.command: "{{ platform_root }}/bin/provision-grafana-alerts{{ ' --include-phase6' if install_romanlms_phase6 | bool else '' }}"
+      ansible.builtin.command: >-
+        {{ platform_root }}/bin/provision-grafana-alerts
+        {{ '--include-phase6' if install_romanlms_phase6 | bool else '' }}
+        {{ '--include-production' if provision_romanlms_production_alerts | bool else '' }}
       register: deployment_alert_setup
       changed_when: "'changed=true' in deployment_alert_setup.stdout"
 

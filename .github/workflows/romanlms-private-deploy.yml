@@ -16,6 +16,22 @@ on:
         required: false
         type: string
         default: ''
+      app_id:
+        required: false
+        type: string
+        default: romanlms-phase6
+      deployment_environment:
+        required: false
+        type: string
+        default: phase6-staging
+      caller_workflow_path:
+        required: false
+        type: string
+        default: .github/workflows/romanlms-phase6-staging.yml
+      image_prefix:
+        required: false
+        type: string
+        default: romanlms-phase6
     secrets:
       ROMAN_PLATFORM_SSH_PRIVATE_KEY:
         required: true
@@ -38,11 +54,16 @@ jobs:
       github.actor == 'RomanYsrael-cmd' &&
       github.event_name == 'workflow_dispatch' &&
       github.ref == 'refs/heads/main' &&
-      ((inputs.operation == 'deploy-stack' && inputs.confirmation == 'DEPLOY PRIVATE ROMANLMS') ||
-       (inputs.operation == 'rollback-stack' && inputs.confirmation == 'ROLLBACK PRIVATE ROMANLMS') ||
-       (inputs.operation == 'verify-stack' && inputs.confirmation == 'VERIFY PRIVATE ROMANLMS') ||
-       (inputs.operation == 'test-stack' && inputs.test_component == 'backend' && inputs.confirmation == 'TEST PRIVATE BACKEND FAILURE') ||
-       (inputs.operation == 'test-stack' && inputs.test_component == 'frontend' && inputs.confirmation == 'TEST PRIVATE FRONTEND FAILURE'))
+      ((inputs.app_id == 'romanlms-phase6' &&
+        ((inputs.operation == 'deploy-stack' && inputs.confirmation == 'DEPLOY PRIVATE ROMANLMS') ||
+         (inputs.operation == 'rollback-stack' && inputs.confirmation == 'ROLLBACK PRIVATE ROMANLMS') ||
+         (inputs.operation == 'verify-stack' && inputs.confirmation == 'VERIFY PRIVATE ROMANLMS') ||
+         (inputs.operation == 'test-stack' && inputs.test_component == 'backend' && inputs.confirmation == 'TEST PRIVATE BACKEND FAILURE') ||
+         (inputs.operation == 'test-stack' && inputs.test_component == 'frontend' && inputs.confirmation == 'TEST PRIVATE FRONTEND FAILURE'))) ||
+       (inputs.app_id == 'romanlms-production' &&
+        ((inputs.operation == 'deploy-stack' && inputs.confirmation == 'DEPLOY ROMANLMS PRODUCTION') ||
+         (inputs.operation == 'rollback-stack' && inputs.confirmation == 'ROLLBACK ROMANLMS PRODUCTION') ||
+         (inputs.operation == 'verify-stack' && inputs.confirmation == 'VERIFY ROMANLMS PRODUCTION'))))
     runs-on: [self-hosted, Windows, X64, roman-laptop]
     timeout-minutes: 120
     defaults:
@@ -52,14 +73,28 @@ jobs:
       PLATFORM_REF: ${{ inputs.platform_ref }}
       OPERATION: ${{ inputs.operation }}
       TEST_COMPONENT: ${{ inputs.test_component }}
+      APP_ID: ${{ inputs.app_id }}
+      DEPLOYMENT_ENVIRONMENT: ${{ inputs.deployment_environment }}
+      CALLER_WORKFLOW_PATH: ${{ inputs.caller_workflow_path }}
+      IMAGE_PREFIX: ${{ inputs.image_prefix }}
+      CONFIRMATION: ${{ inputs.confirmation }}
       GH_TOKEN: ${{ github.token }}
     steps:
       - name: Verify current owner-controlled main and its successful CI
         run: |
           $ErrorActionPreference = 'Stop'
+          $profiles = @{
+            'romanlms-phase6' = @{ Workflow='.github/workflows/romanlms-phase6-staging.yml'; Environment='phase6-staging'; ImagePrefix='romanlms-phase6' }
+            'romanlms-production' = @{ Workflow='.github/workflows/romanlms-production-deploy.yml'; Environment='production'; ImagePrefix='romanlms-prod' }
+          }
+          $profile = $profiles[$env:APP_ID]
+          if (-not $profile -or $env:CALLER_WORKFLOW_PATH -ne $profile.Workflow -or
+              $env:DEPLOYMENT_ENVIRONMENT -ne $profile.Environment -or $env:IMAGE_PREFIX -ne $profile.ImagePrefix) {
+            throw 'The application deployment profile does not match its server-side policy.'
+          }
           if ($env:PLATFORM_REF -notmatch '^[0-9a-f]{40}$') { throw 'A full pinned infrastructure SHA is required.' }
           $currentRun = & gh api "repos/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID" | ConvertFrom-Json
-          if ($LASTEXITCODE -ne 0 -or $currentRun.path -ne '.github/workflows/romanlms-phase6-staging.yml' -or
+          if ($LASTEXITCODE -ne 0 -or $currentRun.path -ne $profile.Workflow -or
               $currentRun.head_sha -ne $env:GITHUB_SHA -or $currentRun.event -ne 'workflow_dispatch' -or
               $currentRun.actor.login -ne 'RomanYsrael-cmd') { throw 'The caller workflow is not authorized.' }
           $expectedWorkflow = 'RomanYsrael-cmd/roman-infrastructure/.github/workflows/romanlms-private-deploy.yml@' + $env:PLATFORM_REF
@@ -127,7 +162,7 @@ jobs:
               $specs += @{ Name='frontend'; Dockerfile='roman-lms/frontend/Dockerfile'; Context='roman-lms/frontend' }
             }
             foreach ($spec in $specs) {
-              $image = 'ghcr.io/romanysrael-cmd/romanlms-phase6-' + $spec.Name
+              $image = 'ghcr.io/romanysrael-cmd/' + $env:IMAGE_PREFIX + '-' + $spec.Name
               $tag = $image + ':sha-' + $env:GITHUB_SHA + '-run-' + $env:GITHUB_RUN_ID + '-' + $env:GITHUB_RUN_ATTEMPT
               $metadataPath = Join-Path $env:RUNNER_TEMP ('roman-image-' + $env:GITHUB_RUN_ID + '-' + $env:GITHUB_RUN_ATTEMPT + '-' + $spec.Name + '.json')
               $buildArgs = @('buildx','build','--push','--metadata-file',$metadataPath,'--file',$spec.Dockerfile,'--tag',$tag,
@@ -181,9 +216,9 @@ jobs:
             & ssh-keygen.exe -F '100.67.102.11' -f $knownHosts | Out-Null
             if ($LASTEXITCODE -ne 0) { throw 'The approved server host key is missing.' }
             $request = @{
-              operation=$env:OPERATION; app_id='romanlms-phase6'; repository=$env:GITHUB_REPOSITORY;
+              operation=$env:OPERATION; app_id=$env:APP_ID; repository=$env:GITHUB_REPOSITORY;
               branch='main'; commit_sha=$env:GITHUB_SHA; workflow_sha=$env:GITHUB_SHA;
-              platform_sha=$env:PLATFORM_REF; environment='phase6-staging';
+              platform_sha=$env:PLATFORM_REF; environment=$env:DEPLOYMENT_ENVIRONMENT;
               github_token=$env:GH_TOKEN;
               release=@{run_id=$env:GITHUB_RUN_ID; run_attempt=$env:GITHUB_RUN_ATTEMPT; actor=$env:GITHUB_ACTOR}
             }

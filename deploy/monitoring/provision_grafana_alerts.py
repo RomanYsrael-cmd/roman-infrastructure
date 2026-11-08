@@ -131,7 +131,7 @@ def _rule_resource(
     }
 
 
-def desired_rules(folder_uid: str, include_phase6: bool = False) -> list[dict[str, Any]]:
+def desired_rules(folder_uid: str, include_phase6: bool = False, include_production: bool = False) -> list[dict[str, Any]]:
     rules = [
         _rule_resource(
             name="roman-platform-deploy-failed",
@@ -201,8 +201,37 @@ def desired_rules(folder_uid: str, include_phase6: bool = False) -> list[dict[st
             summary="RomanLMS private {{ $labels.dependency }} is unavailable",
             description="The isolated staging dependency health check failed. Inspect its container and storage mounts.",
         ),
+        _rule_resource(
+            name="romanlms-production-deploy-failed",
+            title="RomanLMS Production Deployment Failed",
+            folder_uid=folder_uid,
+            query='roman_platform_last_deployment_info{app_id="romanlms-production",outcome="failure"}',
+            summary="RomanLMS production {{ $labels.operation }} failed",
+            description="Production release run {{ $labels.workflow_run_id }} for commit {{ $labels.request_sha }} failed. The previous active route was retained.",
+        ),
+        _rule_resource(
+            name="romanlms-production-deploy-succeeded",
+            title="RomanLMS Production Deployment Succeeded",
+            folder_uid=folder_uid,
+            query='(time() - roman_platform_last_deployment_timestamp_seconds{app_id="romanlms-production",outcome="success"}) < bool 120',
+            summary="RomanLMS production {{ $labels.operation }} succeeded",
+            description="Production release run {{ $labels.workflow_run_id }} passed its release and readiness checks. This notification resolves after two minutes.",
+        ),
+        _rule_resource(
+            name="romanlms-production-component-down",
+            title="RomanLMS Production Component Down",
+            folder_uid=folder_uid,
+            query="1 - romanlms_production_component_up",
+            summary="RomanLMS production {{ $labels.app_component }} is unavailable",
+            description="The production component health check failed. Inspect the active RomanLMS release and production gateway on roman-server.",
+        ),
     ]
-    return rules if include_phase6 else rules[:2]
+    selected = rules[:2]
+    if include_phase6:
+        selected.extend(rules[2:6])
+    if include_production:
+        selected.extend(rules[6:])
+    return selected
 
 
 def _verify_existing_telegram_route(password: str) -> str:
@@ -334,10 +363,11 @@ def _upsert_dashboard(password: str, folder_uid: str) -> bool:
 
 
 def main() -> int:
-    if sys.argv[1:] not in ([], ["--include-phase6"]):
+    if any(argument not in {"--include-phase6", "--include-production"} for argument in sys.argv[1:]) or len(set(sys.argv[1:])) != len(sys.argv[1:]):
         print("Unsupported alert provisioning option.", file=sys.stderr)
         return 1
-    include_phase6 = sys.argv[1:] == ["--include-phase6"]
+    include_phase6 = "--include-phase6" in sys.argv[1:]
+    include_production = "--include-production" in sys.argv[1:]
     try:
         password = GRAFANA_PASSWORD_FILE.read_text(encoding="utf-8").strip()
     except OSError:
@@ -352,7 +382,7 @@ def main() -> int:
         if not isinstance(health, dict) or health.get("database") != "ok":
             raise ProvisioningError("Grafana health check did not pass.")
         folder_uid = _verify_existing_telegram_route(password)
-        changed = sum(_upsert_rule(password, item) for item in desired_rules(folder_uid, include_phase6))
+        changed = sum(_upsert_rule(password, item) for item in desired_rules(folder_uid, include_phase6, include_production))
         if include_phase6:
             changed += int(_upsert_dashboard(password, folder_uid))
     except ProvisioningError as exc:

@@ -371,7 +371,18 @@ def preflight(app: dict[str, Any]) -> None:
         if not service_is_active(service):
             raise DeploymentError(f"Required service is not active: {service}.")
     network = app.get("container_network")
-    if network:
+    network_mode = app.get("container_network_mode", "bridge")
+    if network_mode == "host":
+        if not app.get("allow_host_network") or network != "host":
+            raise DeploymentError("Host networking is not explicitly authorized for this application.")
+        result = run_command(
+            ["docker", "network", "inspect", "--format", "{{.Name}}", "host"],
+            timeout=15,
+            check=False,
+        )
+        if result.returncode != 0 or result.stdout.strip() != "host":
+            raise DeploymentError("The required Docker host network is unavailable.")
+    elif network:
         if not isinstance(network, str) or not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}", network):
             raise DeploymentError("The configured private container network name is invalid.")
         result = run_command(
@@ -709,6 +720,7 @@ def _stack_route_content(components: dict[str, Any], slot: str) -> str:
     if slot not in {"blue", "green"} or not isinstance(components, dict) or not components:
         raise DeploymentError("The application route policy is invalid.")
     prefixes: set[str] = set()
+    health_paths: set[str] = set()
     endpoints: set[tuple[str, int]] = set()
     blocks: list[str] = []
     for name, component in sorted(components.items()):
@@ -733,6 +745,41 @@ def _stack_route_content(components: dict[str, Any], slot: str) -> str:
             raise DeploymentError("Application components cannot share a slot endpoint.")
         endpoints.add((address, port))
         modifier = "^~ " if prefix != "/" else ""
+        forwarded_proto = component.get("forwarded_proto_variable", "$scheme")
+        if forwarded_proto not in {"$scheme", "$http_x_forwarded_proto"}:
+            raise DeploymentError("The application forwarded-protocol policy is invalid.")
+        proxy_read_timeout = component.get("proxy_read_timeout_seconds", 300)
+        if isinstance(proxy_read_timeout, bool) or not isinstance(proxy_read_timeout, int) or not 1 <= proxy_read_timeout <= 3600:
+            raise DeploymentError("The application proxy timeout policy is invalid.")
+        sse_enabled = component.get("sse_enabled", False)
+        if not isinstance(sse_enabled, bool):
+            raise DeploymentError("The application event-stream policy is invalid.")
+        public_health_path = component.get("public_health_path")
+        if public_health_path is not None:
+            if (
+                not isinstance(public_health_path, str)
+                or not re.fullmatch(r"/(?:[A-Za-z0-9_-]+/)*[A-Za-z0-9_-]+", public_health_path)
+                or not public_health_path.startswith(prefix)
+                or public_health_path in health_paths
+            ):
+                raise DeploymentError("The application public health route is invalid.")
+            health_paths.add(public_health_path)
+            blocks.append(
+                f"location = {public_health_path} {{\n"
+                f"    proxy_pass http://{address}:{port}{public_health_path};\n"
+                "    proxy_http_version 1.1;\n"
+                "    proxy_set_header Host $host;\n"
+                "    proxy_set_header X-Real-IP $remote_addr;\n"
+                "    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n"
+                f"    proxy_set_header X-Forwarded-Proto {forwarded_proto};\n"
+                "    proxy_connect_timeout 2s;\n"
+                "    proxy_read_timeout 5s;\n"
+                "}\n"
+            )
+        sse_directives = (
+            "    proxy_buffering off;\n"
+            "    proxy_cache off;\n"
+        ) if sse_enabled else ""
         blocks.append(
             f"location {modifier}{prefix} {{\n"
             f"    proxy_pass http://{address}:{port};\n"
@@ -740,11 +787,14 @@ def _stack_route_content(components: dict[str, Any], slot: str) -> str:
             "    proxy_set_header Host $host;\n"
             "    proxy_set_header X-Real-IP $remote_addr;\n"
             "    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n"
-            "    proxy_set_header X-Forwarded-Proto $scheme;\n"
+            f"    proxy_set_header X-Forwarded-Proto {forwarded_proto};\n"
             "    proxy_set_header Upgrade $http_upgrade;\n"
             "    proxy_set_header Connection $http_connection;\n"
             "    proxy_connect_timeout 2s;\n"
-            "    proxy_read_timeout 300s;\n"
+            f"    proxy_read_timeout {proxy_read_timeout}s;\n"
+            "    proxy_send_timeout 300s;\n"
+            "    proxy_request_buffering off;\n"
+            f"{sse_directives}"
             "}\n"
         )
     if "/" not in prefixes:
@@ -1162,10 +1212,52 @@ def _stack_component_app(app: dict[str, Any], name: str) -> dict[str, Any]:
     component_app = {**app, **component, "app_id": f"{app['app_id']}-{name}"}
     if not APP_ID_RE.fullmatch(component_app["app_id"]):
         raise DeploymentError("The application component identifier is too long.")
+    network_mode = app.get("container_network_mode", "bridge")
     if not app.get("container_network") or component_app.get("container_network") != app["container_network"]:
-        raise DeploymentError("Every component must use the approved isolated application network.")
-    if component_app.get("container_publish", True) or not component_app.get("slot_ips"):
-        raise DeploymentError("Stack components must use private fixed addresses without published ports.")
+        raise DeploymentError("Every component must use the approved application network.")
+    if component_app.get("container_publish", True):
+        raise DeploymentError("Stack components must use private endpoints without published ports.")
+    if network_mode == "host":
+        if not app.get("allow_host_network") or app.get("container_network") != "host":
+            raise DeploymentError("Host networking is not explicitly authorized for this application.")
+        if component_app.get("slot_ips") or not isinstance(component_app.get("slot_ports"), dict):
+            raise DeploymentError("Host-network stack components require fixed loopback slot ports.")
+        bind_variable = component_app.get("host_network_bind_environment_variable")
+        if not isinstance(bind_variable, str) or not re.fullmatch(r"[A-Z][A-Z0-9_]*", bind_variable):
+            raise DeploymentError("The host-network loopback bind policy is invalid.")
+        port_variable = component_app.get("host_network_port_environment_variable")
+        if not isinstance(port_variable, str) or not re.fullmatch(r"[A-Z][A-Z0-9_]*", port_variable):
+            raise DeploymentError("The host-network port policy is invalid.")
+        environment_by_slot = component_app.get("container_environment_by_slot")
+        if not isinstance(environment_by_slot, dict):
+            raise DeploymentError("Host-network slot environments are unavailable.")
+        for slot in ("blue", "green"):
+            env = environment_by_slot.get(slot)
+            port = component_app["slot_ports"].get(slot)
+            if (
+                isinstance(port, bool)
+                or not isinstance(port, int)
+                or not isinstance(env, dict)
+                or env.get(bind_variable) != "127.0.0.1"
+                or env.get(port_variable) != str(port)
+            ):
+                raise DeploymentError("Host-network components must bind only to loopback.")
+        if app.get("stack_test_enabled"):
+            test_env = component_app.get("unhealthy_test_environment")
+            test_port = component_app["slot_ports"].get("test")
+            if (
+                isinstance(test_port, bool)
+                or not isinstance(test_port, int)
+                or not isinstance(test_env, dict)
+                or test_env.get(bind_variable) != "127.0.0.1"
+                or test_env.get(port_variable) != str(test_port)
+            ):
+                raise DeploymentError("Host-network failure tests must bind only to loopback.")
+    elif network_mode == "bridge":
+        if not isinstance(app.get("container_network"), str) or not component_app.get("slot_ips"):
+            raise DeploymentError("Stack components require fixed addresses on the approved private network.")
+    else:
+        raise DeploymentError("The application container network mode is unsupported.")
     listener_port = app.get("private_listener_port")
     if isinstance(listener_port, bool) or not isinstance(listener_port, int) or not 1024 <= listener_port <= 65535:
         raise DeploymentError("The private listener port is invalid.")
@@ -1175,6 +1267,31 @@ def _stack_component_app(app: dict[str, Any], name: str) -> dict[str, Any]:
 
 
 def _stack_validate_network(app: dict[str, Any]) -> None:
+    if app.get("container_network_mode", "bridge") == "host":
+        try:
+            if not app.get("allow_host_network") or app.get("container_network") != "host":
+                raise ValueError("host mode is not authorized")
+            slots = ("blue", "green", "test") if app.get("stack_test_enabled") else ("blue", "green")
+            used: set[int] = set()
+            for name in sorted(app["components"]):
+                component = _stack_component_app(app, name)
+                for slot in slots:
+                    if slot == "test" and not app.get("stack_test_enabled"):
+                        continue
+                    port = component["slot_ports"].get(slot)
+                    if isinstance(port, bool) or not isinstance(port, int) or not 1024 <= port <= 65535 or port in used:
+                        raise ValueError("host slot port is invalid or duplicated")
+                    used.add(port)
+            listener_port = app.get("private_listener_port")
+            if isinstance(listener_port, bool) or not isinstance(listener_port, int) or not 1024 <= listener_port <= 65535:
+                raise ValueError("production listener port is invalid")
+            if listener_port in used:
+                raise ValueError("production listener conflicts with an application port")
+        except (KeyError, TypeError, ValueError) as exc:
+            raise DeploymentError("The application host-network port policy is invalid.") from exc
+        return
+    if app.get("container_network_mode", "bridge") != "bridge":
+        raise DeploymentError("The application container network mode is unsupported.")
     try:
         network = ipaddress.ip_network(app["network_subnet"], strict=True)
         if not isinstance(network, ipaddress.IPv4Network) or not any(network.subnet_of(private) for private in (
@@ -1209,16 +1326,24 @@ def _stack_release_healthy(app: dict[str, Any], release: dict[str, Any]) -> None
             raise DeploymentError("The retained component does not belong to the application release.")
         if not _release_container_available(component_app, record):
             raise DeploymentError("A retained application component is unavailable.")
-        result = run_command(["docker", "inspect", "--format", "{{json .NetworkSettings.Networks}}", record["container"]], timeout=15, check=False)
-        try:
-            networks = json.loads(result.stdout)
-            actual_ip = networks[app["container_network"]]["IPAddress"]
-        except (KeyError, TypeError, json.JSONDecodeError) as exc:
-            raise DeploymentError("The application component network could not be verified.") from exc
-        if result.returncode != 0 or actual_ip != component_app["slot_ips"][slot] or set(networks) != {app["container_network"]}:
-            raise DeploymentError("The application component is not on its approved private address.")
+        if app.get("container_network_mode", "bridge") == "host":
+            result = run_command(["docker", "inspect", "--format", "{{.HostConfig.NetworkMode}}", record["container"]], timeout=15, check=False)
+            if result.returncode != 0 or result.stdout.strip() != "host":
+                raise DeploymentError("The application component is not using its approved loopback host network.")
+            actual_ip = "127.0.0.1"
+            port = int(component_app["slot_ports"][slot])
+        else:
+            result = run_command(["docker", "inspect", "--format", "{{json .NetworkSettings.Networks}}", record["container"]], timeout=15, check=False)
+            try:
+                networks = json.loads(result.stdout)
+                actual_ip = networks[app["container_network"]]["IPAddress"]
+            except (KeyError, TypeError, json.JSONDecodeError) as exc:
+                raise DeploymentError("The application component network could not be verified.") from exc
+            if result.returncode != 0 or actual_ip != component_app["slot_ips"][slot] or set(networks) != {app["container_network"]}:
+                raise DeploymentError("The application component is not on its approved private address.")
+            port = int(component_app["container_port"])
         _wait_http(
-            f"http://{actual_ip}:{int(component_app['container_port'])}{component_app['health_path']}",
+            f"http://{actual_ip}:{port}{component_app['health_path']}",
             component_app["expected_health_text"], int(component_app["readiness_timeout_seconds"]),
         )
 
@@ -1273,7 +1398,11 @@ def _test_stack_failure(request: dict[str, Any], app: dict[str, Any]) -> dict[st
         attempted = True
         run_command(_container_run_args(component, image, container, "test", int(component["container_port"]), request["commit_sha"], test_mode=True), timeout=60)
         try:
-            _wait_http(f"http://{component['slot_ips']['test']}:{int(component['container_port'])}{component['health_path']}", component["expected_health_text"], int(component["unhealthy_test_timeout_seconds"]))
+            if app.get("container_network_mode", "bridge") == "host":
+                test_url = f"http://127.0.0.1:{int(component['slot_ports']['test'])}{component['health_path']}"
+            else:
+                test_url = f"http://{component['slot_ips']['test']}:{int(component['container_port'])}{component['health_path']}"
+            _wait_http(test_url, component["expected_health_text"], int(component["unhealthy_test_timeout_seconds"]))
         except DeploymentError:
             pass
         else:

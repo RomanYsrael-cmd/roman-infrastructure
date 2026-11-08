@@ -22,6 +22,7 @@ sys.path.insert(0, str(ROOT / "app" / "smoke"))
 
 import roman_deploy as deploy
 import provision_grafana_alerts as grafana_alerts
+import collect_romanlms_production as production_metrics
 import server as smoke_server
 
 
@@ -63,6 +64,22 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertIn("$repoDigests -notcontains $digestReference", workflow)
         self.assertNotIn("'--load'", workflow)
         self.assertNotIn("& docker push $tag", workflow)
+
+    def test_production_profile_is_manual_owner_only_and_server_policy_scoped(self):
+        workflow = (ROOT / ".github" / "workflows" / "romanlms-private-deploy.yml").read_text(encoding="utf-8")
+        for required in (
+            "'romanlms-production' = @{ Workflow='.github/workflows/romanlms-production-deploy.yml'; Environment='production'; ImagePrefix='romanlms-prod' }",
+            "github.actor == 'RomanYsrael-cmd'",
+            "github.event_name == 'workflow_dispatch'",
+            "github.ref == 'refs/heads/main'",
+            "app_id=$env:APP_ID",
+            "environment=$env:DEPLOYMENT_ENVIRONMENT",
+            "currentRun.path -ne $profile.Workflow",
+        ):
+            self.assertIn(required, workflow)
+        self.assertIn("inputs.app_id == 'romanlms-production'", workflow)
+        self.assertIn("inputs.confirmation == 'DEPLOY ROMANLMS PRODUCTION'", workflow)
+        self.assertIn("inputs.confirmation == 'ROLLBACK ROMANLMS PRODUCTION'", workflow)
 
     def test_expected_unhealthy_rejection_resets_powershell_exit_code(self):
         workflow = (ROOT / ".github" / "workflows" / "romanlms-smoke-deploy.yml").read_text(encoding="utf-8")
@@ -461,6 +478,68 @@ class StackDeploymentTests(unittest.TestCase):
         with self.assertRaisesRegex(deploy.DeploymentError, "without published ports"):
             deploy._stack_validate_network(self.app)
 
+    def test_production_host_network_requires_loopback_per_slot_without_published_ports(self):
+        app = dict(self.app, container_network="host", container_network_mode="host", allow_host_network=True,
+                   components={
+                       "backend": {"route_prefix": "/lms/", "container_port": 8080,
+                                   "slot_ports": {"blue": 18100, "green": 18102},
+                                   "host_network_bind_environment_variable": "SERVER_ADDRESS",
+                                   "host_network_port_environment_variable": "SERVER_PORT",
+                                   "container_environment_by_slot": {
+                                       "blue": {"SERVER_ADDRESS": "127.0.0.1", "SERVER_PORT": "18100"},
+                                       "green": {"SERVER_ADDRESS": "127.0.0.1", "SERVER_PORT": "18102"},
+                                   },
+                                   "route_health_url": "http://127.0.0.1:18081/lms/actuator/health"},
+                       "frontend": {"route_prefix": "/", "container_port": 3000,
+                                    "slot_ports": {"blue": 18101, "green": 18103},
+                                    "host_network_bind_environment_variable": "FRONTEND_BIND_ADDRESS",
+                                    "host_network_port_environment_variable": "FRONTEND_PORT",
+                                    "container_environment_by_slot": {
+                                        "blue": {"FRONTEND_BIND_ADDRESS": "127.0.0.1", "FRONTEND_PORT": "18101"},
+                                        "green": {"FRONTEND_BIND_ADDRESS": "127.0.0.1", "FRONTEND_PORT": "18103"},
+                                    },
+                                    "route_health_url": "http://127.0.0.1:18081/"},
+                   })
+        deploy._stack_validate_network(app)
+        backend = deploy._stack_component_app(app, "backend")
+        with mock.patch.object(deploy, "_secure_env_file", return_value=Path("/private/runtime.env")):
+            args = deploy._container_run_args(backend, "registry/app@sha256:" + DIGEST, "roman-test", "green", 8080, SHA)
+        self.assertIn("--network", args)
+        self.assertEqual(args[args.index("--network") + 1], "host")
+        self.assertNotIn("--publish", args)
+        self.assertIn("SERVER_ADDRESS=127.0.0.1", args)
+        self.assertIn("SERVER_PORT=18102", args)
+
+    def test_production_host_network_rejects_non_loopback_bind_and_port_mismatch(self):
+        app = dict(self.app, container_network="host", container_network_mode="host", allow_host_network=True,
+                   components={
+                       "backend": {"route_prefix": "/lms/", "container_port": 8080, "slot_ports": {"blue": 18100, "green": 18102},
+                                   "host_network_bind_environment_variable": "SERVER_ADDRESS",
+                                   "host_network_port_environment_variable": "SERVER_PORT",
+                                   "container_environment_by_slot": {
+                                       "blue": {"SERVER_ADDRESS": "0.0.0.0", "SERVER_PORT": "18100"},
+                                       "green": {"SERVER_ADDRESS": "127.0.0.1", "SERVER_PORT": "18103"},
+                                   },
+                                   "route_health_url": "http://127.0.0.1:18081/lms/actuator/health"},
+                   })
+        with self.assertRaisesRegex(deploy.DeploymentError, "loopback"):
+            deploy._stack_component_app(app, "backend")
+
+    def test_host_network_route_preserves_forwarded_https_and_uses_loopback_ports(self):
+        components = {
+            "backend": {"route_prefix": "/lms/", "slot_ports": {"blue": 18100},
+                        "forwarded_proto_variable": "$http_x_forwarded_proto",
+                        "public_health_path": "/lms/actuator/health", "sse_enabled": True},
+            "frontend": {"route_prefix": "/", "slot_ports": {"blue": 18101}},
+        }
+        rendered = deploy._stack_route_content(components, "blue")
+        self.assertIn("proxy_pass http://127.0.0.1:18100;", rendered)
+        self.assertIn("location = /lms/actuator/health", rendered)
+        self.assertIn("proxy_pass http://127.0.0.1:18100/lms/actuator/health;", rendered)
+        self.assertIn("proxy_set_header X-Forwarded-Proto $http_x_forwarded_proto;", rendered)
+        self.assertIn("proxy_buffering off;", rendered)
+        self.assertIn("proxy_request_buffering off;", rendered)
+
     def test_rollback_switches_both_components_to_the_retained_release(self):
         active = {"slot": "green", "commit_sha": "b" * 40, "schema_version": "132"}
         previous = {"slot": "blue", "commit_sha": "a" * 40, "schema_version": "132"}
@@ -490,6 +569,43 @@ class StackDeploymentTests(unittest.TestCase):
                 deploy._switch_stack_route(self.app, "blue")
         self.assertEqual(self.route.read_text(encoding="utf-8"), "return 503;\n")
         self.assertEqual(sum(call.args[0] == ["systemctl", "reload", "nginx"] for call in run.call_args_list), 2)
+
+
+class RomanLmsProductionPolicyTests(unittest.TestCase):
+    def setUp(self):
+        self.app = CONFIG["applications"]["romanlms-production"]
+
+    def test_production_policy_isolated_from_staging_and_uses_only_the_restored_database(self):
+        self.assertEqual(self.app["environment"], "production")
+        self.assertEqual(self.app["allowed_database_urls"], ["jdbc:postgresql://127.0.0.1:5432/romanlms_prod"])
+        self.assertEqual(self.app["expected_schema_version"], "132")
+        self.assertEqual(self.app["flyway_history_exceptions"], [])
+        self.assertFalse(self.app["container_publish"])
+        self.assertEqual(self.app["container_network_mode"], "host")
+        deploy._stack_validate_network(self.app)
+
+    def test_production_component_ports_are_loopback_only_and_route_in_one_release_file(self):
+        for name, bind_variable, port_variable in (
+            ("backend", "SERVER_ADDRESS", "PORT"),
+            ("frontend", "FRONTEND_BIND_ADDRESS", "FRONTEND_PORT"),
+        ):
+            component = deploy._stack_component_app(self.app, name)
+            self.assertEqual(component["host_network_bind_environment_variable"], bind_variable)
+            self.assertEqual(component["host_network_port_environment_variable"], port_variable)
+            self.assertTrue(all(env[bind_variable] == "127.0.0.1" for env in component["container_environment_by_slot"].values()))
+            with mock.patch.object(deploy, "_secure_env_file", return_value=Path("/private/runtime.env")):
+                args = deploy._container_run_args(component, "registry/app@sha256:" + DIGEST, "roman-test", "blue", component["container_port"], SHA)
+            self.assertEqual(args[args.index("--network") + 1], "host")
+            self.assertNotIn("--publish", args)
+        for slot, backend_port, frontend_port in (("blue", 18100, 18101), ("green", 18102, 18103)):
+            route = deploy._stack_route_content(self.app["components"], slot)
+            self.assertIn(f"proxy_pass http://127.0.0.1:{backend_port};", route)
+            self.assertIn(f"proxy_pass http://127.0.0.1:{frontend_port};", route)
+            self.assertIn("location = /lms/actuator/health", route)
+        gateway = (ROOT / "deploy" / "ansible" / "templates" / "romanlms-production.conf.j2").read_text(encoding="utf-8")
+        self.assertIn("listen 127.0.0.1:8081;", gateway)
+        self.assertIn("location ^~ /lms/actuator/", gateway)
+        self.assertIn("return 404;", gateway)
 
 
 class Phase6PolicyTests(unittest.TestCase):
@@ -824,6 +940,35 @@ class GrafanaAlertProvisioningTests(unittest.TestCase):
         self.assertIn('app_id="romanlms-phase6"', rules[2]["spec"]["expressions"]["A"]["model"]["expr"])
         self.assertIn('app_id="romanlms-phase6"', rules[3]["spec"]["expressions"]["A"]["model"]["expr"])
         self.assertTrue(all(item["spec"]["noDataState"] == "Ok" for item in rules))
+
+    def test_production_rules_are_opt_in_and_use_production_only_metrics(self):
+        rules = grafana_alerts.desired_rules("alerts-folder", include_production=True)
+        self.assertEqual(len(rules), 5)
+        production_rules = rules[2:]
+        self.assertTrue(all("romanlms-production" in item["metadata"]["name"] for item in production_rules))
+        self.assertTrue(any("romanlms_production_component_up" in item["spec"]["expressions"]["A"]["model"]["expr"] for item in production_rules))
+
+
+class ProductionMetricsTests(unittest.TestCase):
+    def test_metrics_aggregation_discards_request_labels_and_only_returns_bounded_totals(self):
+        aggregated = production_metrics.aggregate_metrics(
+            'http_server_requests_seconds_count{status="200",uri="/lms/api/user?email=synthetic"} 3\n'
+            'jvm_memory_used_bytes{area="heap"} 1024\n'
+            'hikaricp_connections_active{pool="app"} 2\n'
+        )
+        self.assertEqual(aggregated["http_2xx"], 3)
+        self.assertEqual(aggregated["heap_used"], 1024)
+        self.assertEqual(aggregated["db_connections"], 2)
+        self.assertNotIn("synthetic", repr(aggregated))
+
+    def test_docker_health_requires_the_exact_production_host_network_identity(self):
+        name = "roman-platform-romanlms-production-backend-blue-" + SHA[:12]
+        result = subprocess.CompletedProcess([], 0, "host|healthy|romanlms-production\n", "")
+        with mock.patch.object(production_metrics.subprocess, "run", return_value=result):
+            self.assertEqual(production_metrics.docker_health(name), 1)
+        wrong = subprocess.CompletedProcess([], 0, "bridge|healthy|romanlms-production\n", "")
+        with mock.patch.object(production_metrics.subprocess, "run", return_value=wrong):
+            self.assertEqual(production_metrics.docker_health(name), 0)
 
     def test_upsert_skips_an_unchanged_rule_when_grafana_omits_zero_for(self):
         desired = grafana_alerts.desired_rules("alerts-folder")[0]
