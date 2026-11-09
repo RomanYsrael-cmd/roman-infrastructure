@@ -13,6 +13,7 @@ import threading
 import unittest
 import urllib.error
 import urllib.request
+import yaml
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
@@ -981,6 +982,21 @@ class RomanLmsProductionPolicyTests(unittest.TestCase):
              mock.patch.object(Path, "is_symlink", return_value=False), mock.patch("builtins.open", return_value=io.StringIO(json.dumps(service_account))):
             with self.assertRaisesRegex(deploy.DeploymentError, "does not match"):
                 deploy._secret_file_mount_args(component, environment)
+
+    def test_production_fcm_enablement_requires_explicit_flag_and_credentials(self):
+        playbook = yaml.load(
+            (ROOT / "deploy" / "ansible" / "install.yml").read_text(encoding="utf-8"),
+            Loader=yaml.BaseLoader,
+        )
+        tasks = playbook[0]["tasks"]
+        guard = next(task for task in tasks if task["name"] == "Require production Firebase credentials before enabling FCM")
+        self.assertIn("romanlms_firebase_service_account_json is defined", guard["ansible.builtin.assert"]["that"])
+        self.assertIn("romanlms_fcm_enabled | default(false) | bool", guard["when"])
+        configuration = next(task for task in tasks if task["name"] == "Set production FCM enablement only when explicitly requested")
+        self.assertIn("romanlms_fcm_enabled is defined", configuration["when"])
+        self.assertIn("^ROMANLMS_NOTIFICATIONS_FCM_ENABLED=", configuration["ansible.builtin.lineinfile"]["regexp"])
+        self.assertIn("romanlms_fcm_enabled | bool", configuration["ansible.builtin.lineinfile"]["line"])
+        self.assertTrue(configuration["no_log"])
 
     def test_verify_skips_candidate_capacity_gate_but_keeps_release_validation(self):
         value = {
