@@ -260,6 +260,25 @@
       no_log: true
       when: install_romanlms_production | bool and romanlms_resend_api_key is defined
 
+    - name: Validate the optional production R2 credentials as a pair
+      tags: [romanlms-production-integrations]
+      ansible.builtin.assert:
+        that:
+          - romanlms_s3_access_key_id is defined
+          - romanlms_s3_secret_access_key is defined
+          - romanlms_s3_access_key_id is string
+          - romanlms_s3_access_key_id | length >= 16
+          - "'\\n' not in romanlms_s3_access_key_id"
+          - "'\\r' not in romanlms_s3_access_key_id"
+          - romanlms_s3_secret_access_key is string
+          - romanlms_s3_secret_access_key | length >= 20
+          - "'\\n' not in romanlms_s3_secret_access_key"
+          - "'\\r' not in romanlms_s3_secret_access_key"
+        fail_msg: Both production R2 credentials must be valid non-empty strings.
+      no_log: true
+      when: install_romanlms_production | bool and
+        (romanlms_s3_access_key_id is defined or romanlms_s3_secret_access_key is defined)
+
     - name: Validate the optional production email sender address
       tags: [romanlms-production-integrations]
       ansible.builtin.assert:
@@ -294,7 +313,7 @@
         mode: "0600"
       no_log: true
       when: install_romanlms_production | bool and
-        (romanlms_firebase_service_account_json is defined or romanlms_notification_token_encryption_key is defined or romanlms_resend_api_key is defined)
+        (romanlms_firebase_service_account_json is defined or romanlms_notification_token_encryption_key is defined or romanlms_resend_api_key is defined or romanlms_s3_access_key_id is defined or romanlms_s3_secret_access_key is defined)
 
     - name: Preserve the original token-key environment for transaction rollback
       ansible.builtin.copy:
@@ -409,6 +428,30 @@
         mode: "0600"
       no_log: true
       when: install_romanlms_production | bool and romanlms_resend_api_key is defined
+
+    - name: Install the production R2 S3 access key
+      tags: [romanlms-production-integrations]
+      ansible.builtin.lineinfile:
+        path: "{{ platform_config_dir }}/romanlms-production/runtime.env"
+        regexp: '^S3_ACCESS_KEY_ID='
+        line: "S3_ACCESS_KEY_ID={{ romanlms_s3_access_key_id }}"
+        owner: root
+        group: root
+        mode: "0600"
+      no_log: true
+      when: install_romanlms_production | bool and romanlms_s3_access_key_id is defined and romanlms_s3_secret_access_key is defined
+
+    - name: Install the production R2 S3 secret key
+      tags: [romanlms-production-integrations]
+      ansible.builtin.lineinfile:
+        path: "{{ platform_config_dir }}/romanlms-production/runtime.env"
+        regexp: '^S3_SECRET_ACCESS_KEY='
+        line: "S3_SECRET_ACCESS_KEY={{ romanlms_s3_secret_access_key }}"
+        owner: root
+        group: root
+        mode: "0600"
+      no_log: true
+      when: install_romanlms_production | bool and romanlms_s3_access_key_id is defined and romanlms_s3_secret_access_key is defined
 
     - name: Configure the production transactional email sender address
       tags: [romanlms-production-integrations]

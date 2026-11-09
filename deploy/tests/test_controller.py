@@ -1011,6 +1011,16 @@ class RomanLmsProductionPolicyTests(unittest.TestCase):
         self.assertIn("^ROMANLMS_NOTIFICATIONS_FCM_ENABLED=", configuration["ansible.builtin.lineinfile"]["regexp"])
         self.assertIn("romanlms_fcm_enabled | bool", configuration["ansible.builtin.lineinfile"]["line"])
         self.assertTrue(configuration["no_log"])
+        r2_validation = next(task for task in tasks if task["name"] == "Validate the optional production R2 credentials as a pair")
+        self.assertTrue(r2_validation["no_log"])
+        self.assertIn("romanlms_s3_access_key_id is defined", r2_validation["ansible.builtin.assert"]["that"])
+        self.assertIn("romanlms_s3_secret_access_key is defined", r2_validation["ansible.builtin.assert"]["that"])
+        r2_access = next(task for task in tasks if task["name"] == "Install the production R2 S3 access key")
+        r2_secret = next(task for task in tasks if task["name"] == "Install the production R2 S3 secret key")
+        self.assertTrue(r2_access["no_log"])
+        self.assertTrue(r2_secret["no_log"])
+        self.assertEqual(r2_access["ansible.builtin.lineinfile"]["regexp"], "^S3_ACCESS_KEY_ID=")
+        self.assertEqual(r2_secret["ansible.builtin.lineinfile"]["regexp"], "^S3_SECRET_ACCESS_KEY=")
         integration_tasks = {
             task["name"]
             for task in tasks
@@ -1021,6 +1031,7 @@ class RomanLmsProductionPolicyTests(unittest.TestCase):
             {
                 "Validate the optional production Firebase service account",
                 "Validate the optional production Resend API key",
+                "Validate the optional production R2 credentials as a pair",
                 "Validate the optional production email sender address",
                 "Validate the optional production email sender name",
                 "Preserve the production runtime environment before updating secrets",
@@ -1030,6 +1041,8 @@ class RomanLmsProductionPolicyTests(unittest.TestCase):
                 "Require production Firebase credentials before enabling FCM",
                 "Set production FCM enablement only when explicitly requested",
                 "Install the production Resend API key",
+                "Install the production R2 S3 access key",
+                "Install the production R2 S3 secret key",
                 "Configure the production transactional email sender address",
                 "Configure the production transactional email sender name",
                 "Enable production transactional email after installing its provider key",
