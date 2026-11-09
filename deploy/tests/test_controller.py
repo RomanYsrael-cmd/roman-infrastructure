@@ -504,7 +504,8 @@ class StackDeploymentTests(unittest.TestCase):
              mock.patch.object(deploy, "available_memory_bytes", return_value=1024 * 1024**2), \
              mock.patch.object(deploy, "_start_retained_stack") as start_previous, \
              mock.patch.object(deploy, "_restart_stack_backend") as restore_active, mock.patch.object(deploy, "require_storage_mounts"), \
-             mock.patch.object(deploy, "_switch_stack_route") as switch:
+             mock.patch.object(deploy, "_switch_stack_route") as switch, mock.patch.object(deploy, "_append_audit"), \
+             mock.patch.object(deploy, "_write_metrics"):
             with self.assertRaisesRegex(deploy.DeploymentError, "Insufficient available memory"):
                 deploy._rollback_stack(self.request, app)
         start_previous.assert_not_called()
