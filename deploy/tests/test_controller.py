@@ -412,6 +412,125 @@ class StackDeploymentTests(unittest.TestCase):
         candidate_commands = [args for args in commands if args[:2] == ["docker", "run"]]
         self.assertTrue(all("--publish" not in args and "--ip" in args for args in candidate_commands))
 
+    def test_single_backend_maintenance_stops_old_backend_before_starting_candidate(self):
+        self.app["single_backend_maintenance"] = True
+        old_sha = "d" * 40
+        active_components = {}
+        for name in ("backend", "frontend"):
+            component = deploy._stack_component_app(self.app, name)
+            active_components[name] = {
+                "slot": "green", "commit_sha": old_sha,
+                "container": deploy._container_name(component, "green", old_sha),
+                "image": "retained-image",
+            }
+        self.state.write_text(json.dumps({"active": {
+            "app_id": self.app["app_id"], "slot": "green", "commit_sha": old_sha,
+            "schema_version": "132", "components": active_components,
+        }, "previous": None}), encoding="utf-8")
+        commands = []
+        statuses = iter(("true", "false"))
+
+        def run(args, **kwargs):
+            commands.append(args)
+            if args[:3] == ["docker", "inspect", "--format"]:
+                return subprocess.CompletedProcess(args, 0, next(statuses), "")
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        def switch(app, slot):
+            self.route.write_text("switched " + slot, encoding="utf-8")
+
+        with mock.patch.object(deploy, "_validate_database"), mock.patch.object(deploy, "registry_session", return_value=contextlib.nullcontext({})), \
+             mock.patch.object(deploy, "run_command", side_effect=run), mock.patch.object(deploy, "_verify_image"), \
+             mock.patch.object(deploy, "_remove_inactive_slot"), mock.patch.object(deploy, "_release_container_available", return_value=True), \
+             mock.patch.object(deploy, "_stack_release_healthy"), mock.patch.object(deploy, "verify_release_origin"), \
+             mock.patch.object(deploy, "_switch_stack_route", side_effect=switch), mock.patch.object(deploy, "require_storage_mounts"), \
+             mock.patch.object(deploy, "available_memory_bytes", return_value=4 * 1024**3), \
+             mock.patch.object(deploy, "_append_audit"), mock.patch.object(deploy, "_write_metrics"):
+            result = deploy._deploy_stack(self.request, self.app)
+
+        self.assertEqual(result["outcome"], "success")
+        frontend_start = next(i for i, args in enumerate(commands) if args[:2] == ["docker", "run"] and "frontend" in args[args.index("--name") + 1])
+        backend_stop = next(i for i, args in enumerate(commands) if args[:2] == ["docker", "stop"])
+        backend_start = next(i for i, args in enumerate(commands) if args[:2] == ["docker", "run"] and "backend" in args[args.index("--name") + 1])
+        self.assertLess(frontend_start, backend_stop)
+        self.assertLess(backend_stop, backend_start)
+
+    def test_single_backend_maintenance_removes_candidate_before_restoring_retained_backend(self):
+        self.app["single_backend_maintenance"] = True
+        old_sha = "d" * 40
+        active_components = {}
+        for name in ("backend", "frontend"):
+            component = deploy._stack_component_app(self.app, name)
+            active_components[name] = {
+                "slot": "green", "commit_sha": old_sha,
+                "container": deploy._container_name(component, "green", old_sha),
+                "image": "retained-image",
+            }
+        active = {"app_id": self.app["app_id"], "slot": "green", "commit_sha": old_sha,
+                  "schema_version": "132", "components": active_components}
+        self.state.write_text(json.dumps({"active": active, "previous": None}), encoding="utf-8")
+        commands = []
+        states = iter(("true", "false", "false"))
+
+        def run(args, **kwargs):
+            commands.append(args)
+            if args[:3] == ["docker", "inspect", "--format"]:
+                return subprocess.CompletedProcess(args, 0, next(states), "")
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        failure = deploy.DeploymentError("Readiness check failed: candidate did not start.")
+        health = [None, failure, None]
+        with mock.patch.object(deploy, "_validate_database"), mock.patch.object(deploy, "registry_session", return_value=contextlib.nullcontext({})), \
+             mock.patch.object(deploy, "run_command", side_effect=run), mock.patch.object(deploy, "_verify_image"), \
+             mock.patch.object(deploy, "_remove_inactive_slot"), mock.patch.object(deploy, "_release_container_available", return_value=True), \
+             mock.patch.object(deploy, "available_memory_bytes", return_value=4 * 1024**3), mock.patch.object(deploy, "_stack_release_healthy", side_effect=health), \
+             mock.patch.object(deploy, "_stack_route_healthy"), mock.patch.object(deploy, "verify_release_origin"), \
+             mock.patch.object(deploy, "_switch_stack_route") as switch, mock.patch.object(deploy, "require_storage_mounts"), \
+             mock.patch.object(deploy, "_append_audit"), mock.patch.object(deploy, "_write_metrics"):
+            with self.assertRaisesRegex(deploy.DeploymentError, "candidate did not start"):
+                deploy._deploy_stack(self.request, self.app)
+
+        switch.assert_not_called()
+        latest_remove = max(i for i, args in enumerate(commands) if args[:3] == ["docker", "rm", "-f"])
+        restore_backend = next(i for i, args in enumerate(commands) if args[:2] == ["docker", "start"] and active_components["backend"]["container"] in args)
+        self.assertLess(latest_remove, restore_backend)
+
+    def test_maintenance_rollback_restores_active_backend_when_capacity_gate_fails(self):
+        app = dict(self.app, single_backend_maintenance=True, minimum_available_memory_mb=3072)
+        active = {"slot": "green", "commit_sha": "b" * 40, "schema_version": "132"}
+        previous = {"slot": "blue", "commit_sha": "a" * 40, "schema_version": "132"}
+        self.state.write_text(json.dumps({"active": active, "previous": previous}), encoding="utf-8")
+        with mock.patch.object(deploy, "_validate_database"), mock.patch.object(deploy, "_stop_stack_backend"), \
+             mock.patch.object(deploy, "available_memory_bytes", return_value=1024 * 1024**2), \
+             mock.patch.object(deploy, "_start_retained_stack") as start_previous, \
+             mock.patch.object(deploy, "_restart_stack_backend") as restore_active, mock.patch.object(deploy, "require_storage_mounts"), \
+             mock.patch.object(deploy, "_switch_stack_route") as switch, mock.patch.object(deploy, "_append_audit"), \
+             mock.patch.object(deploy, "_write_metrics"):
+            with self.assertRaisesRegex(deploy.DeploymentError, "Insufficient available memory"):
+                deploy._rollback_stack(self.request, app)
+        start_previous.assert_not_called()
+        restore_active.assert_called_once_with(app, active)
+        switch.assert_not_called()
+
+    def test_maintenance_rollback_stops_active_backend_before_starting_retained_release(self):
+        app = dict(self.app, single_backend_maintenance=True)
+        active = {"slot": "green", "commit_sha": "b" * 40, "schema_version": "132"}
+        previous = {"slot": "blue", "commit_sha": "a" * 40, "schema_version": "132"}
+        self.state.write_text(json.dumps({"active": active, "previous": previous}), encoding="utf-8")
+        events = []
+        def stop_backend(*args):
+            events.append("stop-active-backend")
+        def start_previous(*args):
+            events.append("start-retained-release")
+            return []
+        with mock.patch.object(deploy, "_validate_database"), mock.patch.object(deploy, "_stop_stack_backend", side_effect=stop_backend), \
+             mock.patch.object(deploy, "_start_retained_stack", side_effect=start_previous), mock.patch.object(deploy, "verify_release_origin"), \
+             mock.patch.object(deploy, "available_memory_bytes", return_value=4 * 1024**3), mock.patch.object(deploy, "_switch_stack_route"), mock.patch.object(deploy, "require_storage_mounts"), \
+             mock.patch.object(deploy, "_append_audit"), mock.patch.object(deploy, "_write_metrics"):
+            result = deploy._rollback_stack(self.request, app)
+        self.assertEqual(result["slot"], "blue")
+        self.assertEqual(events, ["stop-active-backend", "start-retained-release"])
+
     def test_unhealthy_active_release_can_be_replaced_after_candidate_is_healthy(self):
         self.app["allow_unhealthy_active_replacement"] = True
         active = {"slot": "blue", "commit_sha": "b" * 40, "components": {}}
@@ -678,6 +797,35 @@ class RomanLmsProductionPolicyTests(unittest.TestCase):
             ],
         )
         self.assertFalse(self.app["container_publish"])
+
+    def test_production_pool_and_single_backend_policy_are_explicit_and_required(self):
+        deploy._validate_romanlms_capacity_policy(self.app)
+        self.assertTrue(self.app["single_backend_maintenance"])
+        for slot in ("blue", "green"):
+            environment = self.app["components"]["backend"]["container_environment_by_slot"][slot]
+            self.assertEqual(environment["DB_POOL_MAX_SIZE"], "50")
+            self.assertEqual(environment["DB_POOL_MIN_IDLE"], "2")
+        bad_app = json.loads(json.dumps(self.app))
+        bad_app["components"]["backend"]["container_environment_by_slot"]["green"]["DB_POOL_MAX_SIZE"] = "10"
+        with self.assertRaisesRegex(deploy.DeploymentError, "maximum 50"):
+            deploy._validate_romanlms_capacity_policy(bad_app)
+
+    def test_verify_skips_candidate_capacity_gate_but_keeps_release_validation(self):
+        value = {
+            "operation": "verify-stack", "app_id": self.app["app_id"],
+            "repository": self.app["repository"], "branch": self.app["production_branch"],
+            "commit_sha": SHA, "workflow_sha": SHA,
+            "platform_sha": self.app["allowed_platform_shas"][0], "environment": self.app["environment"],
+            "release": {"run_id": "12345", "run_attempt": "1", "actor": "RomanYsrael-cmd"},
+            "github_token": "ghs_" + "x" * 32,
+        }
+        lock = mock.Mock()
+        with mock.patch.object(deploy, "_lock", return_value=lock), mock.patch.object(deploy, "preflight") as preflight, \
+             mock.patch.object(deploy, "verify_release_origin"), mock.patch.object(deploy, "_verify_stack_active", return_value={"outcome": "healthy"}):
+            result = deploy.execute(value, CONFIG)
+        self.assertEqual(result["outcome"], "healthy")
+        preflight.assert_called_once_with(self.app, capacity_checks=False, memory_check=False)
+        lock.close.assert_called_once_with()
         self.assertEqual(self.app["container_network_mode"], "host")
         deploy._stack_validate_network(self.app)
 
@@ -1041,10 +1189,28 @@ class GrafanaAlertProvisioningTests(unittest.TestCase):
 
     def test_production_rules_are_opt_in_and_use_production_only_metrics(self):
         rules = grafana_alerts.desired_rules("alerts-folder", include_production=True)
-        self.assertEqual(len(rules), 5)
+        self.assertEqual(len(rules), 13)
         production_rules = rules[2:]
         self.assertTrue(all("romanlms-production" in item["metadata"]["name"] for item in production_rules))
         self.assertTrue(any("romanlms_production_component_up" in item["spec"]["expressions"]["A"]["model"]["expr"] for item in production_rules))
+        self.assertTrue(any("romanlms_production_hikaricp_connections_pending" in item["spec"]["expressions"]["A"]["model"]["expr"] for item in production_rules))
+        self.assertTrue(any("status=~\"5..\"" in item["spec"]["expressions"]["A"]["model"]["expr"] for item in production_rules))
+        self.assertTrue(all(item["spec"]["labels"]["component"] == "romanlms-production" for item in production_rules))
+
+    def test_production_dashboard_covers_pool_latency_http_runtime_and_container_pressure(self):
+        dashboard = grafana_alerts.desired_production_dashboard()
+        self.assertEqual(dashboard["uid"], "romanlms-production-app")
+        self.assertEqual(dashboard["title"], "RomanLMS Production")
+        panel_source = "\n".join(panel["targets"][0]["expr"] for panel in dashboard["panels"])
+        for metric in (
+            "romanlms_production_hikaricp_connections_max",
+            "romanlms_production_http_responses_total",
+            "romanlms_production_http_requests_by_endpoint_seconds_bucket",
+            "romanlms_production_jvm_threads_live",
+            "romanlms_production_container_pids_limit_ratio",
+            "romanlms_production_container_restart_count",
+        ):
+            self.assertIn(metric, panel_source)
 
 
 class ProductionMetricsTests(unittest.TestCase):
@@ -1058,6 +1224,64 @@ class ProductionMetricsTests(unittest.TestCase):
         self.assertEqual(aggregated["heap_used"], 1024)
         self.assertEqual(aggregated["db_connections"], 2)
         self.assertNotIn("synthetic", repr(aggregated))
+
+    def test_exports_bounded_hikari_http_and_runtime_metrics_without_raw_request_labels(self):
+        text = "\n".join([
+            'hikaricp_connections_active{pool="db"} 3',
+            'hikaricp_connections_idle{pool="db"} 2',
+            'hikaricp_connections_pending{pool="db"} 1',
+            'hikaricp_connections_max{pool="db"} 50',
+            'hikaricp_connections_min{pool="db"} 2',
+            'hikaricp_connections_timeout_total{pool="db"} 4',
+            'hikaricp_connections_acquire_seconds_count{pool="db"} 10',
+            'hikaricp_connections_acquire_seconds_sum{pool="db"} 0.5',
+            'hikaricp_connections_acquire_seconds_max{pool="db"} 0.2',
+            'hikaricp_connections_acquire_seconds_bucket{pool="db",le="0.1"} 8',
+            'hikaricp_connections_acquire_seconds_bucket{pool="db",le="+Inf"} 10',
+            'http_server_requests_seconds_count{method="GET",status="200",uri="/lms/api/offerings/123?email=private"} 3',
+            'http_server_requests_seconds_count{method="POST",status="500",uri="/lms/api/offerings/123?email=private"} 1',
+            'http_server_requests_seconds_sum{method="GET",uri="/lms/api/offerings/123?email=private"} 0.7',
+            'http_server_requests_seconds_sum{method="POST",uri="/lms/api/offerings/123?email=private"} 1.2',
+            'http_server_requests_seconds_bucket{method="GET",status="200",uri="/lms/api/offerings/123?email=private",le="1"} 3',
+            'http_server_requests_seconds_bucket{method="GET",status="200",uri="/lms/api/offerings/123?email=private",le="+Inf"} 3',
+            'http_server_requests_seconds_bucket{method="POST",status="500",uri="/lms/api/offerings/123?email=private",le="1"} 0',
+            'http_server_requests_seconds_bucket{method="POST",status="500",uri="/lms/api/offerings/123?email=private",le="+Inf"} 1',
+            'jvm_threads_live_threads 28',
+            'jvm_threads_daemon_threads 18',
+            'jvm_threads_peak_threads 32',
+            'jvm_gc_pause_seconds_count{action="end of minor GC"} 9',
+            'jvm_gc_pause_seconds_sum{action="end of minor GC"} 0.4',
+        ])
+        aggregated = production_metrics.aggregate_metrics(text)
+        self.assertEqual(aggregated["hikari_max"], 50)
+        self.assertEqual(aggregated["hikari_min"], 2)
+        self.assertEqual(aggregated["hikari_active"], 3)
+        self.assertEqual(aggregated["hikari_idle"], 2)
+        self.assertEqual(aggregated["hikari_pending"], 1)
+        self.assertEqual(aggregated["hikari_timeouts"], 4)
+        self.assertEqual(aggregated["hikari_timers"]["acquire"]["count"], 10)
+        self.assertEqual(aggregated["http_codes"]["500"], 1)
+        self.assertEqual(aggregated["jvm_threads_live"], 28)
+        rendered = "\n".join(production_metrics.application_metric_lines(aggregated))
+        self.assertIn("romanlms_production_hikaricp_connections_max 50", rendered)
+        self.assertIn('endpoint_group="offerings",method="GET"', rendered)
+        self.assertIn('status="500"', rendered)
+        self.assertNotIn("private", rendered)
+        self.assertNotIn("123", rendered)
+
+    def test_docker_stats_reports_process_use_and_limits(self):
+        container = "roman-platform-romanlms-production-backend-green-" + SHA[:12]
+        stats = json.dumps({"Name": container, "MemUsage": "128MiB / 1024MiB", "CPUPerc": "1.5%", "PIDs": "12"})
+        with mock.patch.object(production_metrics.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, stats, "")):
+            values = production_metrics.docker_stats({"backend": container})
+        self.assertEqual(values["backend"]["pids"], 12)
+        self.assertEqual(values["backend"]["cpu"], 1.5)
+        inspect = subprocess.CompletedProcess([], 0, "1073741824|256|2\n", "")
+        with mock.patch.object(production_metrics.subprocess, "run", return_value=inspect):
+            limits = production_metrics.docker_resource_limits({"backend": container})
+        self.assertEqual(limits["backend"]["memory_limit"], 1073741824)
+        self.assertEqual(limits["backend"]["pids_limit"], 256)
+        self.assertEqual(limits["backend"]["restart_count"], 2)
 
     def test_docker_health_requires_the_exact_production_host_network_identity(self):
         for component in ("backend", "frontend"):

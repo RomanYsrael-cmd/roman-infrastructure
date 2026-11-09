@@ -28,6 +28,20 @@ DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 APP_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,47}$")
 
 
+def _validate_romanlms_capacity_policy(app: dict[str, Any]) -> None:
+    if app.get("app_id") != "romanlms-production":
+        return
+    if app.get("single_backend_maintenance") is not True:
+        raise DeploymentError("RomanLMS production requires the single-backend maintenance rollout policy.")
+    components = app.get("components")
+    backend = components.get("backend") if isinstance(components, dict) else None
+    slots = backend.get("container_environment_by_slot") if isinstance(backend, dict) else None
+    for slot in ("blue", "green"):
+        environment = slots.get(slot) if isinstance(slots, dict) else None
+        if not isinstance(environment, dict) or environment.get("DB_POOL_MAX_SIZE") != "50" or environment.get("DB_POOL_MIN_IDLE") != "2":
+            raise DeploymentError("RomanLMS production backend slots must set Hikari maximum 50 and minimum idle 2.")
+
+
 class DeploymentError(Exception):
     """A safe, user-facing deployment rejection or operational failure."""
 
@@ -80,6 +94,8 @@ def validate_request(request: Any, config: dict[str, Any]) -> tuple[dict[str, An
         app = config["applications"][app_id]
     except (KeyError, TypeError):
         raise DeploymentError("Application is not on the server allowlist.") from None
+
+    _validate_romanlms_capacity_policy(app)
 
     if request["repository"] != app["repository"]:
         raise DeploymentError("Repository is not authorized for this application.")
@@ -350,7 +366,7 @@ def _verify_image(image: str, request: dict[str, Any], app: dict[str, Any], env:
     )
 
 
-def preflight(app: dict[str, Any]) -> None:
+def preflight(app: dict[str, Any], *, capacity_checks: bool = True, memory_check: bool = True) -> None:
     require_storage_mounts(app)
     root = os.path.realpath(docker_root())
     expected_root = os.path.realpath(app["docker_root_prefix"])
@@ -359,14 +375,16 @@ def preflight(app: dict[str, Any]) -> None:
     storage_root = app["storage_root"]
     if not os.path.isdir(storage_root):
         raise DeploymentError("Approved application storage directory is missing.")
-    free_bytes = shutil.disk_usage(storage_root).free
-    if free_bytes < int(app["minimum_free_gib"]) * 1024**3:
-        raise DeploymentError("Insufficient free space on the applications SSD.")
-    if os.cpu_count() is None or os.cpu_count() < int(app["minimum_cpu_cores"]):
-        raise DeploymentError("Insufficient CPU capacity for the configured deployment strategy.")
-    free_memory_mb = available_memory_bytes() // (1024 * 1024)
-    if free_memory_mb < int(app["minimum_available_memory_mb"]):
-        raise DeploymentError("Insufficient available memory for the candidate release.")
+    if capacity_checks:
+        free_bytes = shutil.disk_usage(storage_root).free
+        if free_bytes < int(app["minimum_free_gib"]) * 1024**3:
+            raise DeploymentError("Insufficient free space on the applications SSD.")
+        if os.cpu_count() is None or os.cpu_count() < int(app["minimum_cpu_cores"]):
+            raise DeploymentError("Insufficient CPU capacity for the configured deployment strategy.")
+    if memory_check:
+        free_memory_mb = available_memory_bytes() // (1024 * 1024)
+        if free_memory_mb < int(app["minimum_available_memory_mb"]):
+            raise DeploymentError("Insufficient available memory for the candidate release.")
     for service in app["required_services"]:
         if not service_is_active(service):
             raise DeploymentError(f"Required service is not active: {service}.")
@@ -1354,6 +1372,53 @@ def _stack_route_healthy(app: dict[str, Any]) -> None:
         _wait_http(component["route_health_url"], component["expected_health_text"], int(component["readiness_timeout_seconds"]))
 
 
+def _check_backend_start_memory(app: dict[str, Any]) -> None:
+    free_memory_mb = available_memory_bytes() // (1024 * 1024)
+    if free_memory_mb < int(app["minimum_available_memory_mb"]):
+        raise DeploymentError("Insufficient available memory to start a backend after releasing the active pool.")
+
+
+def _stop_stack_backend(app: dict[str, Any], release: dict[str, Any]) -> None:
+    components = release.get("components")
+    record = components.get("backend") if isinstance(components, dict) else None
+    backend = _stack_component_app(app, "backend")
+    if (
+        not isinstance(record, dict)
+        or record.get("slot") != release.get("slot")
+        or record.get("commit_sha") != release.get("commit_sha")
+        or not _release_container_available(backend, record)
+    ):
+        raise DeploymentError("The active backend identity is invalid; maintenance deployment was not started.")
+    status = run_command(["docker", "inspect", "--format", "{{.State.Running}}", record["container"]], timeout=15, check=False)
+    if status.returncode != 0 or status.stdout.strip().lower() not in {"true", "false"}:
+        raise DeploymentError("The active backend state could not be verified; maintenance deployment was not started.")
+    if status.stdout.strip().lower() == "true":
+        run_command(["docker", "stop", "--time", "30", record["container"]], timeout=45)
+        stopped = run_command(["docker", "inspect", "--format", "{{.State.Running}}", record["container"]], timeout=15, check=False)
+        if stopped.returncode != 0 or stopped.stdout.strip().lower() != "false":
+            raise DeploymentError("The active backend did not stop before the candidate backend was started.")
+
+
+def _restart_stack_backend(app: dict[str, Any], release: dict[str, Any]) -> None:
+    components = release.get("components")
+    record = components.get("backend") if isinstance(components, dict) else None
+    backend = _stack_component_app(app, "backend")
+    if (
+        not isinstance(record, dict)
+        or record.get("slot") != release.get("slot")
+        or record.get("commit_sha") != release.get("commit_sha")
+        or not _release_container_available(backend, record)
+    ):
+        raise DeploymentError("The retained backend identity is invalid; automatic recovery could not continue.")
+    status = run_command(["docker", "inspect", "--format", "{{.State.Running}}", record["container"]], timeout=15, check=False)
+    if status.returncode != 0:
+        raise DeploymentError("The retained backend state could not be verified; automatic recovery could not continue.")
+    if status.stdout.strip().lower() != "true":
+        run_command(["docker", "start", record["container"]], timeout=60)
+    _stack_release_healthy(app, release)
+    _stack_route_healthy(app)
+
+
 def _verify_stack_active(request: dict[str, Any], app: dict[str, Any]) -> dict[str, Any]:
     started = time.time()
     _stack_validate_network(app)
@@ -1492,9 +1557,17 @@ def _deploy_stack(request: dict[str, Any], app: dict[str, Any]) -> dict[str, Any
     prior_state = state_path.read_text(encoding="utf-8") if state_path.exists() else None
     started_names: list[str] = []
     route_switched = False
+    backend_maintenance = app.get("single_backend_maintenance") is True and active is not None
     records: dict[str, Any] = {}
     try:
-        for name in sorted(app["components"]):
+        component_order = sorted(app["components"])
+        if app.get("single_backend_maintenance") is True:
+            component_order.sort(key=lambda name: (name == "backend", name))
+        for name in component_order:
+            if name == "backend" and backend_maintenance:
+                _stop_stack_backend(app, active)
+            if name == "backend" and app.get("single_backend_maintenance") is True:
+                _check_backend_start_memory(app)
             component_app = _stack_component_app(app, name)
             active_component = (active.get("components") or {}).get(name) if active else None
             _remove_inactive_slot(component_app, slot, active_component)
@@ -1524,6 +1597,11 @@ def _deploy_stack(request: dict[str, Any], app: dict[str, Any]) -> dict[str, Any
                 _atomic_write(state_path, prior_state)
         for container in reversed(started_names):
             run_command(["docker", "rm", "-f", container], timeout=30, check=False)
+        if backend_maintenance:
+            try:
+                _restart_stack_backend(app, active)
+            except Exception as recovery_exc:
+                raise DeploymentError("The candidate failed and the retained backend could not be restored automatically.") from recovery_exc
         raise
     metrics_warning = False
     try:
@@ -1571,7 +1649,11 @@ def _rollback_stack(request: dict[str, Any], app: dict[str, Any]) -> dict[str, A
     prior_state = state_path.read_text(encoding="utf-8")
     switched = False
     started_names: list[str] = []
+    backend_maintenance = app.get("single_backend_maintenance") is True
     try:
+        if backend_maintenance:
+            _stop_stack_backend(app, active)
+            _check_backend_start_memory(app)
         started_names = _start_retained_stack(app, previous)
         verify_release_origin(request, app)
         _switch_stack_route(app, previous["slot"])
@@ -1589,6 +1671,11 @@ def _rollback_stack(request: dict[str, Any], app: dict[str, Any]) -> dict[str, A
             _atomic_write(state_path, prior_state)
         for name in reversed(started_names):
             run_command(["docker", "stop", name], timeout=60, check=False)
+        if backend_maintenance:
+            try:
+                _restart_stack_backend(app, active)
+            except Exception as recovery_exc:
+                raise DeploymentError("Rollback failed and the active backend could not be restored automatically.") from recovery_exc
         raise
     metrics_warning = False
     try:
@@ -1671,7 +1758,9 @@ def execute(request: Any, config: dict[str, Any]) -> dict[str, Any]:
     started = time.time()
     try:
         try:
-            preflight(app)
+            verification = request["operation"] in {"verify", "verify-stack"}
+            single_backend_start = app.get("single_backend_maintenance") is True and request["operation"] in {"deploy-stack", "rollback-stack"}
+            preflight(app, capacity_checks=not verification, memory_check=not verification and not single_backend_start)
             verify_release_origin(request, app)
             if request["operation"] == "deploy":
                 return _deploy(request, app)
