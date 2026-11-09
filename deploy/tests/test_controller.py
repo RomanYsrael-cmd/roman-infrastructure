@@ -960,6 +960,20 @@ class RomanLmsProductionPolicyTests(unittest.TestCase):
         with self.assertRaisesRegex(deploy.DeploymentError, "maximum 50"):
             deploy._validate_romanlms_capacity_policy(bad_app)
 
+    def test_production_slo_boundaries_use_boot_compatible_integer_durations(self):
+        expected = {
+            "MANAGEMENT_METRICS_DISTRIBUTION_SLO_HTTP_SERVER_REQUESTS": "100ms,250ms,500ms,1s,2500ms,5s",
+            "MANAGEMENT_METRICS_DISTRIBUTION_SLO_HIKARICP_CONNECTIONS_ACQUIRE": "5ms,10ms,25ms,50ms,100ms,250ms,500ms,1s",
+            "MANAGEMENT_METRICS_DISTRIBUTION_SLO_HIKARICP_CONNECTIONS_USAGE": "10ms,100ms,500ms,1s,5s,30s",
+            "MANAGEMENT_METRICS_DISTRIBUTION_SLO_HIKARICP_CONNECTIONS_CREATION": "100ms,500ms,1s,2s,5s",
+        }
+        for slot in ("blue", "green"):
+            environment = self.app["components"]["backend"]["container_environment_by_slot"][slot]
+            for name, value in expected.items():
+                self.assertEqual(environment[name], value)
+                for boundary in value.split(","):
+                    self.assertRegex(boundary, r"^\d+(?:ns|us|ms|s|m|h|d)?$")
+
     def test_fcm_uses_only_a_root_owned_read_only_service_account_mount(self):
         component = deploy._stack_component_app(self.app, "backend")
         mount = component["container_secret_file_mounts"][0]
