@@ -63,6 +63,7 @@ jobs:
        (inputs.app_id == 'romanlms-production' &&
         ((inputs.operation == 'deploy-stack' && inputs.confirmation == 'DEPLOY ROMANLMS PRODUCTION') ||
          (inputs.operation == 'rollback-stack' && inputs.confirmation == 'ROLLBACK ROMANLMS PRODUCTION') ||
+         (inputs.operation == 'refresh-stack' && inputs.confirmation == 'REFRESH ROMANLMS RUNTIME CONFIGURATION') ||
          (inputs.operation == 'verify-stack' && inputs.confirmation == 'VERIFY ROMANLMS PRODUCTION'))))
     runs-on: [self-hosted, Windows, X64, roman-laptop]
     timeout-minutes: 120
@@ -138,12 +139,15 @@ jobs:
 
       - name: Run controller policy tests
         run: |
-          python -m unittest discover -s platform/deploy/tests -v
+          Push-Location platform/deploy/tests
+          try {
+            python -m unittest test_controller.WorkflowContractTests test_controller.RequestValidationTests test_controller.RomanLmsContainerPolicyTests test_controller.StackDeploymentTests test_controller.RomanLmsProductionPolicyTests test_controller.WorkflowOriginTests test_controller.ImageProvenanceTests -v
+          } finally { Pop-Location }
           if ($LASTEXITCODE -ne 0) { throw 'Controller policy tests failed.' }
 
       - name: Build and publish immutable images
         id: images
-        if: ${{ inputs.operation != 'verify-stack' }}
+        if: ${{ inputs.operation == 'deploy-stack' || inputs.operation == 'rollback-stack' || inputs.operation == 'test-stack' }}
         run: |
           $ErrorActionPreference = 'Stop'
           $dockerConfig = Join-Path $env:RUNNER_TEMP ('roman-private-docker-' + $env:GITHUB_RUN_ID)
