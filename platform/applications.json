@@ -160,13 +160,14 @@
       "reusable_workflow_path": "RomanYsrael-cmd/roman-infrastructure/.github/workflows/romanlms-private-deploy.yml",
       "required_ci_workflow_file": "ci.yml",
       "authorized_actors": ["RomanYsrael-cmd"],
-      "allowed_platform_shas": ["f14001afa20e54681826394dd06a485dafbdcdac"],
+      "allowed_platform_shas": ["f14001afa20e54681826394dd06a485dafbdcdac", "d5a4b3589c1c5057b94f7355f4f4e5f89a646ea6"],
       "workflow_event": "workflow_dispatch",
       "production_branch": "main",
       "environment": "production",
       "strategy": "blue-green",
       "single_backend_maintenance": true,
       "allow_unhealthy_active_replacement": true,
+      "runtime_refresh_enabled": true,
       "image_revision_mode": "caller",
       "image_package_repository": "RomanYsrael-cmd/roman-lms",
       "image_source_repository": "RomanYsrael-cmd/roman-infrastructure",
@@ -213,6 +214,14 @@
           "container_cpus": 1.0,
           "pids_limit": 256,
           "container_env_file": "/etc/roman-platform/romanlms-production/runtime.env",
+          "container_secret_file_mounts": [
+            {
+              "source": "/etc/roman-platform/romanlms-production/firebase-service-account.json",
+              "target": "/run/secrets/firebase-service-account.json",
+              "group_id": 10001,
+              "mode": "0440"
+            }
+          ],
           "container_tmpfs": ["/tmp:rw,nosuid,nodev,noexec,size=128m,mode=1777"],
           "revision_environment_variable": "APP_DEPLOYMENT_SHA",
           "host_network_bind_environment_variable": "SERVER_ADDRESS",

@@ -1,5 +1,7 @@
 import contextlib
+import base64
 import copy
+import io
 import json
 import os
 import shutil
@@ -65,6 +67,7 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertIn("$repoDigests -notcontains $digestReference", workflow)
         self.assertNotIn("'--load'", workflow)
         self.assertNotIn("& docker push $tag", workflow)
+        self.assertIn("inputs.operation == 'deploy-stack' || inputs.operation == 'rollback-stack' || inputs.operation == 'test-stack'", workflow)
 
     def test_production_profile_is_manual_owner_only_and_server_policy_scoped(self):
         workflow = (ROOT / ".github" / "workflows" / "romanlms-private-deploy.yml").read_text(encoding="utf-8")
@@ -81,6 +84,7 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertIn("inputs.app_id == 'romanlms-production'", workflow)
         self.assertIn("inputs.confirmation == 'DEPLOY ROMANLMS PRODUCTION'", workflow)
         self.assertIn("inputs.confirmation == 'ROLLBACK ROMANLMS PRODUCTION'", workflow)
+        self.assertIn("inputs.confirmation == 'REFRESH ROMANLMS RUNTIME CONFIGURATION'", workflow)
 
     def test_expected_unhealthy_rejection_resets_powershell_exit_code(self):
         workflow = (ROOT / ".github" / "workflows" / "romanlms-smoke-deploy.yml").read_text(encoding="utf-8")
@@ -265,6 +269,25 @@ class RomanLmsContainerPolicyTests(unittest.TestCase):
             with self.subTest(change=change), self.assertRaises(deploy.DeploymentError):
                 deploy.validate_request({**value, **change}, config)
 
+    def test_runtime_refresh_has_no_image_or_registry_inputs_and_is_explicitly_allowlisted(self):
+        app = dict(CONFIG["applications"]["romanlms-production"], runtime_refresh_enabled=True)
+        config = {"applications": {app["app_id"]: app}}
+        value = request(
+            operation="refresh-stack",
+            app_id=app["app_id"],
+            environment=app["environment"],
+            platform_sha="d5a4b3589c1c5057b94f7355f4f4e5f89a646ea6",
+        )
+        for field in ("image", "strategy", "registry_token"):
+            value.pop(field)
+        selected, accepted = deploy.validate_request(value, config)
+        self.assertEqual(selected["app_id"], app["app_id"])
+        self.assertEqual(accepted["operation"], "refresh-stack")
+        with self.assertRaisesRegex(deploy.DeploymentError, "not enabled"):
+            deploy.validate_request(value, {"applications": {app["app_id"]: {**app, "runtime_refresh_enabled": False}}})
+        with self.assertRaisesRegex(deploy.DeploymentError, "unsupported fields"):
+            deploy.validate_request({**value, "images": {}}, config)
+
     def test_stack_route_renders_both_components_for_one_slot(self):
         components = {
             "backend": {"route_prefix": "/lms/", "slot_ports": {"blue": 18182, "green": 18184}},
@@ -412,6 +435,81 @@ class StackDeploymentTests(unittest.TestCase):
         self.assertEqual(self.route.read_text(encoding="utf-8"), "switched blue")
         candidate_commands = [args for args in commands if args[:2] == ["docker", "run"]]
         self.assertTrue(all("--publish" not in args and "--ip" in args for args in candidate_commands))
+
+    def _active_refresh_release(self):
+        commit_sha = "d" * 40
+        components = {}
+        for name in ("backend", "frontend"):
+            component = self.app["components"][name]
+            component["image_namespace"] = f"ghcr.io/owner/{name}"
+            component_app = deploy._stack_component_app(self.app, name)
+            components[name] = {
+                "slot": "green",
+                "commit_sha": commit_sha,
+                "container": deploy._container_name(component_app, "green", commit_sha),
+                "image": f"ghcr.io/owner/{name}@sha256:{DIGEST}",
+            }
+        return {
+            "app_id": self.app["app_id"],
+            "slot": "green",
+            "commit_sha": commit_sha,
+            "platform_sha": WORKFLOW_SHA,
+            "schema_version": "132",
+            "components": components,
+        }
+
+    def test_runtime_refresh_reuses_verified_digests_and_retains_the_prior_release(self):
+        self.app["runtime_refresh_enabled"] = True
+        active = self._active_refresh_release()
+        self.state.write_text(json.dumps({"active": active, "previous": None}), encoding="utf-8")
+        commands = []
+        def run(args, **kwargs):
+            commands.append(args)
+            return subprocess.CompletedProcess(args, 0, "", "")
+        def switch(app, slot):
+            self.route.write_text("switched " + slot, encoding="utf-8")
+        refresh_request = request(operation="refresh-stack")
+        with mock.patch.object(deploy, "_stack_release_healthy"), mock.patch.object(deploy, "_stack_route_healthy"), \
+             mock.patch.object(deploy, "_verify_retained_stack_images"), mock.patch.object(deploy, "_remove_inactive_slot"), \
+             mock.patch.object(deploy, "_container_run_args", return_value=["docker", "run"]), mock.patch.object(deploy, "run_command", side_effect=run), \
+             mock.patch.object(deploy, "_switch_stack_route", side_effect=switch), mock.patch.object(deploy, "verify_release_origin"), \
+             mock.patch.object(deploy, "require_storage_mounts"), mock.patch.object(deploy, "_append_audit"), mock.patch.object(deploy, "_write_metrics"):
+            result = deploy._refresh_stack(refresh_request, self.app)
+        self.assertEqual(result["operation"], "refresh-stack")
+        self.assertEqual(result["slot"], "blue")
+        self.assertEqual(result["commit_sha"], active["commit_sha"])
+        state = json.loads(self.state.read_text(encoding="utf-8"))
+        self.assertEqual(state["active"]["commit_sha"], active["commit_sha"])
+        self.assertEqual(state["active"]["platform_sha"], WORKFLOW_SHA)
+        self.assertEqual(state["previous"], active)
+        self.assertEqual(set(state["active"]["components"]), {"backend", "frontend"})
+        self.assertEqual(sum(args[:2] == ["docker", "run"] for args in commands), 2)
+
+    def test_runtime_refresh_failure_removes_candidates_and_restores_the_active_backend(self):
+        self.app["runtime_refresh_enabled"] = True
+        self.app["single_backend_maintenance"] = True
+        active = self._active_refresh_release()
+        stale_previous = {"slot": "blue", "commit_sha": "a" * 40, "schema_version": "132"}
+        self.state.write_text(json.dumps({"active": active, "previous": stale_previous}), encoding="utf-8")
+        commands = []
+        def run(args, **kwargs):
+            commands.append(args)
+            return subprocess.CompletedProcess(args, 0, "", "")
+        refresh_request = request(operation="refresh-stack")
+        with mock.patch.object(deploy, "_stack_release_healthy", side_effect=[None, deploy.DeploymentError("candidate failed")]), \
+             mock.patch.object(deploy, "_stack_route_healthy"), mock.patch.object(deploy, "_verify_retained_stack_images"), \
+             mock.patch.object(deploy, "_remove_inactive_slot"), mock.patch.object(deploy, "_container_run_args", return_value=["docker", "run"]), \
+             mock.patch.object(deploy, "run_command", side_effect=run), mock.patch.object(deploy, "_stop_stack_backend"), \
+             mock.patch.object(deploy, "_check_backend_start_memory"), mock.patch.object(deploy, "_restart_stack_backend") as restart, \
+              mock.patch.object(deploy, "_append_audit"), mock.patch.object(deploy, "require_storage_mounts"):
+            with self.assertRaisesRegex(deploy.DeploymentError, "candidate failed"):
+                deploy._refresh_stack(refresh_request, self.app)
+        restart.assert_called_once_with(self.app, active)
+        state = json.loads(self.state.read_text(encoding="utf-8"))
+        self.assertEqual(state["active"], active)
+        self.assertIsNone(state["previous"])
+        self.assertEqual(self.route.read_text(encoding="utf-8"), "return 503;\n")
+        self.assertTrue(any(args[:3] == ["docker", "rm", "-f"] for args in commands))
 
     def test_single_backend_maintenance_stops_old_backend_before_starting_candidate(self):
         self.app["single_backend_maintenance"] = True
@@ -787,7 +885,10 @@ class RomanLmsProductionPolicyTests(unittest.TestCase):
     def test_production_policy_isolated_from_staging_and_uses_only_the_restored_database(self):
         self.assertEqual(self.app["environment"], "production")
         self.assertTrue(self.app["allow_unhealthy_active_replacement"])
-        self.assertEqual(self.app["allowed_platform_shas"], ["f14001afa20e54681826394dd06a485dafbdcdac"])
+        self.assertEqual(self.app["allowed_platform_shas"], [
+            "f14001afa20e54681826394dd06a485dafbdcdac",
+            "d5a4b3589c1c5057b94f7355f4f4e5f89a646ea6",
+        ])
         self.assertEqual(self.app["allowed_database_urls"], ["jdbc:postgresql://127.0.0.1:5432/romanlms_prod"])
         self.assertEqual(self.app["expected_schema_version"], "132")
         self.assertEqual(
@@ -810,6 +911,44 @@ class RomanLmsProductionPolicyTests(unittest.TestCase):
         bad_app["components"]["backend"]["container_environment_by_slot"]["green"]["DB_POOL_MAX_SIZE"] = "10"
         with self.assertRaisesRegex(deploy.DeploymentError, "maximum 50"):
             deploy._validate_romanlms_capacity_policy(bad_app)
+
+    def test_fcm_uses_only_a_root_owned_read_only_service_account_mount(self):
+        component = deploy._stack_component_app(self.app, "backend")
+        mount = component["container_secret_file_mounts"][0]
+        environment = {
+            "ROMANLMS_NOTIFICATIONS_FCM_ENABLED": "true",
+            "FIREBASE_PROJECT_ID": "romanlms-prod-project",
+            "GOOGLE_APPLICATION_CREDENTIALS": mount["target"],
+            "NOTIFICATION_DEVICE_TOKEN_ENCRYPTION_KEY": base64.b64encode(b"k" * 32).decode("ascii"),
+        }
+        metadata = SimpleNamespace(st_mode=stat.S_IFREG | 0o440, st_uid=0, st_gid=10001)
+        service_account = {"type": "service_account", "project_id": "romanlms-prod-project", "client_email": "romanlms@example.invalid", "private_key": "test-only"}
+        with mock.patch.object(deploy.os, "lstat", return_value=metadata), mock.patch.object(deploy.os.path, "realpath", return_value=mount["source"]), \
+             mock.patch.object(Path, "is_symlink", return_value=False), mock.patch("builtins.open", return_value=io.StringIO(json.dumps(service_account))):
+            arguments = deploy._secret_file_mount_args(component, environment)
+        self.assertEqual(arguments, ["--mount", "type=bind,src=/etc/roman-platform/romanlms-production/firebase-service-account.json,dst=/run/secrets/firebase-service-account.json,readonly"])
+
+        unsafe_metadata = SimpleNamespace(st_mode=stat.S_IFREG | 0o644, st_uid=0, st_gid=10001)
+        with mock.patch.object(deploy.os, "lstat", return_value=unsafe_metadata), mock.patch.object(deploy.os.path, "realpath", return_value=mount["source"]), \
+             mock.patch.object(Path, "is_symlink", return_value=False):
+            with self.assertRaisesRegex(deploy.DeploymentError, "root-owned read-only"):
+                deploy._secret_file_mount_args(component, environment)
+
+    def test_fcm_rejects_a_service_account_for_another_project(self):
+        component = deploy._stack_component_app(self.app, "backend")
+        mount = component["container_secret_file_mounts"][0]
+        environment = {
+            "ROMANLMS_NOTIFICATIONS_FCM_ENABLED": "true",
+            "FIREBASE_PROJECT_ID": "romanlms-prod-project",
+            "GOOGLE_APPLICATION_CREDENTIALS": mount["target"],
+            "NOTIFICATION_DEVICE_TOKEN_ENCRYPTION_KEY": base64.b64encode(b"k" * 32).decode("ascii"),
+        }
+        metadata = SimpleNamespace(st_mode=stat.S_IFREG | 0o440, st_uid=0, st_gid=10001)
+        service_account = {"type": "service_account", "project_id": "different-project", "client_email": "romanlms@example.invalid", "private_key": "test-only"}
+        with mock.patch.object(deploy.os, "lstat", return_value=metadata), mock.patch.object(deploy.os.path, "realpath", return_value=mount["source"]), \
+             mock.patch.object(Path, "is_symlink", return_value=False), mock.patch("builtins.open", return_value=io.StringIO(json.dumps(service_account))):
+            with self.assertRaisesRegex(deploy.DeploymentError, "does not match"):
+                deploy._secret_file_mount_args(component, environment)
 
     def test_verify_skips_candidate_capacity_gate_but_keeps_release_validation(self):
         value = {
@@ -839,7 +978,7 @@ class RomanLmsProductionPolicyTests(unittest.TestCase):
             self.assertEqual(component["host_network_bind_environment_variable"], bind_variable)
             self.assertEqual(component["host_network_port_environment_variable"], port_variable)
             self.assertTrue(all(env[bind_variable] == "127.0.0.1" for env in component["container_environment_by_slot"].values()))
-            with mock.patch.object(deploy, "_secure_env_file", return_value=Path("/private/runtime.env")):
+            with mock.patch.object(deploy, "_secure_env_file", return_value=Path("/private/runtime.env")), mock.patch.object(deploy, "_env_file_values", return_value={}):
                 args = deploy._container_run_args(component, "registry/app@sha256:" + DIGEST, "roman-test", "blue", component["container_port"], SHA)
             self.assertEqual(args[args.index("--network") + 1], "host")
             self.assertNotIn("--publish", args)
@@ -978,6 +1117,14 @@ class WorkflowOriginTests(unittest.TestCase):
         with mock.patch.object(deploy, "github_json", side_effect=self._responses()):
             deploy.verify_release_origin(value, self.app)
 
+    def test_runtime_refresh_requires_exact_commit_ci(self):
+        value = request(operation="refresh-stack")
+        app = dict(self.app, required_ci_workflow_file="ci.yml")
+        with mock.patch.object(deploy, "github_json", side_effect=self._responses()), \
+             mock.patch.object(deploy, "verify_required_ci") as required_ci:
+            deploy.verify_release_origin(value, app)
+        required_ci.assert_called_once_with(value, app)
+
     def test_rejects_pull_request_workflow(self):
         value = request()
         responses = self._responses()
@@ -1037,6 +1184,38 @@ class ImageProvenanceTests(unittest.TestCase):
                     "approved-image@sha256:" + DIGEST, SHA, SHA, WORKFLOW_SHA,
                     APP["image_package_repository"], APP["image_source_repository"], {},
                 )
+
+    def test_runtime_refresh_revalidates_each_retained_immutable_image_and_container(self):
+        app = CONFIG["applications"]["romanlms-production"]
+        commit_sha = "d" * 40
+        release = {"slot": "green", "commit_sha": commit_sha, "platform_sha": "f14001afa20e54681826394dd06a485dafbdcdac", "components": {}}
+        responses = []
+        expected_images = {}
+        for name, component in app["components"].items():
+            image = f"{component['image_namespace']}@sha256:{DIGEST}"
+            expected_images[name] = image
+            release["components"][name] = {"slot": "green", "commit_sha": commit_sha, "container": f"retained-{name}", "image": image}
+            responses.extend((
+                subprocess.CompletedProcess([], 0, json.dumps([image]), ""),
+                subprocess.CompletedProcess([], 0, image, ""),
+            ))
+        with mock.patch.object(deploy, "run_command", side_effect=responses), mock.patch.object(deploy, "verify_image_labels") as verify:
+            deploy._verify_retained_stack_images(app, release)
+        self.assertEqual(verify.call_count, 2)
+        self.assertEqual({call.args[0] for call in verify.call_args_list}, set(expected_images.values()))
+        for call in verify.call_args_list:
+            self.assertEqual(call.args[1:4], (commit_sha, commit_sha, release["platform_sha"]))
+
+    def test_runtime_refresh_rejects_mutable_retained_image_reference(self):
+        app = CONFIG["applications"]["romanlms-production"]
+        commit_sha = "d" * 40
+        release = {"slot": "green", "commit_sha": commit_sha, "platform_sha": "f14001afa20e54681826394dd06a485dafbdcdac", "components": {}}
+        for name in app["components"]:
+            release["components"][name] = {"slot": "green", "commit_sha": commit_sha, "container": f"retained-{name}", "image": "mutable:latest"}
+        with mock.patch.object(deploy, "run_command") as run:
+            with self.assertRaisesRegex(deploy.DeploymentError, "image identity is invalid"):
+                deploy._verify_retained_stack_images(app, release)
+        run.assert_not_called()
 
 
 class GateTests(unittest.TestCase):

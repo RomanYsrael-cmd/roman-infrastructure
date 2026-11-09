@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import contextlib
+import base64
 import ipaddress
 import json
 import os
@@ -72,6 +73,7 @@ def validate_request(request: Any, config: dict[str, Any]) -> tuple[dict[str, An
         "unhealthy-test": {"image", "registry_token"},
         "validate-database": {"migration_image", "registry_token"},
         "deploy-stack": {"images", "strategy", "migration_image", "registry_token"},
+        "refresh-stack": set(),
         "rollback-stack": {"migration_image", "registry_token"},
         "test-stack": {"image", "component", "registry_token"},
         "verify-stack": set(),
@@ -171,6 +173,9 @@ def validate_request(request: Any, config: dict[str, Any]) -> tuple[dict[str, An
         _secret(request["registry_token"], "registry token")
     elif operation == "verify-stack" and not isinstance(app.get("components"), dict):
         raise DeploymentError("Application components are not configured.")
+    elif operation == "refresh-stack":
+        if app.get("runtime_refresh_enabled") is not True or not isinstance(app.get("components"), dict) or not app["components"]:
+            raise DeploymentError("Runtime-only refresh is not enabled for this application.")
 
     return app, request
 
@@ -244,7 +249,7 @@ def verify_release_origin(request: dict[str, Any], app: dict[str, Any]) -> None:
     commit_info = github_json(repo, f"commits/{request['commit_sha']}", request["github_token"])
     if commit_info.get("sha") != request["commit_sha"]:
         raise DeploymentError("GitHub did not confirm the requested commit.")
-    if request["operation"] in {"deploy-stack", "rollback-stack", "test-stack", "verify-stack"}:
+    if request["operation"] in {"deploy-stack", "rollback-stack", "test-stack", "verify-stack", "refresh-stack"}:
         verify_required_ci(request, app)
 
 
@@ -521,7 +526,10 @@ def _container_run_args(
         args.extend(["--publish", f"127.0.0.1:{port}:{int(app['container_port'])}"])
     env_file = app.get("container_env_file")
     if env_file:
-        args.extend(["--env-file", str(_secure_env_file(env_file))])
+        secure_env_file = _secure_env_file(env_file)
+        args.extend(["--env-file", str(secure_env_file)])
+        if app.get("container_secret_file_mounts"):
+            args.extend(_secret_file_mount_args(app, _env_file_values(Path(secure_env_file))))
     env_sets = app.get("container_environment_by_slot", {})
     if test_mode:
         env_sets = {**env_sets, "test": app.get("unhealthy_test_environment", {})}
@@ -544,6 +552,84 @@ def _container_run_args(
         image,
     ])
     return args
+
+
+def _secret_file_mount_args(app: dict[str, Any], environment: dict[str, str]) -> list[str]:
+    mounts = app.get("container_secret_file_mounts", [])
+    if not isinstance(mounts, list):
+        raise DeploymentError("The configured secret-file mounts are invalid.")
+    fcm_enabled = environment.get("ROMANLMS_NOTIFICATIONS_FCM_ENABLED", "false").lower() == "true"
+    firebase_project = environment.get("FIREBASE_PROJECT_ID", "")
+    credentials_path = environment.get("GOOGLE_APPLICATION_CREDENTIALS", "")
+    targets: set[str] = set()
+    arguments: list[str] = []
+    firebase_mount: tuple[str, str] | None = None
+    for mount in mounts:
+        if not isinstance(mount, dict) or set(mount) != {"source", "target", "group_id", "mode"}:
+            raise DeploymentError("The configured secret-file mount is invalid.")
+        source = _text(mount["source"], "secret-file source", 240)
+        target = _text(mount["target"], "secret-file target", 120)
+        group_id = mount["group_id"]
+        mode = mount["mode"]
+        source_prefix = f"/etc/roman-platform/{app.get('root_app_id', app['app_id'])}/"
+        if (
+            not source.startswith(source_prefix)
+            or any(part in {".", ".."} for part in source.split("/"))
+            or not re.fullmatch(r"/run/secrets/[A-Za-z0-9_.-]+", target)
+            or target in targets
+            or isinstance(group_id, bool)
+            or not isinstance(group_id, int)
+            or not isinstance(mode, str)
+            or mode != "0440"
+        ):
+            raise DeploymentError("The configured secret-file mount is outside the approved policy.")
+        targets.add(target)
+        source_path = Path(source)
+        try:
+            metadata = source_path.lstat()
+        except FileNotFoundError:
+            if fcm_enabled or credentials_path == target:
+                raise DeploymentError("The enabled Firebase credential file is missing.") from None
+            continue
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or source_path.is_symlink()
+            or os.path.realpath(source) != source
+            or metadata.st_uid != 0
+            or metadata.st_gid != group_id
+            or stat.S_IMODE(metadata.st_mode) != int(mode, 8)
+        ):
+            raise DeploymentError("A secret file does not have the required root-owned read-only permissions.")
+        if target.endswith("/firebase-service-account.json"):
+            firebase_mount = (source, target)
+        arguments.extend(["--mount", f"type=bind,src={source},dst={target},readonly"])
+
+    if credentials_path and credentials_path not in targets:
+        raise DeploymentError("The configured application-credentials path is not an approved mounted secret.")
+    if fcm_enabled:
+        if not firebase_project or firebase_mount is None or credentials_path != firebase_mount[1]:
+            raise DeploymentError("Firebase delivery requires a project ID and its approved mounted service account.")
+        encoded_key = environment.get("NOTIFICATION_DEVICE_TOKEN_ENCRYPTION_KEY", "")
+        try:
+            key = base64.b64decode(encoded_key, validate=True)
+        except (ValueError, TypeError):
+            key = b""
+        if len(key) != 32:
+            raise DeploymentError("Firebase delivery requires a valid 32-byte notification-token encryption key.")
+        try:
+            with open(firebase_mount[0], encoding="utf-8") as stream:
+                service_account = json.load(stream)
+        except (OSError, json.JSONDecodeError):
+            raise DeploymentError("The Firebase service-account file is invalid.") from None
+        if (
+            not isinstance(service_account, dict)
+            or service_account.get("type") != "service_account"
+            or service_account.get("project_id") != firebase_project
+            or not isinstance(service_account.get("client_email"), str)
+            or not isinstance(service_account.get("private_key"), str)
+        ):
+            raise DeploymentError("The Firebase service account does not match the configured project.")
+    return arguments
 
 
 def verify_image_labels(
@@ -1227,7 +1313,7 @@ def _stack_component_app(app: dict[str, Any], name: str) -> dict[str, Any]:
     component = app["components"][name]
     if not APP_ID_RE.fullmatch(name) or not isinstance(component, dict):
         raise DeploymentError("The application component policy is invalid.")
-    component_app = {**app, **component, "app_id": f"{app['app_id']}-{name}"}
+    component_app = {**app, **component, "app_id": f"{app['app_id']}-{name}", "root_app_id": app["app_id"]}
     if not APP_ID_RE.fullmatch(component_app["app_id"]):
         raise DeploymentError("The application component identifier is too long.")
     network_mode = app.get("container_network_mode", "bridge")
@@ -1611,6 +1697,189 @@ def _deploy_stack(request: dict[str, Any], app: dict[str, Any]) -> dict[str, Any
     return {"outcome": "success", "app_id": app["app_id"], "slot": slot, "commit_sha": request["commit_sha"], "images": request["images"], "metrics_warning": metrics_warning}
 
 
+def _verify_retained_stack_images(app: dict[str, Any], release: dict[str, Any]) -> None:
+    commit_sha = release.get("commit_sha")
+    platform_sha = release.get("platform_sha")
+    components = release.get("components")
+    if (
+        not isinstance(commit_sha, str)
+        or not SHA_RE.fullmatch(commit_sha)
+        or platform_sha not in app.get("allowed_platform_shas", [])
+        or not isinstance(platform_sha, str)
+        or not SHA_RE.fullmatch(platform_sha)
+        or not isinstance(components, dict)
+        or set(components) != set(app["components"])
+    ):
+        raise DeploymentError("The active release provenance is incomplete; runtime refresh was not started.")
+    source_revision = _image_source_revision({"commit_sha": commit_sha, "platform_sha": platform_sha}, app)
+    for name in sorted(components):
+        component_app = _stack_component_app(app, name)
+        record = components[name]
+        image = record.get("image") if isinstance(record, dict) else None
+        namespace = component_app.get("image_namespace")
+        if (
+            not isinstance(namespace, str)
+            or not isinstance(image, str)
+            or not re.fullmatch(re.escape(namespace) + r"@sha256:[0-9a-f]{64}", image)
+            or record.get("commit_sha") != commit_sha
+            or record.get("slot") != release.get("slot")
+        ):
+            raise DeploymentError("The active release image identity is invalid; runtime refresh was not started.")
+        repo_digests = run_command(["docker", "image", "inspect", "--format", "{{json .RepoDigests}}", image], timeout=15)
+        try:
+            available_digests = json.loads(repo_digests.stdout.strip())
+        except json.JSONDecodeError as exc:
+            raise DeploymentError("The active image digest could not be verified.") from exc
+        if not isinstance(available_digests, list) or image not in available_digests:
+            raise DeploymentError("The active image no longer matches its immutable registry digest.")
+        configured_image = run_command(["docker", "inspect", "--format", "{{.Config.Image}}", record["container"]], timeout=15)
+        if configured_image.stdout.strip() != image:
+            raise DeploymentError("The active container image does not match its release record.")
+        verify_image_labels(
+            image,
+            source_revision,
+            commit_sha,
+            platform_sha,
+            app["image_package_repository"],
+            app["image_source_repository"],
+            os.environ.copy(),
+        )
+
+
+def _refresh_stack(request: dict[str, Any], app: dict[str, Any]) -> dict[str, Any]:
+    started = time.time()
+    _stack_validate_network(app)
+    state_path = Path(app["state_file"])
+    state = _read_state(str(state_path))
+    active = state.get("active")
+    if (
+        not isinstance(active, dict)
+        or active.get("schema_version") != str(app["expected_schema_version"])
+        or active.get("slot") not in {"blue", "green"}
+    ):
+        raise DeploymentError("A current active release is required before runtime-only refresh.")
+    _stack_release_healthy(app, active)
+    _stack_route_healthy(app)
+    _verify_retained_stack_images(app, active)
+
+    slot = "green" if active["slot"] == "blue" else "blue"
+    route_path = Path(app["route_file"])
+    prior_route = route_path.read_text(encoding="utf-8")
+    if state.get("previous"):
+        # The inactive slot is reused below, so its older retained release cannot remain rollbackable.
+        state["previous"] = None
+        require_storage_mounts(app)
+        _atomic_write(state_path, json.dumps(state, indent=2, sort_keys=True) + "\n")
+    prior_state = state_path.read_text(encoding="utf-8") if state_path.exists() else None
+    _append_audit(app, {
+        "operation": "refresh-stack",
+        "outcome": "started",
+        "commit_sha": active["commit_sha"],
+        "workflow_sha": request["workflow_sha"],
+        "platform_sha": request["platform_sha"],
+        "workflow_run_id": request["release"]["run_id"],
+        "actor": request["release"]["actor"],
+        "slot": slot,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    })
+
+    backend_maintenance = app.get("single_backend_maintenance") is True
+    started_names: list[str] = []
+    route_switched = False
+    records: dict[str, Any] = {}
+    try:
+        component_order = sorted(app["components"])
+        if backend_maintenance:
+            component_order.sort(key=lambda name: (name == "backend", name))
+        for name in component_order:
+            component_app = _stack_component_app(app, name)
+            active_component = (active.get("components") or {}).get(name)
+            if name == "backend" and backend_maintenance:
+                _stop_stack_backend(app, active)
+                _check_backend_start_memory(app)
+            _remove_inactive_slot(component_app, slot, active_component)
+            record = active_component
+            container = _container_name(component_app, slot, active["commit_sha"])
+            started_names.append(container)
+            run_command(
+                _container_run_args(
+                    component_app,
+                    record["image"],
+                    container,
+                    slot,
+                    int(component_app["container_port"]),
+                    active["commit_sha"],
+                ),
+                timeout=60,
+            )
+            records[name] = {
+                "slot": slot,
+                "commit_sha": active["commit_sha"],
+                "container": container,
+                "image": record["image"],
+            }
+        timestamp = datetime.now(timezone.utc).isoformat()
+        refreshed_release = {
+            **active,
+            "slot": slot,
+            "components": records,
+            "runtime_config_refreshed_at": timestamp,
+            "runtime_config_workflow_sha": request["workflow_sha"],
+            "runtime_config_platform_sha": request["platform_sha"],
+            "runtime_config_run_id": request["release"]["run_id"],
+        }
+        _stack_release_healthy(app, refreshed_release)
+        verify_release_origin(request, app)
+        _switch_stack_route(app, slot)
+        route_switched = True
+        new_state = {"active": refreshed_release, "previous": active, "updated_at": timestamp}
+        require_storage_mounts(app)
+        _atomic_write(state_path, json.dumps(new_state, indent=2, sort_keys=True) + "\n")
+        _append_audit(app, {
+            "operation": "refresh-stack",
+            "outcome": "success",
+            "commit_sha": active["commit_sha"],
+            "workflow_sha": request["workflow_sha"],
+            "platform_sha": request["platform_sha"],
+            "workflow_run_id": request["release"]["run_id"],
+            "actor": request["release"]["actor"],
+            "slot": slot,
+            "timestamp": timestamp,
+        })
+    except Exception:
+        if route_switched:
+            _atomic_write(route_path, prior_route)
+            run_command(["nginx", "-t"], timeout=20, check=False)
+            run_command(["systemctl", "reload", "nginx"], timeout=20, check=False)
+            if prior_state is None:
+                state_path.unlink(missing_ok=True)
+            else:
+                _atomic_write(state_path, prior_state)
+        for container in reversed(started_names):
+            run_command(["docker", "rm", "-f", container], timeout=30, check=False)
+        if backend_maintenance:
+            try:
+                _restart_stack_backend(app, active)
+            except Exception as recovery_exc:
+                raise DeploymentError("Runtime refresh failed and the retained backend could not be restored automatically.") from recovery_exc
+        raise
+
+    metrics_warning = False
+    try:
+        _write_metrics(app, new_state, "success", "refresh-stack", time.time() - started, request["release"]["run_id"], request["commit_sha"])
+    except OSError:
+        metrics_warning = True
+    return {
+        "outcome": "success",
+        "operation": "refresh-stack",
+        "app_id": app["app_id"],
+        "slot": slot,
+        "commit_sha": active["commit_sha"],
+        "images": {name: record["image"] for name, record in records.items()},
+        "metrics_warning": metrics_warning,
+    }
+
+
 def _start_retained_stack(app: dict[str, Any], release: dict[str, Any]) -> list[str]:
     components = release.get("components")
     if not isinstance(components, dict) or set(components) != set(app["components"]):
@@ -1759,7 +2028,7 @@ def execute(request: Any, config: dict[str, Any]) -> dict[str, Any]:
     try:
         try:
             verification = request["operation"] in {"verify", "verify-stack"}
-            single_backend_start = app.get("single_backend_maintenance") is True and request["operation"] in {"deploy-stack", "rollback-stack"}
+            single_backend_start = app.get("single_backend_maintenance") is True and request["operation"] in {"deploy-stack", "rollback-stack", "refresh-stack"}
             preflight(app, capacity_checks=not verification, memory_check=not verification and not single_backend_start)
             verify_release_origin(request, app)
             if request["operation"] == "deploy":
@@ -1780,6 +2049,8 @@ def execute(request: Any, config: dict[str, Any]) -> dict[str, Any]:
                 return _test_stack_failure(request, app)
             if request["operation"] == "verify-stack":
                 return _verify_stack_active(request, app)
+            if request["operation"] == "refresh-stack":
+                return _refresh_stack(request, app)
             raise DeploymentError("Coordinated application deployment is not yet enabled.")
         except Exception as exc:
             event = {
