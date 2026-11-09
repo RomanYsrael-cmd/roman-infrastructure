@@ -317,7 +317,7 @@ def desired_rules(folder_uid: str, include_phase6: bool = False, include_product
             for_duration="10m",
         ),
         _rule_resource(
-            name="romanlms-production-container-pid-pressure",
+            name="romanlms-production-pid-pressure",
             title="RomanLMS Container PID Pressure",
             folder_uid=folder_uid,
             query="romanlms_production_container_pids_limit_ratio > bool 0.8",
