@@ -1449,7 +1449,27 @@ def _deploy_stack(request: dict[str, Any], app: dict[str, Any]) -> dict[str, Any
     if not active and state.get("previous"):
         raise DeploymentError("Application release state has a previous release without an active release.")
     if active:
-        _stack_release_healthy(app, active)
+        try:
+            _stack_release_healthy(app, active)
+        except DeploymentError as exc:
+            # Recovery deployments must be able to replace a release that is
+            # already failing its HTTP readiness checks. Keep its route intact
+            # while the candidate is built and validated; only the candidate's
+            # complete health gate may authorize the route switch.
+            if (
+                not app.get("allow_unhealthy_active_replacement")
+                or not str(exc).startswith("Readiness check failed:")
+            ):
+                raise
+            _append_audit(app, {
+                "operation": "deploy-stack",
+                "outcome": "active-readiness-failed",
+                "active_commit_sha": active.get("commit_sha"),
+                "workflow_run_id": request["release"]["run_id"],
+                "actor": request["release"]["actor"],
+                "error": str(exc)[:160],
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            })
     slot = "green" if active and active["slot"] == "blue" else "blue"
     # Validate the entire route before pulling images or disturbing retained containers.
     _stack_validate_network(app)

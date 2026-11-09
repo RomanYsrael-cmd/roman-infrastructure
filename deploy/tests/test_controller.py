@@ -412,6 +412,84 @@ class StackDeploymentTests(unittest.TestCase):
         candidate_commands = [args for args in commands if args[:2] == ["docker", "run"]]
         self.assertTrue(all("--publish" not in args and "--ip" in args for args in candidate_commands))
 
+    def test_unhealthy_active_release_can_be_replaced_after_candidate_is_healthy(self):
+        self.app["allow_unhealthy_active_replacement"] = True
+        active = {"slot": "blue", "commit_sha": "b" * 40, "components": {}}
+        self.state.write_text(json.dumps({"active": active, "previous": None}), encoding="utf-8")
+        commands = []
+        audit = []
+
+        def run(args, **kwargs):
+            commands.append(args)
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        def switch(app, slot):
+            self.assertEqual(sum(args[:2] == ["docker", "run"] for args in commands), 2)
+            self.route.write_text("switched " + slot, encoding="utf-8")
+
+        with mock.patch.object(deploy, "_validate_database"), mock.patch.object(deploy, "registry_session", return_value=contextlib.nullcontext({})), \
+             mock.patch.object(deploy, "run_command", side_effect=run), mock.patch.object(deploy, "_verify_image"), \
+             mock.patch.object(deploy, "_remove_inactive_slot"), \
+             mock.patch.object(deploy, "_stack_release_healthy", side_effect=[deploy.DeploymentError("Readiness check failed: TimeoutError."), None]), \
+             mock.patch.object(deploy, "verify_release_origin"), mock.patch.object(deploy, "_switch_stack_route", side_effect=switch), \
+             mock.patch.object(deploy, "require_storage_mounts"), mock.patch.object(deploy, "_append_audit", side_effect=lambda app, event: audit.append(event)), \
+             mock.patch.object(deploy, "_write_metrics"):
+            result = deploy._deploy_stack(self.request, self.app)
+
+        self.assertEqual(result["slot"], "green")
+        self.assertEqual(self.route.read_text(encoding="utf-8"), "switched green")
+        state = json.loads(self.state.read_text(encoding="utf-8"))
+        self.assertEqual(state["active"]["commit_sha"], SHA)
+        self.assertEqual(state["previous"], active)
+        self.assertEqual(audit[0]["outcome"], "active-readiness-failed")
+
+    def test_unhealthy_active_replacement_does_not_hide_candidate_readiness_failure(self):
+        self.app["allow_unhealthy_active_replacement"] = True
+        active = {"slot": "blue", "commit_sha": "b" * 40, "components": {}}
+        self.state.write_text(json.dumps({"active": active, "previous": None}), encoding="utf-8")
+        commands = []
+
+        def run(args, **kwargs):
+            commands.append(args)
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        with mock.patch.object(deploy, "_validate_database"), mock.patch.object(deploy, "registry_session", return_value=contextlib.nullcontext({})), \
+             mock.patch.object(deploy, "run_command", side_effect=run), mock.patch.object(deploy, "_verify_image"), \
+             mock.patch.object(deploy, "_remove_inactive_slot"), \
+             mock.patch.object(deploy, "_stack_release_healthy", side_effect=[deploy.DeploymentError("Readiness check failed: TimeoutError."), deploy.DeploymentError("Readiness check failed: HTTP 503 or unexpected response.")]), \
+             mock.patch.object(deploy, "_append_audit"), mock.patch.object(deploy, "_switch_stack_route") as switch:
+            with self.assertRaisesRegex(deploy.DeploymentError, "Readiness check failed: HTTP 503"):
+                deploy._deploy_stack(self.request, self.app)
+
+        switch.assert_not_called()
+        self.assertEqual(self.route.read_text(encoding="utf-8"), "return 503;\n")
+        state = json.loads(self.state.read_text(encoding="utf-8"))
+        self.assertEqual(state["active"], active)
+        self.assertEqual(sum(args[:3] == ["docker", "rm", "-f"] for args in commands), 2)
+
+    def test_unhealthy_active_replacement_does_not_hide_release_state_errors(self):
+        self.app["allow_unhealthy_active_replacement"] = True
+        active = {"slot": "blue", "commit_sha": "b" * 40, "components": {}}
+        self.state.write_text(json.dumps({"active": active, "previous": None}), encoding="utf-8")
+        with mock.patch.object(deploy, "_validate_database"), \
+             mock.patch.object(deploy, "_stack_release_healthy", side_effect=deploy.DeploymentError("The retained application release state is invalid.")), \
+             mock.patch.object(deploy, "registry_session") as registry, mock.patch.object(deploy, "_switch_stack_route") as switch:
+            with self.assertRaisesRegex(deploy.DeploymentError, "state is invalid"):
+                deploy._deploy_stack(self.request, self.app)
+        registry.assert_not_called()
+        switch.assert_not_called()
+
+    def test_unhealthy_active_replacement_requires_explicit_server_policy(self):
+        active = {"slot": "blue", "commit_sha": "b" * 40, "components": {}}
+        self.state.write_text(json.dumps({"active": active, "previous": None}), encoding="utf-8")
+        with mock.patch.object(deploy, "_validate_database"), \
+             mock.patch.object(deploy, "_stack_release_healthy", side_effect=deploy.DeploymentError("Readiness check failed: TimeoutError.")), \
+             mock.patch.object(deploy, "registry_session") as registry, mock.patch.object(deploy, "_switch_stack_route") as switch:
+            with self.assertRaisesRegex(deploy.DeploymentError, "Readiness check failed"):
+                deploy._deploy_stack(self.request, self.app)
+        registry.assert_not_called()
+        switch.assert_not_called()
+
     def test_second_component_failure_removes_started_candidate_and_keeps_route(self):
         commands = []
         def run(args, **kwargs):
@@ -588,6 +666,7 @@ class RomanLmsProductionPolicyTests(unittest.TestCase):
 
     def test_production_policy_isolated_from_staging_and_uses_only_the_restored_database(self):
         self.assertEqual(self.app["environment"], "production")
+        self.assertTrue(self.app["allow_unhealthy_active_replacement"])
         self.assertEqual(self.app["allowed_platform_shas"], ["f14001afa20e54681826394dd06a485dafbdcdac"])
         self.assertEqual(self.app["allowed_database_urls"], ["jdbc:postgresql://127.0.0.1:5432/romanlms_prod"])
         self.assertEqual(self.app["expected_schema_version"], "132")
@@ -629,6 +708,7 @@ class RomanLmsProductionPolicyTests(unittest.TestCase):
 class Phase6PolicyTests(unittest.TestCase):
     def test_private_policy_keeps_network_database_and_publication_closed(self):
         app = CONFIG["applications"]["romanlms-phase6"]
+        self.assertFalse(app.get("allow_unhealthy_active_replacement", False))
         deploy._stack_validate_network(app)
         self.assertFalse(app["container_publish"])
         self.assertEqual(app["container_restart_policy"], "no")

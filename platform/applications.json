@@ -165,6 +165,7 @@
       "production_branch": "main",
       "environment": "production",
       "strategy": "blue-green",
+      "allow_unhealthy_active_replacement": true,
       "image_revision_mode": "caller",
       "image_package_repository": "RomanYsrael-cmd/roman-lms",
       "image_source_repository": "RomanYsrael-cmd/roman-infrastructure",
