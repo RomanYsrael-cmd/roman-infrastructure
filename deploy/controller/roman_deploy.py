@@ -836,8 +836,11 @@ def _candidate_startup_diagnostic(container: str) -> dict[str, Any]:
 
     logs_result = run_command(["docker", "logs", "--tail", "150", container], timeout=15, check=False)
     logs = (logs_result.stdout or "") + "\n" + (logs_result.stderr or "")
+    # Docker/Spring logs may prefix every line with a timestamp and log level,
+    # so searching only at the start of a line misses the actual exception.
+    # Emit class names only; never include messages, tokens, or other log text.
     exception_pattern = re.compile(
-        r"(?m)^\s*(?:Caused by:\s*)?([A-Za-z_$][A-Za-z0-9_.$]*?(?:Exception|Error))(?::|\s|$)"
+        r"\b([A-Za-z_$][A-Za-z0-9_.$]*?(?:Exception|Error))(?::|\s|$)"
     )
     exception_types: list[str] = []
     for match in exception_pattern.finditer(logs):
