@@ -71,6 +71,7 @@
           - "{{ '{{.DockerRootDir}}' }}"
       register: docker_root
       changed_when: false
+      check_mode: false
 
     - name: Require Docker storage on the applications SSD
       ansible.builtin.assert:
@@ -109,6 +110,7 @@
       register: listener_check
       changed_when: false
       failed_when: false
+      check_mode: false
 
     - name: Refuse to claim an unrelated listener
       ansible.builtin.assert:
@@ -133,6 +135,7 @@
       register: romanlms_phase6_listener_check
       changed_when: false
       failed_when: false
+      check_mode: false
       when: install_romanlms_phase6 | bool
 
     - name: Refuse to claim an unrelated Phase 6 listener
@@ -159,6 +162,7 @@
       register: romanlms_production_listener_check
       changed_when: false
       failed_when: false
+      check_mode: false
       when: install_romanlms_production | bool
 
     - name: Refuse to claim an unrelated RomanLMS production listener
@@ -325,6 +329,7 @@
           - "{{ platform_root }}/bin/rotate-notification-device-tokens"
           - --self-test
       changed_when: false
+      check_mode: false
       when: install_romanlms_production | bool and romanlms_notification_token_encryption_key is defined
 
     - name: Configure the production Firebase project ID
@@ -625,6 +630,7 @@
 
     - name: Validate Nginx configuration
       ansible.builtin.command: nginx -t
+      check_mode: false
       listen: Reload Roman platform Nginx
 
     - name: Reload Nginx without restarting it
