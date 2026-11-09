@@ -415,6 +415,36 @@ class StackDeploymentTests(unittest.TestCase):
         })
         self.request = request(operation="deploy-stack", images={"backend": "image-b", "frontend": "image-f"}, migration_image="migration")
 
+    def test_startup_diagnostic_reports_state_and_exception_type_without_log_contents(self):
+        sensitive_log = (
+            "APPLICATION FAILED TO START\n"
+            "Caused by: com.romanlms.notifications.TokenStartupException: "
+            "re_0123456789abcdefghijklmnopqrstuvwxyz\n"
+            "account=user@example.edu"
+        )
+        responses = [
+            subprocess.CompletedProcess([], 0, "exited|1|12|false", ""),
+            subprocess.CompletedProcess([], 0, sensitive_log, ""),
+        ]
+        with mock.patch.object(deploy, "run_command", side_effect=responses):
+            diagnostic = deploy._candidate_startup_diagnostic("roman-platform-test-stack-backend-blue-abcdef123456")
+        summary = deploy._format_candidate_startup_diagnostic(diagnostic)
+        self.assertEqual(diagnostic["container_state"], {
+            "status": "exited", "exit_code": 1, "restart_count": 12, "oom_killed": False,
+        })
+        self.assertIn("com.romanlms.notifications.TokenStartupException", summary)
+        self.assertIn("restarts=12", summary)
+        self.assertIn("spring_boot_failure_report=true", summary)
+        self.assertNotIn("re_0123456789", summary)
+        self.assertNotIn("user@example.edu", summary)
+        self.assertNotIn("account=", summary)
+
+    def test_readiness_error_names_connection_failure_reason(self):
+        with mock.patch.object(deploy.urllib.request, "urlopen", side_effect=urllib.error.URLError(ConnectionRefusedError())), \
+             mock.patch.object(deploy.time, "sleep"):
+            with self.assertRaisesRegex(deploy.DeploymentError, r"URLError \(ConnectionRefusedError\)"):
+                deploy._wait_http("http://127.0.0.1:18100/health", "UP", 1)
+
     def test_deploy_starts_both_components_before_one_route_switch(self):
         commands = []
         def run(args, **kwargs):

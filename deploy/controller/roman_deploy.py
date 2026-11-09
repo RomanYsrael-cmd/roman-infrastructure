@@ -802,10 +802,79 @@ def _wait_http(url: str, expected_text: str, timeout_seconds: int) -> None:
                 last_error = f"HTTP {response.status} or unexpected response"
         except urllib.error.HTTPError as exc:
             last_error = f"HTTP {exc.code} or unexpected response"
-        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        except urllib.error.URLError as exc:
+            reason = getattr(exc, "reason", None)
+            last_error = f"URLError ({type(reason).__name__})" if reason is not None else "URLError"
+        except (TimeoutError, OSError) as exc:
             last_error = type(exc).__name__
         time.sleep(1)
     raise DeploymentError(f"Readiness check failed: {last_error}.")
+
+
+def _candidate_startup_diagnostic(container: str) -> dict[str, Any]:
+    """Return a redacted container state and exception-class signature for failed candidates."""
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,179}", container):
+        return {}
+    state_result = run_command(
+        ["docker", "inspect", "--format", "{{.State.Status}}|{{.State.ExitCode}}|{{.RestartCount}}|{{.State.OOMKilled}}", container],
+        timeout=15,
+        check=False,
+    )
+    state: dict[str, Any] = {}
+    if state_result.returncode == 0:
+        fields = state_result.stdout.strip().split("|")
+        if len(fields) == 4:
+            status, exit_code, restart_count, oom_killed = fields
+            if status in {"created", "restarting", "running", "removing", "paused", "exited", "dead"}:
+                state["status"] = status
+            if exit_code.isdecimal():
+                state["exit_code"] = int(exit_code)
+            if restart_count.isdecimal():
+                state["restart_count"] = int(restart_count)
+            if oom_killed.lower() in {"true", "false"}:
+                state["oom_killed"] = oom_killed.lower() == "true"
+
+    logs_result = run_command(["docker", "logs", "--tail", "150", container], timeout=15, check=False)
+    logs = (logs_result.stdout or "") + "\n" + (logs_result.stderr or "")
+    exception_pattern = re.compile(
+        r"(?m)^\s*(?:Caused by:\s*)?([A-Za-z_$][A-Za-z0-9_.$]*?(?:Exception|Error))(?::|\s|$)"
+    )
+    exception_types: list[str] = []
+    for match in exception_pattern.finditer(logs):
+        class_name = match.group(1)
+        if class_name not in exception_types:
+            exception_types.append(class_name)
+        if len(exception_types) == 3:
+            break
+    diagnostic: dict[str, Any] = {}
+    if state:
+        diagnostic["container_state"] = state
+    if exception_types:
+        diagnostic["startup_exception_types"] = exception_types
+    if "APPLICATION FAILED TO START" in logs:
+        diagnostic["spring_boot_failure_report"] = True
+    return diagnostic
+
+
+def _format_candidate_startup_diagnostic(diagnostic: dict[str, Any]) -> str:
+    state = diagnostic.get("container_state")
+    parts: list[str] = []
+    if isinstance(state, dict):
+        fields = [
+            f"status={state['status']}" if "status" in state else None,
+            f"exit_code={state['exit_code']}" if "exit_code" in state else None,
+            f"restarts={state['restart_count']}" if "restart_count" in state else None,
+            f"oom_killed={str(state['oom_killed']).lower()}" if "oom_killed" in state else None,
+        ]
+        summary = ",".join(value for value in fields if value)
+        if summary:
+            parts.append(f"container({summary})")
+    exception_types = diagnostic.get("startup_exception_types")
+    if isinstance(exception_types, list) and exception_types:
+        parts.append("startup_exception_types=" + ",".join(exception_types))
+    if diagnostic.get("spring_boot_failure_report") is True:
+        parts.append("spring_boot_failure_report=true")
+    return "; ".join(parts)
 
 
 def _route_content(app: dict[str, Any], port: int) -> str:
@@ -1446,10 +1515,18 @@ def _stack_release_healthy(app: dict[str, Any], release: dict[str, Any]) -> None
             if result.returncode != 0 or actual_ip != component_app["slot_ips"][slot] or set(networks) != {app["container_network"]}:
                 raise DeploymentError("The application component is not on its approved private address.")
             port = int(component_app["container_port"])
-        _wait_http(
-            f"http://{actual_ip}:{port}{component_app['health_path']}",
-            component_app["expected_health_text"], int(component_app["readiness_timeout_seconds"]),
-        )
+        try:
+            _wait_http(
+                f"http://{actual_ip}:{port}{component_app['health_path']}",
+                component_app["expected_health_text"], int(component_app["readiness_timeout_seconds"]),
+            )
+        except DeploymentError as exc:
+            diagnostic = _format_candidate_startup_diagnostic(
+                _candidate_startup_diagnostic(record["container"])
+            )
+            if diagnostic:
+                raise DeploymentError(f"{exc} Component {name} startup diagnostic: {diagnostic}.") from exc
+            raise
 
 
 def _stack_route_healthy(app: dict[str, Any]) -> None:
