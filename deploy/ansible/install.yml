@@ -226,6 +226,7 @@
       when: install_romanlms_production | bool
 
     - name: Validate the optional production Firebase service account
+      tags: [romanlms-production-integrations]
       ansible.builtin.assert:
         that:
           - romanlms_firebase_service_account_json is mapping
@@ -248,6 +249,7 @@
       when: install_romanlms_production | bool and romanlms_notification_token_encryption_key is defined
 
     - name: Validate the optional production Resend API key
+      tags: [romanlms-production-integrations]
       ansible.builtin.assert:
         that:
           - romanlms_resend_api_key is string
@@ -259,6 +261,7 @@
       when: install_romanlms_production | bool and romanlms_resend_api_key is defined
 
     - name: Validate the optional production email sender address
+      tags: [romanlms-production-integrations]
       ansible.builtin.assert:
         that:
           - romanlms_mail_from is string
@@ -268,6 +271,7 @@
       when: install_romanlms_production | bool and romanlms_mail_from is defined
 
     - name: Validate the optional production email sender name
+      tags: [romanlms-production-integrations]
       ansible.builtin.assert:
         that:
           - romanlms_mail_from_name is string
@@ -280,6 +284,7 @@
       when: install_romanlms_production | bool and romanlms_mail_from_name is defined
 
     - name: Preserve the production runtime environment before updating secrets
+      tags: [romanlms-production-integrations]
       ansible.builtin.copy:
         src: "{{ platform_config_dir }}/romanlms-production/runtime.env"
         dest: "{{ platform_config_dir }}/romanlms-production/runtime.env.backup-{{ ansible_date_time.iso8601_basic_short }}"
@@ -314,6 +319,7 @@
       when: install_romanlms_production | bool and romanlms_notification_token_encryption_key is defined
 
     - name: Install the production Firebase service-account credential
+      tags: [romanlms-production-integrations]
       ansible.builtin.copy:
         content: "{{ romanlms_firebase_service_account_json | to_nice_json }}\n"
         dest: "{{ platform_config_dir }}/romanlms-production/firebase-service-account.json"
@@ -336,6 +342,7 @@
       when: install_romanlms_production | bool and romanlms_notification_token_encryption_key is defined
 
     - name: Configure the production Firebase project ID
+      tags: [romanlms-production-integrations]
       ansible.builtin.lineinfile:
         path: "{{ platform_config_dir }}/romanlms-production/runtime.env"
         regexp: '^FIREBASE_PROJECT_ID='
@@ -347,6 +354,7 @@
       when: install_romanlms_production | bool and romanlms_firebase_service_account_json is defined
 
     - name: Configure the production Firebase credentials mount path
+      tags: [romanlms-production-integrations]
       ansible.builtin.lineinfile:
         path: "{{ platform_config_dir }}/romanlms-production/runtime.env"
         regexp: '^GOOGLE_APPLICATION_CREDENTIALS='
@@ -356,6 +364,28 @@
         mode: "0600"
       no_log: true
       when: install_romanlms_production | bool and romanlms_firebase_service_account_json is defined
+
+    - name: Require production Firebase credentials before enabling FCM
+      tags: [romanlms-production-integrations]
+      ansible.builtin.assert:
+        that:
+          - romanlms_firebase_service_account_json is defined
+          - romanlms_fcm_enabled | bool
+        fail_msg: FCM requires a service-account credential and an explicit enable flag.
+      no_log: true
+      when: install_romanlms_production | bool and romanlms_fcm_enabled | default(false) | bool
+
+    - name: Set production FCM enablement only when explicitly requested
+      tags: [romanlms-production-integrations]
+      ansible.builtin.lineinfile:
+        path: "{{ platform_config_dir }}/romanlms-production/runtime.env"
+        regexp: '^ROMANLMS_NOTIFICATIONS_FCM_ENABLED='
+        line: "ROMANLMS_NOTIFICATIONS_FCM_ENABLED={{ 'true' if romanlms_fcm_enabled | bool else 'false' }}"
+        owner: root
+        group: root
+        mode: "0600"
+      no_log: true
+      when: install_romanlms_production | bool and romanlms_fcm_enabled is defined
 
     - name: Install the rotated production notification-token encryption key
       ansible.builtin.lineinfile:
@@ -369,6 +399,7 @@
       when: install_romanlms_production | bool and romanlms_notification_token_encryption_key is defined
 
     - name: Install the production Resend API key
+      tags: [romanlms-production-integrations]
       ansible.builtin.lineinfile:
         path: "{{ platform_config_dir }}/romanlms-production/runtime.env"
         regexp: '^RESEND_API='
@@ -380,6 +411,7 @@
       when: install_romanlms_production | bool and romanlms_resend_api_key is defined
 
     - name: Configure the production transactional email sender address
+      tags: [romanlms-production-integrations]
       ansible.builtin.lineinfile:
         path: "{{ platform_config_dir }}/romanlms-production/runtime.env"
         regexp: '^ROMANLMS_MAIL_FROM='
@@ -391,6 +423,7 @@
       when: install_romanlms_production | bool and romanlms_mail_from is defined
 
     - name: Configure the production transactional email sender name
+      tags: [romanlms-production-integrations]
       ansible.builtin.lineinfile:
         path: "{{ platform_config_dir }}/romanlms-production/runtime.env"
         regexp: '^ROMANLMS_MAIL_FROM_NAME='
@@ -402,6 +435,7 @@
       when: install_romanlms_production | bool and romanlms_mail_from_name is defined
 
     - name: Enable production transactional email after installing its provider key
+      tags: [romanlms-production-integrations]
       ansible.builtin.lineinfile:
         path: "{{ platform_config_dir }}/romanlms-production/runtime.env"
         regexp: '^ROMANLMS_MAIL_ENABLED='

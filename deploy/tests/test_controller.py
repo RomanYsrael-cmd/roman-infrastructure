@@ -13,6 +13,7 @@ import threading
 import unittest
 import urllib.error
 import urllib.request
+import yaml
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
@@ -981,6 +982,47 @@ class RomanLmsProductionPolicyTests(unittest.TestCase):
              mock.patch.object(Path, "is_symlink", return_value=False), mock.patch("builtins.open", return_value=io.StringIO(json.dumps(service_account))):
             with self.assertRaisesRegex(deploy.DeploymentError, "does not match"):
                 deploy._secret_file_mount_args(component, environment)
+
+    def test_production_fcm_enablement_requires_explicit_flag_and_credentials(self):
+        playbook = yaml.load(
+            (ROOT / "deploy" / "ansible" / "install.yml").read_text(encoding="utf-8"),
+            Loader=yaml.BaseLoader,
+        )
+        tasks = playbook[0]["tasks"]
+        guard = next(task for task in tasks if task["name"] == "Require production Firebase credentials before enabling FCM")
+        self.assertIn("romanlms_firebase_service_account_json is defined", guard["ansible.builtin.assert"]["that"])
+        self.assertIn("romanlms_fcm_enabled | default(false) | bool", guard["when"])
+        configuration = next(task for task in tasks if task["name"] == "Set production FCM enablement only when explicitly requested")
+        self.assertIn("romanlms_fcm_enabled is defined", configuration["when"])
+        self.assertIn("^ROMANLMS_NOTIFICATIONS_FCM_ENABLED=", configuration["ansible.builtin.lineinfile"]["regexp"])
+        self.assertIn("romanlms_fcm_enabled | bool", configuration["ansible.builtin.lineinfile"]["line"])
+        self.assertTrue(configuration["no_log"])
+        integration_tasks = {
+            task["name"]
+            for task in tasks
+            if "romanlms-production-integrations" in task.get("tags", [])
+        }
+        self.assertEqual(
+            integration_tasks,
+            {
+                "Validate the optional production Firebase service account",
+                "Validate the optional production Resend API key",
+                "Validate the optional production email sender address",
+                "Validate the optional production email sender name",
+                "Preserve the production runtime environment before updating secrets",
+                "Install the production Firebase service-account credential",
+                "Configure the production Firebase project ID",
+                "Configure the production Firebase credentials mount path",
+                "Require production Firebase credentials before enabling FCM",
+                "Set production FCM enablement only when explicitly requested",
+                "Install the production Resend API key",
+                "Configure the production transactional email sender address",
+                "Configure the production transactional email sender name",
+                "Enable production transactional email after installing its provider key",
+            },
+        )
+        token_rotation = next(task for task in tasks if task["name"] == "Install the rotated production notification-token encryption key")
+        self.assertNotIn("romanlms-production-integrations", token_rotation.get("tags", []))
 
     def test_verify_skips_candidate_capacity_gate_but_keeps_release_validation(self):
         value = {
