@@ -935,6 +935,7 @@ class RomanLmsProductionPolicyTests(unittest.TestCase):
             "0a6f8563dbb5e8c0d98c7a245c3792d80457f1b7",
             "6dd7bbb99ba15d801ce5de34dcda9fe4670657a1",
             "63b54022e990c0d010cd6ac65902afbb3e1d07d5",
+            "eff9b117a741fa17722d85511e24878cb2651707",
         ])
         self.assertEqual(self.app["allowed_database_urls"], ["jdbc:postgresql://127.0.0.1:5432/romanlms_prod"])
         self.assertEqual(self.app["expected_schema_version"], "132")
