@@ -326,8 +326,11 @@
     - name: Verify the notification-token rotation cryptography before changing runtime configuration
       ansible.builtin.command:
         argv:
-          - "{{ platform_root }}/bin/rotate-notification-device-tokens"
+          - "{{ ansible_playbook_python }}"
+          - "{{ platform_repo_root }}/deploy/maintenance/rotate_notification_device_tokens.py"
           - --self-test
+      delegate_to: localhost
+      become: false
       changed_when: false
       check_mode: false
       when: install_romanlms_production | bool and romanlms_notification_token_encryption_key is defined
