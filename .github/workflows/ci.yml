@@ -20,22 +20,55 @@ jobs:
       - name: Check out source
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
         with:
+          fetch-depth: 0
           persist-credentials: false
 
-      - name: Run controller policy and failure-gate tests
-        run: |
-          sh -n deploy/controller/bin/roman-deploy-ssh
-          python3 -m compileall -q deploy/controller deploy/tests app/smoke
-          python3 -m unittest discover -s deploy/tests -v
-          python3 -m json.tool platform/applications.json >/dev/null
-          node --test deploy/cloudflare/romanlms-production-proxy/worker.test.mjs
+      - id: changes
+        name: Classify changed paths for focused validation
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.sha }}
+        run: python3 deploy/ci/change_scopes.py --base "$BASE_SHA" --head "$HEAD_SHA" --github-output "$GITHUB_OUTPUT"
 
-      - name: Validate the opt-in Ansible bootstrap syntax
+      - name: Test changed-path classification and compile policy code
+        run: |
+          python3 -m unittest discover -s deploy/tests -p 'test_ci_change_scopes.py' -v
+          python3 -m compileall -q deploy/ci
+
+      - name: Run focused controller policy and failure-gate tests
+        if: ${{ steps.changes.outputs.controller == 'true' || steps.changes.outputs.configuration == 'true' || steps.changes.outputs.workflow == 'true' }}
+        working-directory: deploy/tests
+        run: |
+          python3 -m py_compile ../controller/roman_deploy.py test_controller.py
+          python3 -m unittest test_controller.WorkflowContractTests test_controller.RequestValidationTests test_controller.RomanLmsContainerPolicyTests test_controller.StackDeploymentTests test_controller.RomanLmsProductionPolicyTests test_controller.WorkflowOriginTests test_controller.ImageProvenanceTests -v
+
+      - name: Validate application policy JSON
+        if: ${{ steps.changes.outputs.configuration == 'true' }}
+        run: python3 -m json.tool platform/applications.json >/dev/null
+
+      - name: Validate changed deployment shell entry points
+        if: ${{ steps.changes.outputs.controller == 'true' }}
+        run: sh -n deploy/controller/bin/roman-deploy-ssh
+
+      - name: Validate opt-in Ansible bootstrap syntax
+        if: ${{ steps.changes.outputs.ansible == 'true' }}
         run: |
           python3 -m pip install --disable-pip-version-check --no-input ansible-core==2.22.0
           ansible-playbook --syntax-check -i 'roman_servers,' deploy/ansible/install.yml
 
+      - name: Run focused monitoring regression checks
+        if: ${{ steps.changes.outputs.monitoring == 'true' }}
+        working-directory: deploy/tests
+        run: |
+          python3 -m py_compile ../monitoring/*.py
+          python3 -m unittest test_controller.GrafanaAlertProvisioningTests test_controller.ProductionMetricsTests test_phase6_monitoring.Phase6MonitoringTests -v
+
+      - name: Run Cloudflare proxy tests
+        if: ${{ steps.changes.outputs.cloudflare == 'true' }}
+        run: node --test deploy/cloudflare/romanlms-production-proxy/worker.test.mjs
+
       - name: Build and smoke-test the HTTP candidate on loopback
+        if: ${{ steps.changes.outputs.smoke == 'true' }}
         run: |
           set -euo pipefail
           image=roman-infrastructure-smoke:ci

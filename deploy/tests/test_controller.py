@@ -415,6 +415,36 @@ class StackDeploymentTests(unittest.TestCase):
         })
         self.request = request(operation="deploy-stack", images={"backend": "image-b", "frontend": "image-f"}, migration_image="migration")
 
+    def test_startup_diagnostic_reports_state_and_exception_type_without_log_contents(self):
+        sensitive_log = (
+            "APPLICATION FAILED TO START\n"
+            "Caused by: com.romanlms.notifications.TokenStartupException: "
+            "re_0123456789abcdefghijklmnopqrstuvwxyz\n"
+            "account=user@example.edu"
+        )
+        responses = [
+            subprocess.CompletedProcess([], 0, "exited|1|12|false", ""),
+            subprocess.CompletedProcess([], 0, sensitive_log, ""),
+        ]
+        with mock.patch.object(deploy, "run_command", side_effect=responses):
+            diagnostic = deploy._candidate_startup_diagnostic("roman-platform-test-stack-backend-blue-abcdef123456")
+        summary = deploy._format_candidate_startup_diagnostic(diagnostic)
+        self.assertEqual(diagnostic["container_state"], {
+            "status": "exited", "exit_code": 1, "restart_count": 12, "oom_killed": False,
+        })
+        self.assertIn("com.romanlms.notifications.TokenStartupException", summary)
+        self.assertIn("restarts=12", summary)
+        self.assertIn("spring_boot_failure_report=true", summary)
+        self.assertNotIn("re_0123456789", summary)
+        self.assertNotIn("user@example.edu", summary)
+        self.assertNotIn("account=", summary)
+
+    def test_readiness_error_names_connection_failure_reason(self):
+        with mock.patch.object(deploy.urllib.request, "urlopen", side_effect=urllib.error.URLError(ConnectionRefusedError())), \
+             mock.patch.object(deploy.time, "sleep"):
+            with self.assertRaisesRegex(deploy.DeploymentError, r"URLError \(ConnectionRefusedError\)"):
+                deploy._wait_http("http://127.0.0.1:18100/health", "UP", 1)
+
     def test_deploy_starts_both_components_before_one_route_switch(self):
         commands = []
         def run(args, **kwargs):
@@ -889,6 +919,7 @@ class RomanLmsProductionPolicyTests(unittest.TestCase):
             "f14001afa20e54681826394dd06a485dafbdcdac",
             "d5a4b3589c1c5057b94f7355f4f4e5f89a646ea6",
             "03ccb655ad7102decea52b1d3dbd67a53b7933d0",
+            "0a6f8563dbb5e8c0d98c7a245c3792d80457f1b7",
         ])
         self.assertEqual(self.app["allowed_database_urls"], ["jdbc:postgresql://127.0.0.1:5432/romanlms_prod"])
         self.assertEqual(self.app["expected_schema_version"], "132")
