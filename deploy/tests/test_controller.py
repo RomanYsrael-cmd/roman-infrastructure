@@ -985,13 +985,13 @@ class RomanLmsProductionPolicyTests(unittest.TestCase):
         }
         metadata = SimpleNamespace(st_mode=stat.S_IFREG | 0o440, st_uid=0, st_gid=10001)
         service_account = {"type": "service_account", "project_id": "romanlms-prod-project", "client_email": "romanlms@example.invalid", "private_key": "test-only"}
-        with mock.patch.object(deploy.os, "lstat", return_value=metadata), mock.patch.object(deploy.os.path, "realpath", return_value=mount["source"]), \
+        with mock.patch.object(Path, "lstat", return_value=metadata), mock.patch.object(deploy.os.path, "realpath", return_value=mount["source"]), \
              mock.patch.object(Path, "is_symlink", return_value=False), mock.patch("builtins.open", return_value=io.StringIO(json.dumps(service_account))):
             arguments = deploy._secret_file_mount_args(component, environment)
         self.assertEqual(arguments, ["--mount", "type=bind,src=/etc/roman-platform/romanlms-production/firebase-service-account.json,dst=/run/secrets/firebase-service-account.json,readonly"])
 
         unsafe_metadata = SimpleNamespace(st_mode=stat.S_IFREG | 0o644, st_uid=0, st_gid=10001)
-        with mock.patch.object(deploy.os, "lstat", return_value=unsafe_metadata), mock.patch.object(deploy.os.path, "realpath", return_value=mount["source"]), \
+        with mock.patch.object(Path, "lstat", return_value=unsafe_metadata), mock.patch.object(deploy.os.path, "realpath", return_value=mount["source"]), \
              mock.patch.object(Path, "is_symlink", return_value=False):
             with self.assertRaisesRegex(deploy.DeploymentError, "root-owned read-only"):
                 deploy._secret_file_mount_args(component, environment)
@@ -1007,7 +1007,7 @@ class RomanLmsProductionPolicyTests(unittest.TestCase):
         }
         metadata = SimpleNamespace(st_mode=stat.S_IFREG | 0o440, st_uid=0, st_gid=10001)
         service_account = {"type": "service_account", "project_id": "different-project", "client_email": "romanlms@example.invalid", "private_key": "test-only"}
-        with mock.patch.object(deploy.os, "lstat", return_value=metadata), mock.patch.object(deploy.os.path, "realpath", return_value=mount["source"]), \
+        with mock.patch.object(Path, "lstat", return_value=metadata), mock.patch.object(deploy.os.path, "realpath", return_value=mount["source"]), \
              mock.patch.object(Path, "is_symlink", return_value=False), mock.patch("builtins.open", return_value=io.StringIO(json.dumps(service_account))):
             with self.assertRaisesRegex(deploy.DeploymentError, "does not match"):
                 deploy._secret_file_mount_args(component, environment)
