@@ -6,9 +6,11 @@ from __future__ import annotations
 import base64
 import copy
 import json
+import re
 import sys
 import urllib.error
 import urllib.request
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
@@ -375,6 +377,45 @@ def _verify_existing_telegram_route(password: str) -> str:
     return folder["uid"]
 
 
+_DURATION_PART = re.compile(r"(\d+(?:\.\d+)?)(ms|s|m|h|d|w|y)")
+_DURATION_MILLISECONDS = {
+    "ms": Decimal(1),
+    "s": Decimal(1_000),
+    "m": Decimal(60_000),
+    "h": Decimal(3_600_000),
+    "d": Decimal(86_400_000),
+    "w": Decimal(604_800_000),
+    "y": Decimal(31_536_000_000),
+}
+
+
+def _duration_milliseconds(value: Any) -> Decimal | None:
+    if not isinstance(value, str):
+        return None
+    if not value:
+        return Decimal(0)
+    parts = list(_DURATION_PART.finditer(value))
+    if not parts or "".join(part.group(0) for part in parts) != value:
+        return None
+    try:
+        return sum(
+            (Decimal(part.group(1)) * _DURATION_MILLISECONDS[part.group(2)] for part in parts),
+            Decimal(0),
+        )
+    except InvalidOperation:
+        return None
+
+
+def _same_duration(actual: Any, expected: Any) -> bool:
+    actual_text = actual or "0s"
+    expected_text = expected or "0s"
+    actual_milliseconds = _duration_milliseconds(actual_text)
+    expected_milliseconds = _duration_milliseconds(expected_text)
+    if actual_milliseconds is not None and expected_milliseconds is not None:
+        return actual_milliseconds == expected_milliseconds
+    return actual_text == expected_text
+
+
 def _matches(current: dict[str, Any], desired: dict[str, Any]) -> bool:
     metadata = current.get("metadata", {})
     spec = current.get("spec", {})
@@ -386,7 +427,7 @@ def _matches(current: dict[str, Any], desired: dict[str, Any]) -> bool:
         and spec.get("trigger") == wanted["trigger"]
         and spec.get("labels") == wanted["labels"]
         and spec.get("annotations") == wanted["annotations"]
-        and (spec.get("for") or "0s") == (wanted.get("for") or "0s")
+        and _same_duration(spec.get("for"), wanted.get("for"))
         and spec.get("noDataState") == wanted["noDataState"]
         and spec.get("execErrState") == wanted["execErrState"]
         and spec.get("expressions", {}).get("A", {}).get("model", {}).get("expr")

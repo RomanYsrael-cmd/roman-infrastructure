@@ -1,4 +1,5 @@
 import contextlib
+import copy
 import json
 import os
 import shutil
@@ -1160,6 +1161,17 @@ class MetricsTests(unittest.TestCase):
 
 
 class GrafanaAlertProvisioningTests(unittest.TestCase):
+    def test_alert_rule_matches_grafana_normalized_duration_values(self):
+        desired = next(
+            rule for rule in grafana_alerts.desired_rules("alerts-folder", include_production=True)
+            if rule["spec"].get("for") == "2m"
+        )
+        current = copy.deepcopy(desired)
+        current["spec"]["for"] = "2m0s"
+        self.assertTrue(grafana_alerts._matches(current, desired))
+        current["spec"]["for"] = "3m0s"
+        self.assertFalse(grafana_alerts._matches(current, desired))
+
     def test_private_dashboard_includes_release_health_and_resource_queries(self):
         dashboard = grafana_alerts.desired_dashboard()
         self.assertIn(grafana_alerts.DASHBOARD_TAG, dashboard["tags"])
