@@ -22,6 +22,10 @@ NAMESPACE = "default"
 APP_ID = "platform-smoke"
 DASHBOARD_UID = "romanlms-phase6-private"
 DASHBOARD_TAG = "roman-platform-managed"
+PRODUCTION_FOLDER_TITLE = "RomanLMS Production"
+PRODUCTION_FOLDER_UID = "romanlms-production"
+PRODUCTION_DASHBOARD_UID = "romanlms-production-app"
+PRODUCTION_DASHBOARD_TAG = "romanlms-production-managed"
 
 
 class ProvisioningError(Exception):
@@ -87,7 +91,13 @@ def _rule_resource(
     query: str,
     summary: str,
     description: str,
+    for_duration: str = "0s",
+    component: str = "deployment-controller",
+    origin: str | None = None,
 ) -> dict[str, Any]:
+    labels = {"component": component, "host": "roman-server", "severity": "warning"}
+    if origin:
+        labels["origin"] = origin
     return {
         "apiVersion": "rules.alerting.grafana.app/v1beta1",
         "kind": "AlertRule",
@@ -101,13 +111,9 @@ def _rule_resource(
         "spec": {
             "title": title,
             "trigger": {"interval": "30s"},
-            "labels": {
-                "component": "deployment-controller",
-                "host": "roman-server",
-                "severity": "warning",
-            },
+            "labels": labels,
             "annotations": {"summary": summary, "description": description},
-            "for": "0s",
+            "for": for_duration,
             "noDataState": "Ok",
             "execErrState": "Alerting",
             "expressions": {
@@ -208,6 +214,7 @@ def desired_rules(folder_uid: str, include_phase6: bool = False, include_product
             query='roman_platform_last_deployment_info{app_id="romanlms-production",outcome="failure"}',
             summary="RomanLMS production {{ $labels.operation }} failed",
             description="Production release run {{ $labels.workflow_run_id }} for commit {{ $labels.request_sha }} failed. The previous active route was retained.",
+            component="romanlms-production",
         ),
         _rule_resource(
             name="romanlms-production-deploy-succeeded",
@@ -216,6 +223,7 @@ def desired_rules(folder_uid: str, include_phase6: bool = False, include_product
             query='(time() - roman_platform_last_deployment_timestamp_seconds{app_id="romanlms-production",outcome="success"}) < bool 120',
             summary="RomanLMS production {{ $labels.operation }} succeeded",
             description="Production release run {{ $labels.workflow_run_id }} passed its release and readiness checks. This notification resolves after two minutes.",
+            component="romanlms-production",
         ),
         _rule_resource(
             name="romanlms-production-component-down",
@@ -224,6 +232,107 @@ def desired_rules(folder_uid: str, include_phase6: bool = False, include_product
             query="1 - romanlms_production_component_up",
             summary="RomanLMS production {{ $labels.app_component }} is unavailable",
             description="The production component health check failed. Inspect the active RomanLMS release and production gateway on roman-server.",
+            component="romanlms-production",
+            for_duration="2m",
+        ),
+        _rule_resource(
+            name="romanlms-production-metrics-missing",
+            title="RomanLMS Production Metrics Missing",
+            folder_uid=folder_uid,
+            query="1 - romanlms_production_metrics_up",
+            summary="RomanLMS production application metrics are unavailable",
+            description="The private production collector cannot read the active backend Prometheus endpoint.",
+            component="romanlms-production",
+            for_duration="2m",
+        ),
+        _rule_resource(
+            name="romanlms-production-hikaricp-pressure",
+            title="RomanLMS Hikari Pool Pressure",
+            folder_uid=folder_uid,
+            query=(
+                "(romanlms_production_hikaricp_connections_pending > 0) or "
+                "(romanlms_production_hikaricp_connections_active / "
+                "clamp_min(romanlms_production_hikaricp_connections_max, 1) > 0.9)"
+            ),
+            summary="RomanLMS Hikari pool is near exhaustion",
+            description="Connection requests are pending or more than 90% of the configured pool is active.",
+            component="romanlms-production",
+            for_duration="5m",
+        ),
+        _rule_resource(
+            name="romanlms-production-http-5xx-rate",
+            title="RomanLMS Application HTTP 5xx Rate High",
+            folder_uid=folder_uid,
+            query=(
+                '(sum(rate(romanlms_production_http_responses_total{origin="application",status=~"5.."}[5m])) '
+                '/ clamp_min(sum(rate(romanlms_production_http_responses_total{origin="application"}[5m])), 0.001)) > bool 0.05'
+            ),
+            summary="RomanLMS application 5xx rate exceeds 5%",
+            description="Application-origin HTTP 5xx responses exceeded 5% of requests for ten minutes. Proxy and Cloudflare errors are not included in this application metric.",
+            component="romanlms-production",
+            origin="application",
+            for_duration="10m",
+        ),
+        _rule_resource(
+            name="romanlms-production-http-p95-latency",
+            title="RomanLMS Application HTTP p95 Latency High",
+            folder_uid=folder_uid,
+            query=(
+                "histogram_quantile(0.95, sum by (le) "
+                "(rate(romanlms_production_http_server_requests_seconds_bucket[5m]))) > bool 1"
+            ),
+            summary="RomanLMS application HTTP p95 exceeds one second",
+            description="Backend application response latency p95 stayed above one second for ten minutes.",
+            component="romanlms-production",
+            origin="application",
+            for_duration="10m",
+        ),
+        _rule_resource(
+            name="romanlms-production-slow-endpoints",
+            title="RomanLMS Slow Endpoint Groups",
+            folder_uid=folder_uid,
+            query=(
+                "sum by (endpoint_group, method) "
+                "(rate(romanlms_production_http_requests_over_one_second_total[5m])) > bool 0.2"
+            ),
+            summary="RomanLMS {{ $labels.method }} {{ $labels.endpoint_group }} requests are slow",
+            description="More than 0.2 requests per second in this bounded endpoint group exceeded one second for ten minutes.",
+            component="romanlms-production",
+            origin="application",
+            for_duration="10m",
+        ),
+        _rule_resource(
+            name="romanlms-production-jvm-heap-pressure",
+            title="RomanLMS JVM Heap Pressure",
+            folder_uid=folder_uid,
+            query=(
+                "(romanlms_production_jvm_memory_used_bytes{area=\"heap\"} / "
+                "clamp_min(romanlms_production_jvm_heap_max_bytes, 1)) > bool 0.9"
+            ),
+            summary="RomanLMS JVM heap use is above 90%",
+            description="Heap use stayed above 90% of the configured JVM heap for ten minutes.",
+            component="romanlms-production",
+            for_duration="10m",
+        ),
+        _rule_resource(
+            name="romanlms-production-container-pid-pressure",
+            title="RomanLMS Container PID Pressure",
+            folder_uid=folder_uid,
+            query="romanlms_production_container_pids_limit_ratio > bool 0.8",
+            summary="RomanLMS {{ $labels.app_component }} is near its PID limit",
+            description="The container is using more than 80% of its configured process limit for five minutes.",
+            component="romanlms-production",
+            for_duration="5m",
+        ),
+        _rule_resource(
+            name="romanlms-production-container-restarts",
+            title="RomanLMS Container Restarted",
+            folder_uid=folder_uid,
+            query="sum by (app_component) (increase(romanlms_production_container_restart_count[10m])) > bool 0",
+            summary="RomanLMS {{ $labels.app_component }} container restarted",
+            description="An active production application container restarted in the last ten minutes.",
+            component="romanlms-production",
+            for_duration="0s",
         ),
     ]
     selected = rules[:2]
@@ -297,7 +406,7 @@ def _upsert_rule(password: str, desired: dict[str, Any]) -> bool:
         current = api_request(item_path, password)
     else:
         labels = current.get("spec", {}).get("labels", {})
-        if labels.get("component") != "deployment-controller":
+        if labels.get("component") not in {"deployment-controller", "romanlms-production"}:
             raise ProvisioningError(f"Grafana rule UID {name} already belongs to another component; it was not changed.")
         if _matches(current, desired):
             return False
@@ -344,22 +453,102 @@ def desired_dashboard() -> dict[str, Any]:
     }
 
 
-def _upsert_dashboard(password: str, folder_uid: str) -> bool:
-    desired = desired_dashboard()
-    current = api_request(f"/api/dashboards/uid/{DASHBOARD_UID}", password)
+def desired_production_dashboard() -> dict[str, Any]:
+    panels = [
+        ("Backend and frontend readiness", "romanlms_production_component_up", "short"),
+        ("Metrics collector status", "romanlms_production_metrics_up", "short"),
+        ("Hikari active, idle and pending", "romanlms_production_hikaricp_connections_active or romanlms_production_hikaricp_connections_idle or romanlms_production_hikaricp_connections_pending", "short"),
+        ("Hikari maximum and minimum idle", "romanlms_production_hikaricp_connections_max or romanlms_production_hikaricp_connections_min", "short"),
+        ("Hikari acquisition p95", "histogram_quantile(0.95, sum by (le) (rate(romanlms_production_hikaricp_connection_acquire_seconds_bucket[5m])))", "s"),
+        ("Hikari usage and creation p95", "histogram_quantile(0.95, sum by (le) (rate(romanlms_production_hikaricp_connection_usage_seconds_bucket[5m]))) or histogram_quantile(0.95, sum by (le) (rate(romanlms_production_hikaricp_connection_creation_seconds_bucket[5m])))", "s"),
+        ("Hikari connection timeouts", "rate(romanlms_production_hikaricp_connection_timeouts_total[5m])", "ops"),
+        ("Application HTTP requests per second by status", "sum by (status) (rate(romanlms_production_http_responses_total{origin=\"application\"}[5m]))", "reqps"),
+        ("Application 500, 502, 503 and 504 responses", "sum by (status) (rate(romanlms_production_http_responses_total{origin=\"application\",status=~\"500|502|503|504\"}[5m]))", "reqps"),
+        ("Application HTTP 5xx ratio", "sum(rate(romanlms_production_http_responses_total{origin=\"application\",status=~\"5..\"}[5m])) / clamp_min(sum(rate(romanlms_production_http_responses_total{origin=\"application\"}[5m])), 0.001)", "percentunit"),
+        ("Application HTTP p95 latency", "histogram_quantile(0.95, sum by (le) (rate(romanlms_production_http_server_requests_seconds_bucket[5m])))", "s"),
+        ("Endpoint group HTTP p95 latency", "histogram_quantile(0.95, sum by (le, endpoint_group, method) (rate(romanlms_production_http_requests_by_endpoint_seconds_bucket[5m])))", "s"),
+        ("Slow endpoint group requests per second", "sum by (endpoint_group, method) (rate(romanlms_production_http_requests_over_one_second_total[5m]))", "reqps"),
+        ("JVM heap and non-heap memory", "romanlms_production_jvm_memory_used_bytes", "bytes"),
+        ("JVM heap use percent", "100 * romanlms_production_jvm_memory_used_bytes{area=\"heap\"} / clamp_min(romanlms_production_jvm_heap_max_bytes, 1)", "percent"),
+        ("JVM threads", "romanlms_production_jvm_threads_live or romanlms_production_jvm_threads_daemon or romanlms_production_jvm_threads_peak", "short"),
+        ("JVM garbage collection pause rate", "rate(romanlms_production_jvm_gc_pause_seconds_total[5m])", "s"),
+        ("Container CPU percent", "romanlms_production_container_cpu_percent", "percent"),
+        ("Container memory use and limit", "romanlms_production_container_memory_bytes or romanlms_production_container_memory_limit_bytes", "bytes"),
+        ("Container memory use percent", "100 * romanlms_production_container_memory_bytes / clamp_min(romanlms_production_container_memory_limit_bytes, 1)", "percent"),
+        ("Container restarts", "increase(romanlms_production_container_restart_count[1h])", "short"),
+        ("Container PID limit pressure", "romanlms_production_container_pids_limit_ratio", "percentunit"),
+    ]
+    return {
+        "uid": PRODUCTION_DASHBOARD_UID,
+        "title": "RomanLMS Production",
+        "tags": [DASHBOARD_TAG, PRODUCTION_DASHBOARD_TAG],
+        "timezone": "browser",
+        "schemaVersion": 39,
+        "refresh": "30s",
+        "time": {"from": "now-6h", "to": "now"},
+        "panels": [
+            {"id": index + 1, "type": "timeseries", "title": title,
+             "gridPos": {"h": 8, "w": 12, "x": (index % 2) * 12, "y": (index // 2) * 8},
+             "datasource": {"type": "prometheus", "uid": DATASOURCE_UID},
+             "fieldConfig": {"defaults": {"unit": unit}, "overrides": []},
+             "targets": [{"refId": "A", "expr": expression, "datasource": {"type": "prometheus", "uid": DATASOURCE_UID}}]}
+            for index, (title, expression, unit) in enumerate(panels)
+        ],
+    }
+
+
+def _upsert_dashboard_resource(
+    password: str,
+    folder_uid: str,
+    desired: dict[str, Any],
+    owner_tag: str,
+    message: str,
+) -> bool:
+    dashboard_uid = desired["uid"]
+    current = api_request(f"/api/dashboards/uid/{dashboard_uid}", password)
     if current is not None:
         dashboard = current.get("dashboard", {}) if isinstance(current, dict) else {}
-        if DASHBOARD_TAG not in dashboard.get("tags", []):
-            raise ProvisioningError("The Phase 6 dashboard UID belongs to another dashboard; it was not changed.")
+        if owner_tag not in dashboard.get("tags", []):
+            raise ProvisioningError(f"Dashboard UID {dashboard_uid} belongs to another dashboard; it was not changed.")
         keys = ("uid", "title", "tags", "timezone", "schemaVersion", "refresh", "time", "panels")
         if all(dashboard.get(key) == desired.get(key) for key in keys) and current.get("meta", {}).get("folderUid") == folder_uid:
             return False
         desired["id"] = dashboard.get("id")
         desired["version"] = dashboard.get("version", 0)
-    result = api_request("/api/dashboards/db", password, method="POST", body={"dashboard": desired, "folderUid": folder_uid, "overwrite": True, "message": "Managed RomanLMS private monitoring"})
-    if not isinstance(result, dict) or result.get("uid") != DASHBOARD_UID:
-        raise ProvisioningError("Grafana did not confirm the Phase 6 dashboard.")
+    result = api_request("/api/dashboards/db", password, method="POST", body={"dashboard": desired, "folderUid": folder_uid, "overwrite": True, "message": message})
+    if not isinstance(result, dict) or result.get("uid") != dashboard_uid:
+        raise ProvisioningError(f"Grafana did not confirm dashboard {dashboard_uid}.")
     return True
+
+
+def _upsert_dashboard(password: str, folder_uid: str) -> bool:
+    return _upsert_dashboard_resource(password, folder_uid, desired_dashboard(), DASHBOARD_TAG, "Managed RomanLMS private monitoring")
+
+
+def _ensure_production_dashboard_folder(password: str) -> str:
+    folders = api_request("/api/folders", password)
+    if not isinstance(folders, list):
+        raise ProvisioningError("Grafana folders could not be listed.")
+    by_title = next((item for item in folders if item.get("title") == PRODUCTION_FOLDER_TITLE), None)
+    by_uid = next((item for item in folders if item.get("uid") == PRODUCTION_FOLDER_UID), None)
+    if by_title and by_title.get("uid") != PRODUCTION_FOLDER_UID:
+        raise ProvisioningError("The RomanLMS Production folder title belongs to a different folder UID.")
+    if by_uid and by_uid.get("title") != PRODUCTION_FOLDER_TITLE:
+        raise ProvisioningError("The RomanLMS Production folder UID belongs to a different folder.")
+    folder = by_title or by_uid
+    if folder:
+        return str(folder["uid"])
+    created = api_request("/api/folders", password, method="POST", body={"uid": PRODUCTION_FOLDER_UID, "title": PRODUCTION_FOLDER_TITLE})
+    if not isinstance(created, dict) or created.get("uid") != PRODUCTION_FOLDER_UID or created.get("title") != PRODUCTION_FOLDER_TITLE:
+        raise ProvisioningError("Grafana did not confirm the RomanLMS Production folder.")
+    return PRODUCTION_FOLDER_UID
+
+
+def _upsert_production_dashboard(password: str, folder_uid: str) -> bool:
+    return _upsert_dashboard_resource(
+        password, folder_uid, desired_production_dashboard(), PRODUCTION_DASHBOARD_TAG,
+        "Managed RomanLMS production application monitoring",
+    )
 
 
 def main() -> int:
@@ -385,6 +574,9 @@ def main() -> int:
         changed = sum(_upsert_rule(password, item) for item in desired_rules(folder_uid, include_phase6, include_production))
         if include_phase6:
             changed += int(_upsert_dashboard(password, folder_uid))
+        if include_production:
+            production_folder_uid = _ensure_production_dashboard_folder(password)
+            changed += int(_upsert_production_dashboard(password, production_folder_uid))
     except ProvisioningError as exc:
         print(str(exc), file=sys.stderr)
         return 1
