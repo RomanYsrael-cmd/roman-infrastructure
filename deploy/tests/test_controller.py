@@ -418,8 +418,9 @@ class StackDeploymentTests(unittest.TestCase):
 
     def test_startup_diagnostic_reports_state_and_exception_type_without_log_contents(self):
         sensitive_log = (
+            "2026-11-09T18:28:28.123456Z ERROR 1 --- Application run failed\n"
+            "2026-11-09T18:28:28.123457Z stderr F Caused by: com.romanlms.notifications.TokenStartupException: "
             "APPLICATION FAILED TO START\n"
-            "Caused by: com.romanlms.notifications.TokenStartupException: "
             "re_0123456789abcdefghijklmnopqrstuvwxyz\n"
             "account=user@example.edu"
         )
