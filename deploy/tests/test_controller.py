@@ -1204,6 +1204,7 @@ class GrafanaAlertProvisioningTests(unittest.TestCase):
         self.assertEqual(len(rules), 13)
         production_rules = rules[2:]
         self.assertTrue(all("romanlms-production" in item["metadata"]["name"] for item in production_rules))
+        self.assertTrue(all(len(item["metadata"]["name"]) <= 40 for item in rules))
         self.assertTrue(any("romanlms_production_component_up" in item["spec"]["expressions"]["A"]["model"]["expr"] for item in production_rules))
         self.assertTrue(any("romanlms_production_hikaricp_connections_pending" in item["spec"]["expressions"]["A"]["model"]["expr"] for item in production_rules))
         self.assertTrue(any("status=~\"5..\"" in item["spec"]["expressions"]["A"]["model"]["expr"] for item in production_rules))
