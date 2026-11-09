@@ -418,9 +418,13 @@ class StackDeploymentTests(unittest.TestCase):
 
     def test_startup_diagnostic_reports_state_and_exception_type_without_log_contents(self):
         sensitive_log = (
-            "2026-11-09T18:28:28.123456Z ERROR 1 --- Application run failed\n"
-            "2026-11-09T18:28:28.123457Z stderr F Caused by: com.romanlms.notifications.TokenStartupException: "
+            "2026-11-09T18:28:28.123456Z ERROR 1 --- org.springframework.context.ApplicationContextException: "
+            "Application run failed\n"
             "APPLICATION FAILED TO START\n"
+            "2026-11-09T18:28:28.123457Z stderr F Caused by: java.lang.NumberFormatException: "
+            "For input string: private-value\n"
+            "2026-11-09T18:28:28.123458Z stderr F     at com.romanlms.romanlms_backend.config.StartupPropertyFactory.parse(StartupPropertyFactory.java:42) ~[classes/:na]\n"
+            "Picked up JAVA_TOOL_OPTIONS: -XX:+ExitOnOutOfMemoryError\n"
             "re_0123456789abcdefghijklmnopqrstuvwxyz\n"
             "account=user@example.edu"
         )
@@ -434,9 +438,16 @@ class StackDeploymentTests(unittest.TestCase):
         self.assertEqual(diagnostic["container_state"], {
             "status": "exited", "exit_code": 1, "restart_count": 12, "oom_killed": False,
         })
-        self.assertIn("com.romanlms.notifications.TokenStartupException", summary)
+        self.assertIn("org.springframework.context.ApplicationContextException", summary)
+        self.assertIn("java.lang.NumberFormatException", summary)
+        self.assertIn(
+            "com.romanlms.romanlms_backend.config.StartupPropertyFactory.parse(StartupPropertyFactory.java:42)",
+            summary,
+        )
         self.assertIn("restarts=12", summary)
         self.assertIn("spring_boot_failure_report=true", summary)
+        self.assertNotIn("private-value", summary)
+        self.assertNotIn("ExitOnOutOfMemoryError", summary)
         self.assertNotIn("re_0123456789", summary)
         self.assertNotIn("user@example.edu", summary)
         self.assertNotIn("account=", summary)

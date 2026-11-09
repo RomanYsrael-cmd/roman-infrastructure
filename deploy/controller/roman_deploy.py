@@ -812,7 +812,7 @@ def _wait_http(url: str, expected_text: str, timeout_seconds: int) -> None:
 
 
 def _candidate_startup_diagnostic(container: str) -> dict[str, Any]:
-    """Return a redacted container state and exception-class signature for failed candidates."""
+    """Return a redacted container state and stack signature for failed candidates."""
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,179}", container):
         return {}
     state_result = run_command(
@@ -836,11 +836,12 @@ def _candidate_startup_diagnostic(container: str) -> dict[str, Any]:
 
     logs_result = run_command(["docker", "logs", "--tail", "150", container], timeout=15, check=False)
     logs = (logs_result.stdout or "") + "\n" + (logs_result.stderr or "")
-    # Docker/Spring logs may prefix every line with a timestamp and log level,
-    # so searching only at the start of a line misses the actual exception.
-    # Emit class names only; never include messages, tokens, or other log text.
+    # Docker/Spring logs may prefix exception lines with timestamps and log
+    # levels, so searching only at the start of a line misses the exception.
+    # Require the class name to end in a colon; this avoids matching JVM options
+    # such as -XX:+ExitOnOutOfMemoryError. Never include exception messages.
     exception_pattern = re.compile(
-        r"\b([A-Za-z_$][A-Za-z0-9_.$]*?(?:Exception|Error))(?::|\s|$)"
+        r"\b([A-Za-z_$][A-Za-z0-9_.$]*(?:Exception|Error))(?=:)"
     )
     exception_types: list[str] = []
     for match in exception_pattern.finditer(logs):
@@ -849,11 +850,25 @@ def _candidate_startup_diagnostic(container: str) -> dict[str, Any]:
             exception_types.append(class_name)
         if len(exception_types) == 3:
             break
+    frame_pattern = re.compile(
+        r"\bat\s+(com\.romanlms\.[A-Za-z0-9_.$]+)\(([A-Za-z0-9_$.]+\.java:\d+)\)"
+    )
+    stack_frames: list[str] = []
+    for line in logs.splitlines():
+        match = frame_pattern.search(line)
+        if match:
+            frame = f"{match.group(1)}({match.group(2)})"
+            if frame not in stack_frames:
+                stack_frames.append(frame)
+        if len(stack_frames) == 5:
+            break
     diagnostic: dict[str, Any] = {}
     if state:
         diagnostic["container_state"] = state
     if exception_types:
         diagnostic["startup_exception_types"] = exception_types
+    if stack_frames:
+        diagnostic["startup_stack_frames"] = stack_frames
     if "APPLICATION FAILED TO START" in logs:
         diagnostic["spring_boot_failure_report"] = True
     return diagnostic
@@ -875,6 +890,9 @@ def _format_candidate_startup_diagnostic(diagnostic: dict[str, Any]) -> str:
     exception_types = diagnostic.get("startup_exception_types")
     if isinstance(exception_types, list) and exception_types:
         parts.append("startup_exception_types=" + ",".join(exception_types))
+    stack_frames = diagnostic.get("startup_stack_frames")
+    if isinstance(stack_frames, list) and stack_frames:
+        parts.append("startup_stack_frames=" + ",".join(stack_frames))
     if diagnostic.get("spring_boot_failure_report") is True:
         parts.append("spring_boot_failure_report=true")
     return "; ".join(parts)
