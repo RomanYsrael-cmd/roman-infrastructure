@@ -284,7 +284,7 @@
       ansible.builtin.assert:
         that:
           - romanlms_mail_from is string
-          - romanlms_mail_from is match('^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$')
+          - romanlms_mail_from is match('^[^@\s]+@[^@\s]+\.[^@\s]+$')
         fail_msg: The production email sender address is invalid.
       no_log: true
       when: install_romanlms_production | bool and romanlms_mail_from is defined
