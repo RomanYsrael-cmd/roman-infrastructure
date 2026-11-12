@@ -21,6 +21,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from romanlms_ci_gate import CiGateError, github_api, verify_ci_release
+
 
 CONFIG_PATH = Path("/etc/roman-platform/applications.json")
 MAX_REQUEST_BYTES = 32 * 1024
@@ -34,6 +36,13 @@ def _validate_romanlms_capacity_policy(app: dict[str, Any]) -> None:
         return
     if app.get("single_backend_maintenance") is not True:
         raise DeploymentError("RomanLMS production requires the single-backend maintenance rollout policy.")
+    if (
+        app.get("automatic_workflow_event") != "workflow_run"
+        or not isinstance(app.get("automatic_release_enabled"), bool)
+        or not isinstance(app.get("required_ci_workflow_blob_sha"), str)
+        or not SHA_RE.fullmatch(app["required_ci_workflow_blob_sha"])
+    ):
+        raise DeploymentError("RomanLMS production requires a root-approved automatic release and CI workflow policy.")
     components = app.get("components")
     backend = components.get("backend") if isinstance(components, dict) else None
     slots = backend.get("container_environment_by_slot") if isinstance(backend, dict) else None
@@ -118,12 +127,34 @@ def validate_request(request: Any, config: dict[str, Any]) -> tuple[dict[str, An
         raise DeploymentError("Reusable workflow version is not on the server allowlist.")
 
     release = request["release"]
-    if not isinstance(release, dict) or set(release) != {"run_id", "run_attempt", "actor"}:
+    base_release_fields = {"run_id", "run_attempt", "actor"}
+    automatic_release_fields = {"mode", "trigger_run_id", "trigger_run_attempt"}
+    if (
+        not isinstance(release, dict)
+        or not base_release_fields.issubset(release)
+        or set(release) - base_release_fields - automatic_release_fields
+    ):
         raise DeploymentError("Request is missing approved release metadata.")
     for key in ("run_id", "run_attempt"):
         if not isinstance(release[key], str) or not release[key].isdigit() or len(release[key]) > 20:
             raise DeploymentError("Invalid workflow run metadata.")
     _text(release["actor"], "workflow actor", 100)
+    release_mode = release.get("mode", "manual")
+    if release_mode not in {"manual", "automatic"}:
+        raise DeploymentError("Invalid release mode.")
+    if release_mode == "automatic":
+        if (
+            app_id != "romanlms-production"
+            or app.get("automatic_release_enabled") is not True
+            or operation != "deploy-stack"
+            or not automatic_release_fields.issubset(release)
+        ):
+            raise DeploymentError("Automatic production release is not enabled for this request.")
+        for key in ("trigger_run_id", "trigger_run_attempt"):
+            if not isinstance(release[key], str) or not release[key].isdigit() or len(release[key]) > 20:
+                raise DeploymentError("Invalid triggering CI run metadata.")
+    elif set(release) - base_release_fields - {"mode"}:
+        raise DeploymentError("Manual releases cannot include automatic CI trigger metadata.")
     _secret(request["github_token"], "GitHub token")
 
     if operation in {"deploy", "unhealthy-test"}:
@@ -209,6 +240,13 @@ def verify_release_origin(request: dict[str, Any], app: dict[str, Any]) -> None:
         request["github_token"],
     )
     expected_path = app["workflow_path"]
+    release_mode = request["release"].get("mode", "manual")
+    if release_mode == "automatic":
+        if app.get("automatic_release_enabled") is not True or app.get("automatic_workflow_event") != "workflow_run":
+            raise DeploymentError("Automatic production release is not enabled by the server policy.")
+        expected_event = app["automatic_workflow_event"]
+    else:
+        expected_event = app["workflow_event"]
     actor = run.get("actor") or {}
     actor_login = actor.get("login") if isinstance(actor, dict) else None
     workflow_refs = run.get("referenced_workflows") or []
@@ -220,7 +258,7 @@ def verify_release_origin(request: dict[str, Any], app: dict[str, Any]) -> None:
         if isinstance(item, dict)
     )
     if (
-        run.get("event") != app["workflow_event"]
+        run.get("event") != expected_event
         or run.get("status") != "in_progress"
         or run.get("head_branch") != app["production_branch"]
         or run.get("head_sha") != request["workflow_sha"]
@@ -231,6 +269,14 @@ def verify_release_origin(request: dict[str, Any], app: dict[str, Any]) -> None:
         or not reusable_is_pinned
     ):
         raise DeploymentError("Workflow run is not an authorized in-progress production release.")
+
+    if release_mode == "automatic" and (
+        request["operation"] != "deploy-stack"
+        or request["release"].get("actor") not in app.get("authorized_actors", [])
+        or not request["release"].get("trigger_run_id")
+        or not request["release"].get("trigger_run_attempt")
+    ):
+        raise DeploymentError("Automatic release trigger is not authorized by server policy.")
 
     workflow_branch = github_json(
         app["workflow_repository"],
@@ -257,6 +303,26 @@ def verify_required_ci(request: dict[str, Any], app: dict[str, Any]) -> None:
     workflow = app.get("required_ci_workflow_file")
     if not isinstance(workflow, str) or not re.fullmatch(r"[A-Za-z0-9_.-]+\.ya?ml", workflow):
         raise DeploymentError("The required CI workflow is not configured.")
+    if app.get("app_id") == "romanlms-production":
+        expected_blob_sha = app.get("required_ci_workflow_blob_sha")
+        if not isinstance(expected_blob_sha, str) or not SHA_RE.fullmatch(expected_blob_sha):
+            raise DeploymentError("The root-approved RomanLMS CI workflow identity is not configured.")
+        release = request["release"]
+        try:
+            proof = verify_ci_release(
+                github_api(app["repository"], request["github_token"]),
+                source_sha=request["commit_sha"],
+                repository=app["repository"],
+                workflow_file=workflow,
+                expected_workflow_blob_sha=expected_blob_sha,
+                short_run_id=int(release["trigger_run_id"]) if release.get("mode") == "automatic" else None,
+                short_run_attempt=int(release["trigger_run_attempt"]) if release.get("mode") == "automatic" else None,
+            )
+        except (CiGateError, ValueError, TypeError) as exc:
+            raise DeploymentError(f"RomanLMS LONG/SHORT CI release proof failed: {exc}") from exc
+        if release.get("mode") == "automatic" and proof.get("productionChange") is not True:
+            raise DeploymentError("Automatic release has no production application changes.")
+        return
     payload = github_json(app["repository"], f"actions/workflows/{workflow}/runs?head_sha={request['commit_sha']}&event=push&per_page=20", request["github_token"])
     runs = payload.get("workflow_runs")
     if not isinstance(runs, list):
