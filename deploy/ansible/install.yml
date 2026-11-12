@@ -499,6 +499,15 @@
         mode: "0644"
       tags: [romanlms-recovery-controller]
 
+    - name: Install the RomanLMS LONG and SHORT CI proof verifier
+      ansible.builtin.copy:
+        src: "{{ platform_repo_root }}/deploy/controller/romanlms_ci_gate.py"
+        dest: "{{ platform_root }}/controller/romanlms_ci_gate.py"
+        owner: root
+        group: root
+        mode: "0644"
+      tags: [romanlms-recovery-controller]
+
     - name: Install the restricted command wrapper
       ansible.builtin.copy:
         src: "{{ platform_repo_root }}/deploy/controller/bin/roman-deploy"

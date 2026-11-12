@@ -70,6 +70,35 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertNotIn("& docker push $tag", workflow)
         self.assertIn("inputs.operation == 'deploy-stack' || inputs.operation == 'rollback-stack' || inputs.operation == 'test-stack'", workflow)
 
+    def test_server_handoff_uses_a_read_only_token_after_prebuild_ci_proof(self):
+        workflow = yaml.safe_load(
+            (ROOT / ".github" / "workflows" / "romanlms-private-deploy.yml").read_text(encoding="utf-8")
+        )
+        jobs = workflow["jobs"]
+        self.assertEqual(jobs["publish-images"]["permissions"]["packages"], "write")
+        self.assertEqual(jobs["send-release"]["permissions"]["packages"], "read")
+        self.assertEqual(jobs["send-release"]["permissions"]["actions"], "read")
+        self.assertEqual(jobs["send-release"]["permissions"]["pull-requests"], "read")
+        publish_steps = jobs["publish-images"]["steps"]
+        proof = next(step for step in publish_steps if step.get("name") == "Verify exact RomanLMS LONG and SHORT proof before image publication")
+        image_build = next(step for step in publish_steps if step.get("name") == "Build and publish immutable images")
+        self.assertLess(publish_steps.index(proof), publish_steps.index(image_build))
+        self.assertIn("romanlms_ci_gate.py", proof["run"])
+        release_script = jobs["send-release"]["steps"][0]["run"]
+        self.assertIn("commit_sha=$env:SOURCE_SHA", release_script)
+        self.assertIn("trigger_run_id=$env:TRIGGER_RUN_ID", release_script)
+
+    def test_ansible_installs_the_ci_proof_module_as_root_owned_controller_code(self):
+        install = (ROOT / "deploy" / "ansible" / "install.yml").read_text(encoding="utf-8")
+        for required in (
+            "deploy/controller/romanlms_ci_gate.py",
+            "/controller/romanlms_ci_gate.py",
+            "owner: root",
+            "group: root",
+            'mode: "0644"',
+        ):
+            self.assertIn(required, install)
+
     def test_production_profile_is_manual_owner_only_and_server_policy_scoped(self):
         workflow = (ROOT / ".github" / "workflows" / "romanlms-private-deploy.yml").read_text(encoding="utf-8")
         for required in (
@@ -177,6 +206,49 @@ class RequestValidationTests(unittest.TestCase):
     def test_rejects_missing_release_metadata(self):
         with self.assertRaisesRegex(deploy.DeploymentError, "approved release metadata"):
             deploy.validate_request(request(release={"run_id": "12345"}), CONFIG)
+
+    def test_automatic_production_release_requires_server_enablement_and_exact_trigger_metadata(self):
+        production = json.loads(json.dumps(CONFIG["applications"]["romanlms-production"]))
+        production["allowed_platform_shas"].append(WORKFLOW_SHA)
+        production["automatic_release_enabled"] = True
+        config = {"applications": {"romanlms-production": production}}
+        value = request(
+            operation="deploy-stack",
+            app_id="romanlms-production",
+            environment="production",
+            migration_image=f"{production['migration_image_namespace']}@sha256:{DIGEST}",
+            images={
+                name: f"{component['image_namespace']}@sha256:{DIGEST}"
+                for name, component in production["components"].items()
+            },
+            release={
+                "run_id": "12345",
+                "run_attempt": "1",
+                "actor": "RomanYsrael-cmd",
+                "mode": "automatic",
+                "trigger_run_id": "67890",
+                "trigger_run_attempt": "1",
+            },
+        )
+        value.pop("image")
+        with self.assertRaisesRegex(deploy.DeploymentError, "Automatic production release is not enabled"):
+            disabled = json.loads(json.dumps(production))
+            disabled["automatic_release_enabled"] = False
+            deploy.validate_request(value, {"applications": {"romanlms-production": disabled}})
+        app, accepted = deploy.validate_request(value, config)
+        self.assertEqual(app["app_id"], "romanlms-production")
+        self.assertEqual(accepted["release"]["trigger_run_id"], "67890")
+
+    def test_manual_release_cannot_smuggle_automatic_ci_trigger_metadata(self):
+        value = request()
+        value["release"] = {
+            **value["release"],
+            "mode": "manual",
+            "trigger_run_id": "67890",
+            "trigger_run_attempt": "1",
+        }
+        with self.assertRaisesRegex(deploy.DeploymentError, "Manual releases cannot include"):
+            deploy.validate_request(value, CONFIG)
 
     def test_rejects_short_or_non_hex_commit(self):
         with self.assertRaisesRegex(deploy.DeploymentError, "full 40-character"):
@@ -927,6 +999,9 @@ class RomanLmsProductionPolicyTests(unittest.TestCase):
 
     def test_production_policy_isolated_from_staging_and_uses_only_the_restored_database(self):
         self.assertEqual(self.app["environment"], "production")
+        self.assertFalse(self.app["automatic_release_enabled"])
+        self.assertEqual(self.app["automatic_workflow_event"], "workflow_run")
+        self.assertRegex(self.app["required_ci_workflow_blob_sha"], r"^[0-9a-f]{40}$")
         self.assertTrue(self.app["allow_unhealthy_active_replacement"])
         self.assertEqual(self.app["allowed_platform_shas"], [
             "f14001afa20e54681826394dd06a485dafbdcdac",
@@ -1232,6 +1307,44 @@ class WorkflowOriginTests(unittest.TestCase):
         value = request()
         with mock.patch.object(deploy, "github_json", side_effect=self._responses()):
             deploy.verify_release_origin(value, self.app)
+
+    def test_accepts_only_an_explicit_automatic_workflow_run_with_source_ci_identity(self):
+        value = request(
+            operation="deploy-stack",
+            release={
+                "run_id": "12345",
+                "run_attempt": "1",
+                "actor": "RomanYsrael-cmd",
+                "mode": "automatic",
+                "trigger_run_id": "67890",
+                "trigger_run_attempt": "2",
+            },
+        )
+        app = dict(self.app, automatic_workflow_event="workflow_run", automatic_release_enabled=True)
+        responses = self._responses()
+        responses[0]["event"] = "workflow_run"
+        with mock.patch.object(deploy, "github_json", side_effect=responses), \
+             mock.patch.object(deploy, "verify_required_ci") as verify_ci:
+            deploy.verify_release_origin(value, app)
+        verify_ci.assert_called_once_with(value, app)
+
+    def test_rejects_automatic_workflow_run_when_server_release_switch_is_off(self):
+        value = request(
+            operation="deploy-stack",
+            release={
+                "run_id": "12345",
+                "run_attempt": "1",
+                "actor": "RomanYsrael-cmd",
+                "mode": "automatic",
+                "trigger_run_id": "67890",
+                "trigger_run_attempt": "2",
+            },
+        )
+        responses = self._responses()
+        responses[0]["event"] = "workflow_run"
+        with mock.patch.object(deploy, "github_json", side_effect=responses):
+            with self.assertRaisesRegex(deploy.DeploymentError, "not enabled by the server policy"):
+                deploy.verify_release_origin(value, dict(self.app, automatic_workflow_event="workflow_run", automatic_release_enabled=False))
 
     def test_runtime_refresh_requires_exact_commit_ci(self):
         value = request(operation="refresh-stack")

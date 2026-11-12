@@ -12,6 +12,7 @@ class ChangeScopeTests(unittest.TestCase):
     def test_controller_change_selects_policy_checks_only(self):
         result = classify_paths([
             "deploy/controller/roman_deploy.py",
+            "deploy/controller/romanlms_ci_gate.py",
             "deploy/tests/test_controller.py",
         ])
         self.assertTrue(result["controller"])
