@@ -36,7 +36,7 @@ def classify_paths(paths: list[str]) -> dict[str, object]:
             result["workflow"] = True
         elif path.startswith("deploy/ci/") or path.startswith("deploy/tests/test_ci_"):
             result["ci_policy"] = True
-        elif path == "deploy/tests/test_controller.py" or path.startswith("deploy/controller/"):
+        elif path in {"deploy/tests/test_controller.py", "deploy/tests/test_romanlms_ci_gate.py"} or path.startswith("deploy/controller/"):
             result["controller"] = True
         elif path.startswith("deploy/ansible/"):
             result["ansible"] = True

@@ -14,6 +14,7 @@ class ChangeScopeTests(unittest.TestCase):
             "deploy/controller/roman_deploy.py",
             "deploy/controller/romanlms_ci_gate.py",
             "deploy/tests/test_controller.py",
+            "deploy/tests/test_romanlms_ci_gate.py",
         ])
         self.assertTrue(result["controller"])
         self.assertFalse(result["smoke"])
