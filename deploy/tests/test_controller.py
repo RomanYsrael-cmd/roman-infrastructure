@@ -999,7 +999,7 @@ class RomanLmsProductionPolicyTests(unittest.TestCase):
 
     def test_production_policy_isolated_from_staging_and_uses_only_the_restored_database(self):
         self.assertEqual(self.app["environment"], "production")
-        self.assertFalse(self.app["automatic_release_enabled"])
+        self.assertTrue(self.app["automatic_release_enabled"])
         self.assertEqual(self.app["automatic_workflow_event"], "workflow_run")
         self.assertRegex(self.app["required_ci_workflow_blob_sha"], r"^[0-9a-f]{40}$")
         self.assertTrue(self.app["allow_unhealthy_active_replacement"])
@@ -1011,7 +1011,12 @@ class RomanLmsProductionPolicyTests(unittest.TestCase):
             "6dd7bbb99ba15d801ce5de34dcda9fe4670657a1",
             "63b54022e990c0d010cd6ac65902afbb3e1d07d5",
             "eff9b117a741fa17722d85511e24878cb2651707",
+            "df2711da492189c5e092338c92548c40011d1926",
         ])
+        self.assertEqual(
+            self.app["required_ci_workflow_blob_sha"],
+            "521ca61f43c766872b5e080e07612979a148bb9f",
+        )
         self.assertEqual(self.app["allowed_database_urls"], ["jdbc:postgresql://127.0.0.1:5432/romanlms_prod"])
         self.assertEqual(self.app["expected_schema_version"], "132")
         self.assertEqual(
