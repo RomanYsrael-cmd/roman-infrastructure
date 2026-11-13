@@ -1,4 +1,4 @@
-"""Verify the two CI proofs required for an automatic RomanLMS production release."""
+"""Verify CI evidence for an automatic RomanLMS production release."""
 
 from __future__ import annotations
 
@@ -123,6 +123,8 @@ def _require_run_identity(
         or actor.get("login") != AUTHORIZED_ACTOR
         or not isinstance(head_repository, dict)
         or str(head_repository.get("full_name", "")).lower() != repository.lower()
+        or not isinstance(run.get("repository"), dict)
+        or str(run["repository"].get("full_name", "")).lower() != repository.lower()
     ):
         raise CiGateError(f"Exact owner-authorized {profile} CI identity does not match")
     if run.get("status") != "completed" or run.get("conclusion") != "success":
@@ -136,6 +138,44 @@ def _tree_sha(api_json: Callable[[str], Any], sha: str, label: str) -> str:
     if not isinstance(tree_sha, str) or SHA_RE.fullmatch(tree_sha) is None:
         raise CiGateError(f"{label} tree identity is malformed")
     return tree_sha
+
+
+def _release_commit(api_json: Callable[[str], Any], sha: str) -> tuple[dict[str, Any], str]:
+    """Return exact GitHub commit metadata and tree identity; fail closed on ambiguity."""
+    commit = _object(api_json(f"/commits/{sha}"), "release commit")
+    if commit.get("sha") != sha:
+        raise CiGateError("GitHub release commit identity does not match the requested source SHA")
+    data = _object(commit.get("commit"), "release commit data")
+    tree = _object(data.get("tree"), "release commit tree")
+    tree_sha = tree.get("sha")
+    parents = commit.get("parents")
+    if (
+        not isinstance(tree_sha, str)
+        or SHA_RE.fullmatch(tree_sha) is None
+        or not isinstance(parents, list)
+        or not 1 <= len(parents) <= 2
+        or any(
+            not isinstance(parent, dict)
+            or not isinstance(parent.get("sha"), str)
+            or SHA_RE.fullmatch(parent["sha"]) is None
+            for parent in parents
+        )
+    ):
+        raise CiGateError("GitHub release commit metadata is malformed or has no parent")
+    return commit, tree_sha
+
+
+def _is_merged_main_pr(pr: dict[str, Any], repository: str) -> bool:
+    base = pr.get("base")
+    base_repo = base.get("repo") if isinstance(base, dict) else None
+    return bool(
+        pr.get("state") == "closed"
+        and pr.get("merged_at")
+        and isinstance(base, dict)
+        and base.get("ref") == "main"
+        and isinstance(base_repo, dict)
+        and str(base_repo.get("full_name", "")).lower() == repository.lower()
+    )
 
 
 def _workflow_blob_sha(api_json: Callable[[str], Any], source_sha: str) -> str:
@@ -244,7 +284,7 @@ def verify_ci_release(
     short_run_id: int | None = None,
     short_run_attempt: int | None = None,
 ) -> dict[str, Any]:
-    """Require exact main SHORT plus a merged PR's pre-merge LONG-tested identical tree."""
+    """Verify exact main SHORT and either a validated PR merge or an authorized direct push."""
     if SHA_RE.fullmatch(source_sha) is None:
         raise CiGateError("Release source SHA is malformed")
     if SHA_RE.fullmatch(expected_workflow_blob_sha) is None:
@@ -299,37 +339,59 @@ def verify_ci_release(
     short_finished = _timestamp(short_run.get("updated_at") or short_run.get("created_at"), "main SHORT")
     short_created = _timestamp(short_run.get("created_at"), "main SHORT creation")
 
-    main_tree = _tree_sha(api_json, source_sha, "main release")
+    source_commit, main_tree = _release_commit(api_json, source_sha)
     associated = api_json(f"/commits/{source_sha}/pulls?per_page=100")
     if not isinstance(associated, list) or len(associated) >= 100:
         raise CiGateError("Merged pull request association is missing, malformed, or truncated")
 
-    eligible_prs: list[dict[str, Any]] = []
+    merged_main_prs: list[dict[str, Any]] = []
     for pr in associated:
         if not isinstance(pr, dict):
             raise CiGateError("Pull request association contains a malformed record")
-        base = pr.get("base")
-        head = pr.get("head")
-        base_repo = base.get("repo") if isinstance(base, dict) else None
-        head_repo = head.get("repo") if isinstance(head, dict) else None
+        if _is_merged_main_pr(pr, repository):
+            merged_main_prs.append(pr)
+
+    matching_merge_commits = [pr for pr in merged_main_prs if pr.get("merge_commit_sha") == source_sha]
+    if merged_main_prs and not matching_merge_commits:
+        raise CiGateError("Release commit is associated with a merged main PR but is not its exact merge commit")
+
+    if not matching_merge_commits:
+        # The Actions API actor/event and GitHub-linked commit identity distinguish a
+        # direct owner push. Commit messages are deliberately not used as evidence.
+        if len(source_commit.get("parents", [])) != 1:
+            raise CiGateError("Direct main push must be a single-parent commit; merge commits require PR evidence")
+        commit_actor_verified = any(
+            isinstance(identity, dict) and identity.get("login") == AUTHORIZED_ACTOR
+            for identity in (source_commit.get("author"), source_commit.get("committer"))
+        )
+        if not commit_actor_verified:
+            raise CiGateError("Direct main push commit has no GitHub-linked owner author or committer")
+        production_change, changed_paths = _production_change(api_json, source_sha)
+        return {
+            "sourceSha": source_sha,
+            "sourceTreeSha": main_tree,
+            "authorizationPath": "authorized-direct-main-push",
+            "shortRunId": selected_short_run_id,
+            "shortRunAttempt": selected_short_attempt,
+            "productionChange": production_change,
+            "changedPaths": changed_paths,
+            "ciWorkflowBlobSha": expected_workflow_blob_sha,
+        }
+
+    eligible_prs: list[dict[str, Any]] = []
+    for pr in matching_merge_commits:
         user = pr.get("user")
+        head = pr.get("head")
+        head_repo = head.get("repo") if isinstance(head, dict) else None
         if (
-            pr.get("state") == "closed"
-            and pr.get("merged_at")
-            and pr.get("merge_commit_sha") == source_sha
-            and isinstance(base, dict)
-            and base.get("ref") == "main"
-            and isinstance(base_repo, dict)
-            and str(base_repo.get("full_name", "")).lower() == repository.lower()
-            and isinstance(head, dict)
+            isinstance(user, dict)
+            and user.get("login") == AUTHORIZED_ACTOR
             and isinstance(head_repo, dict)
             and str(head_repo.get("full_name", "")).lower() == repository.lower()
-            and isinstance(user, dict)
-            and user.get("login") == AUTHORIZED_ACTOR
         ):
             eligible_prs.append(pr)
-    if not eligible_prs:
-        raise CiGateError("Release commit has no merged owner-authored same-repository PR to main")
+    if len(eligible_prs) != len(matching_merge_commits):
+        raise CiGateError("Merged main PR is not owner-authored and same-repository")
 
     proof: tuple[dict[str, Any], dict[str, Any], str] | None = None
     for pr in eligible_prs:
@@ -405,6 +467,7 @@ def verify_ci_release(
     return {
         "sourceSha": source_sha,
         "sourceTreeSha": main_tree,
+        "authorizationPath": "validated-pr-merge",
         "shortRunId": selected_short_run_id,
         "shortRunAttempt": selected_short_attempt,
         "longRunId": _positive_int(long_run.get("id"), "pre-merge LONG run ID"),

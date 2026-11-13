@@ -55,6 +55,23 @@ class WorkflowContractTests(unittest.TestCase):
         with mock.patch.object(deploy, "github_json", return_value={"workflow_runs": [{**good, "actor": {"login": "other"}}]}):
             with self.assertRaisesRegex(deploy.DeploymentError, "authorized actor"):
                 deploy.verify_required_ci(request(), app)
+
+    def test_automatic_production_release_requires_a_positive_production_safety_classification(self):
+        app = dict(CONFIG["applications"]["romanlms-production"])
+        value = request(
+            operation="deploy-stack",
+            app_id="romanlms-production",
+            commit_sha=SHA,
+            release={
+                "mode": "automatic",
+                "trigger_run_id": "67890",
+                "trigger_run_attempt": "2",
+            },
+        )
+        with mock.patch.object(deploy, "verify_ci_release", return_value={"productionChange": False}):
+            with self.assertRaisesRegex(deploy.DeploymentError, "no production application changes"):
+                deploy.verify_required_ci(value, app)
+
     def test_private_release_requires_owner_manual_main_and_successful_ci(self):
         workflow = (ROOT / ".github" / "workflows" / "romanlms-private-deploy.yml").read_text(encoding="utf-8")
         for required in ("github.actor == 'RomanYsrael-cmd'", "github.event_name == 'workflow_dispatch'",
@@ -84,7 +101,7 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertEqual(jobs["send-release"]["permissions"]["actions"], "read")
         self.assertEqual(jobs["send-release"]["permissions"]["pull-requests"], "read")
         publish_steps = jobs["publish-images"]["steps"]
-        proof = next(step for step in publish_steps if step.get("name") == "Verify exact RomanLMS LONG and SHORT proof before image publication")
+        proof = next(step for step in publish_steps if step.get("name") == "Verify exact RomanLMS CI authorization before image publication")
         image_build = next(step for step in publish_steps if step.get("name") == "Build and publish immutable images")
         self.assertLess(publish_steps.index(proof), publish_steps.index(image_build))
         self.assertIn("romanlms_ci_gate.py", proof["run"])

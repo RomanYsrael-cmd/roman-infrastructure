@@ -28,6 +28,7 @@ def _run(*, run_id: int, sha: str, branch: str, profile: str, event: str, create
         "head_sha": sha,
         "head_branch": branch,
         "head_repository": {"full_name": "RomanYsrael-cmd/roman-lms"},
+        "repository": {"full_name": "RomanYsrael-cmd/roman-lms"},
         "actor": {"login": "RomanYsrael-cmd"},
         "event": event,
         "status": "completed",
@@ -94,7 +95,13 @@ class FakeGitHub:
         if normalized.startswith("contents/.github/workflows/ci.yml?"):
             return {"type": "file", "sha": WORKFLOW_BLOB_SHA}
         if normalized == f"commits/{SOURCE_SHA}":
-            return {"sha": SOURCE_SHA, "commit": {"tree": {"sha": self.main_tree}}, "parents": [{"sha": PARENT_SHA}]}
+            return {
+                "sha": SOURCE_SHA,
+                "author": {"login": "RomanYsrael-cmd"},
+                "committer": {"login": "RomanYsrael-cmd"},
+                "commit": {"tree": {"sha": self.main_tree}},
+                "parents": [{"sha": PARENT_SHA}],
+            }
         if normalized == f"commits/{LONG_SHA}":
             return {"sha": LONG_SHA, "commit": {"tree": {"sha": self.candidate_tree}}}
         if normalized.startswith(f"commits/{SOURCE_SHA}/pulls?"):
@@ -127,6 +134,7 @@ class RomanLmsCiReleaseGateTests(unittest.TestCase):
     def test_accepts_exact_short_long_tree_and_production_change(self):
         proof = _verify(FakeGitHub(), short_run_id=SHORT_RUN_ID, short_run_attempt=1)
         self.assertEqual(proof["sourceSha"], SOURCE_SHA)
+        self.assertEqual(proof["authorizationPath"], "validated-pr-merge")
         self.assertEqual(proof["longRunId"], LONG_RUN_ID)
         self.assertEqual(proof["shortRunId"], SHORT_RUN_ID)
         self.assertEqual(proof["pullRequestNumber"], 17)
@@ -177,11 +185,117 @@ class RomanLmsCiReleaseGateTests(unittest.TestCase):
         with self.assertRaisesRegex(CiGateError, "not the latest exact-SHA main SHORT run"):
             _verify(FakeGitHub(), short_run_id=SHORT_RUN_ID - 1, short_run_attempt=1)
 
-    def test_direct_main_commit_without_a_merged_owner_pr_is_blocked(self):
+    def test_authorized_direct_main_short_success_is_eligible_without_long_or_pr(self):
         api = FakeGitHub()
         api.pull_requests = []
-        with self.assertRaisesRegex(CiGateError, "no merged owner-authored same-repository PR"):
+        proof = _verify(api, short_run_id=SHORT_RUN_ID, short_run_attempt=1)
+        self.assertEqual(proof["authorizationPath"], "authorized-direct-main-push")
+        self.assertEqual(proof["shortRunId"], SHORT_RUN_ID)
+        self.assertNotIn("longRunId", proof)
+        self.assertTrue(proof["productionChange"])
+
+    def test_direct_main_push_requires_owner_linked_github_commit_identity(self):
+        api = FakeGitHub()
+        api.pull_requests = []
+        original = api.__class__.__call__
+
+        class UnlinkedCommit(FakeGitHub):
+            def __call__(self, path: str):
+                result = original(self, path)
+                if path.lstrip("/") == f"commits/{SOURCE_SHA}":
+                    result["author"] = {"login": "different-user"}
+                    result["committer"] = None
+                return result
+
+        unlinked = UnlinkedCommit()
+        unlinked.pull_requests = []
+        with self.assertRaisesRegex(CiGateError, "no GitHub-linked owner author or committer"):
+            _verify(unlinked)
+
+    def test_unassociated_merge_commit_is_not_treated_as_a_direct_push(self):
+        original = FakeGitHub.__call__
+
+        class UnassociatedMerge(FakeGitHub):
+            def __call__(self, path: str):
+                result = original(self, path)
+                if path.lstrip("/") == f"commits/{SOURCE_SHA}":
+                    result["parents"].append({"sha": "f" * 40})
+                return result
+
+        api = UnassociatedMerge()
+        api.pull_requests = []
+        with self.assertRaisesRegex(CiGateError, "single-parent commit"):
             _verify(api)
+
+    def test_unauthorized_direct_push_actor_is_blocked(self):
+        api = FakeGitHub()
+        api.pull_requests = []
+        api.short_runs[0]["actor"]["login"] = "unapproved-writer"
+        with self.assertRaisesRegex(CiGateError, "identity does not match"):
+            _verify(api)
+
+    def test_merged_fork_pr_cannot_fall_back_to_direct_push(self):
+        api = FakeGitHub()
+        api.pull_requests[0]["head"]["repo"]["full_name"] = "other/roman-lms"
+        with self.assertRaisesRegex(CiGateError, "owner-authored and same-repository"):
+            _verify(api)
+
+    def test_exact_merged_pr_cannot_fall_back_to_direct_when_long_is_missing(self):
+        api = FakeGitHub()
+        api.long_runs = []
+        with self.assertRaisesRegex(CiGateError, "No exact pre-merge LONG CI run exists"):
+            _verify(api)
+
+    def test_pending_short_run_is_blocked(self):
+        api = FakeGitHub()
+        api.short_runs[0]["status"] = "in_progress"
+        api.short_runs[0]["conclusion"] = None
+        with self.assertRaisesRegex(CiGateError, "did not complete successfully"):
+            _verify(api)
+
+    def test_stale_main_source_sha_is_blocked(self):
+        api = FakeGitHub()
+        original = api.__class__.__call__
+
+        class StaleMain(FakeGitHub):
+            def __call__(self, path: str):
+                if path.lstrip("/") == "branches/main":
+                    return {"commit": {"sha": "f" * 40}}
+                return original(self, path)
+
+        with self.assertRaisesRegex(CiGateError, "not the current canonical main commit"):
+            _verify(StaleMain())
+
+    def test_wrong_workflow_repository_or_branch_is_blocked(self):
+        for field, value in (
+            ("path", ".github/workflows/other.yml"),
+            ("workflow_id", WORKFLOW_ID + 1),
+            ("head_branch", "other"),
+        ):
+            with self.subTest(field=field):
+                api = FakeGitHub()
+                api.short_runs[0][field] = value
+                with self.assertRaises(CiGateError):
+                    _verify(api)
+        api = FakeGitHub()
+        api.short_runs[0]["repository"]["full_name"] = "attacker/roman-lms"
+        with self.assertRaisesRegex(CiGateError, "identity does not match"):
+            _verify(api)
+
+    def test_short_attempt_and_required_job_must_match(self):
+        api = FakeGitHub()
+        with self.assertRaisesRegex(CiGateError, "attempt differs"):
+            _verify(api, short_run_id=SHORT_RUN_ID, short_run_attempt=2)
+        original = api.__class__.__call__
+
+        class FailedRequiredJob(FakeGitHub):
+            def __call__(self, path: str):
+                if path.startswith(f"/actions/runs/{SHORT_RUN_ID}/attempts/1/jobs?"):
+                    return {"total_count": 1, "jobs": [{"name": "CI / required", "status": "completed", "conclusion": "failure"}]}
+                return original(self, path)
+
+        with self.assertRaisesRegex(CiGateError, "did not complete successfully"):
+            _verify(FailedRequiredJob())
 
     def test_short_must_start_after_merge(self):
         api = FakeGitHub()

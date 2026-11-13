@@ -30,5 +30,6 @@ The free-cost assumption depends on GitHub's current public-repository and conta
 - .github/workflows/ci.yml: public-repository test and local container smoke checks
 - .github/workflows/romanlms-smoke-deploy.yml: reusable workflow for a manual RomanLMS deployment
 - examples/romanlms/roman-platform-smoke.yml: caller workflow example, pinned after the reusable workflow commit
+- docs/romanlms-release-policy.md: RomanLMS production CI authorization paths and retained safety gates
 
 See docs/status.md for the verified state and remaining server-side steps.
