@@ -164,7 +164,7 @@
       "workflow_event": "workflow_dispatch",
       "automatic_workflow_event": "workflow_run",
       "automatic_release_enabled": true,
-      "required_ci_workflow_blob_sha": "521ca61f43c766872b5e080e07612979a148bb9f",
+      "required_ci_workflow_blob_sha": "2735e91f2e7f2df6ca1bdf282a105d36641b07e8",
       "production_branch": "main",
       "environment": "production",
       "strategy": "blue-green",
