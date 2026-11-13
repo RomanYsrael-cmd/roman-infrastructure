@@ -121,6 +121,15 @@ class WorkflowContractTests(unittest.TestCase):
             'mode: "0644"',
         ):
             self.assertIn(required, install)
+        playbook = yaml.load(install, Loader=yaml.BaseLoader)
+        tasks = {task["name"]: task for task in playbook[0]["tasks"] if isinstance(task, dict) and task.get("name")}
+        for task_name in (
+            "Install the Python controller",
+            "Install the RomanLMS CI release verifier",
+            "Install the server allowlist",
+        ):
+            with self.subTest(task=task_name):
+                self.assertEqual(tasks[task_name]["ansible.builtin.copy"].get("backup"), "true")
 
     def test_production_profile_is_manual_owner_only_and_server_policy_scoped(self):
         workflow = (ROOT / ".github" / "workflows" / "romanlms-private-deploy.yml").read_text(encoding="utf-8")
