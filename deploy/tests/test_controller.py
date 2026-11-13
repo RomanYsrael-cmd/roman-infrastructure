@@ -34,6 +34,10 @@ CONFIG = json.loads((ROOT / "platform" / "applications.json").read_text(encoding
 SHA = "a" * 40
 WORKFLOW_SHA = "b" * 40
 DIGEST = "c" * 64
+GITHUB_APP_TOKEN_SAMPLE = (
+    "ghs_123456789_eyJhbGciOiJSUzI1NiJ9."
+    "eyJzdWIiOiJhcHA6MTIzNDU2Nzg5In0.signature_part-with-hyphen"
+)
 APP = dict(CONFIG["applications"]["platform-smoke"], allowed_platform_shas=[WORKFLOW_SHA])
 CONFIG["applications"]["platform-smoke"] = APP
 
@@ -168,8 +172,8 @@ def request(**overrides):
         "environment": "production",
         "strategy": "blue-green",
         "image": f"{APP['image_namespace']}@sha256:{DIGEST}",
-        "github_token": "ghs_" + "x" * 32,
-        "registry_token": "ghs_" + "y" * 32,
+        "github_token": GITHUB_APP_TOKEN_SAMPLE,
+        "registry_token": GITHUB_APP_TOKEN_SAMPLE,
         "release": {"run_id": "12345", "run_attempt": "1", "actor": "RomanYsrael-cmd"},
     }
     value.update(overrides)
@@ -181,6 +185,10 @@ class RequestValidationTests(unittest.TestCase):
         app, value = deploy.validate_request(request(), CONFIG)
         self.assertEqual(app["app_id"], "platform-smoke")
         self.assertEqual(value["commit_sha"], SHA)
+
+    def test_rejects_header_injection_in_github_token(self):
+        with self.assertRaisesRegex(deploy.DeploymentError, "GitHub token"):
+            deploy.validate_request(request(github_token=GITHUB_APP_TOKEN_SAMPLE + "\r\nInjected: yes"), CONFIG)
 
     def test_rejects_non_allowlisted_repository(self):
         with self.assertRaisesRegex(deploy.DeploymentError, "Repository is not authorized"):
@@ -282,7 +290,7 @@ class RequestValidationTests(unittest.TestCase):
         )
         value.pop("image")
         value.pop("strategy")
-        value["registry_token"] = "ghs_" + "z" * 32
+        value["registry_token"] = GITHUB_APP_TOKEN_SAMPLE
         selected, accepted = deploy.validate_request(value, config)
         self.assertEqual(selected["app_id"], "romanlms-phase6-backend")
         self.assertEqual(accepted["migration_image"], f"{app['migration_image_namespace']}@sha256:{DIGEST}")
@@ -304,7 +312,7 @@ class RequestValidationTests(unittest.TestCase):
         )
         value.pop("image")
         value.pop("strategy")
-        value["registry_token"] = "ghs_" + "z" * 32
+        value["registry_token"] = GITHUB_APP_TOKEN_SAMPLE
         with self.assertRaisesRegex(deploy.DeploymentError, "allowlisted GHCR package"):
             deploy.validate_request(value, config)
 
@@ -1154,7 +1162,7 @@ class RomanLmsProductionPolicyTests(unittest.TestCase):
             "commit_sha": SHA, "workflow_sha": SHA,
             "platform_sha": self.app["allowed_platform_shas"][0], "environment": self.app["environment"],
             "release": {"run_id": "12345", "run_attempt": "1", "actor": "RomanYsrael-cmd"},
-            "github_token": "ghs_" + "x" * 32,
+            "github_token": GITHUB_APP_TOKEN_SAMPLE,
         }
         lock = mock.Mock()
         with mock.patch.object(deploy, "_lock", return_value=lock), mock.patch.object(deploy, "preflight") as preflight, \

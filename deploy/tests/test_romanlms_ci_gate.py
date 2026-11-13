@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "controller"))
-from romanlms_ci_gate import CiGateError, verify_ci_release
+from romanlms_ci_gate import CiGateError, _valid_github_token, verify_ci_release
 
 
 SOURCE_SHA = "a" * 40
@@ -194,6 +194,23 @@ class RomanLmsCiReleaseGateTests(unittest.TestCase):
         api.long_runs[0]["updated_at"] = "2026-11-12T11:01:00Z"
         with self.assertRaisesRegex(CiGateError, "did not pass before the pull request was merged"):
             _verify(api)
+
+
+class GitHubReadTokenValidationTests(unittest.TestCase):
+    def test_accepts_stateless_github_app_installation_jwt_format(self):
+        token = (
+            "ghs_123456789_eyJhbGciOiJSUzI1NiJ9."
+            "eyJzdWIiOiJhcHA6MTIzNDU2Nzg5In0.signature_part-with-hyphen"
+        )
+        self.assertTrue(_valid_github_token(token))
+
+    def test_accepts_legacy_github_installation_token_format(self):
+        self.assertTrue(_valid_github_token("ghs_" + "a" * 40))
+
+    def test_rejects_short_or_header_injection_tokens(self):
+        for token in ("too-short", "g" * 40 + "\r\nInjected: yes"):
+            with self.subTest(token=repr(token)):
+                self.assertFalse(_valid_github_token(token))
 
 
 if __name__ == "__main__":
