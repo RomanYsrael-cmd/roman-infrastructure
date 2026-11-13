@@ -21,10 +21,18 @@ CI_JOB_NAME = "CI / required"
 CI_RUN_TITLE_PREFIX = "RomanLMS CI"
 CANONICAL_REPOSITORY = "RomanYsrael-cmd/roman-lms"
 AUTHORIZED_ACTOR = "RomanYsrael-cmd"
+# GitHub App installation tokens may use the stateless `ghs_<app-id>_<jwt>` format.
+# Compact JWTs use dots and base64url permits hyphens and underscores.
+GITHUB_TOKEN_RE = re.compile(r"^[A-Za-z0-9_.-]{20,8192}$")
 
 
 class CiGateError(ValueError):
     """A missing or unverifiable LONG/SHORT CI release proof."""
+
+
+def _valid_github_token(token: str) -> bool:
+    """Accept opaque GitHub installation tokens without permitting header controls."""
+    return bool(GITHUB_TOKEN_RE.fullmatch(token))
 
 
 def _timestamp(value: Any, label: str) -> datetime:
@@ -458,7 +466,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output", type=Path)
     args = parser.parse_args(argv)
     token = os.environ.get(args.token_env, "")
-    if not re.fullmatch(r"[A-Za-z0-9_]{20,8192}", token):
+    if not _valid_github_token(token):
         print("RomanLMS CI release gate failed: GitHub read token is missing or malformed", file=sys.stderr)
         return 1
     try:
