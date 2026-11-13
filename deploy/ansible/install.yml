@@ -499,7 +499,7 @@
         mode: "0644"
       tags: [romanlms-recovery-controller]
 
-    - name: Install the RomanLMS LONG and SHORT CI proof verifier
+    - name: Install the RomanLMS CI release verifier
       ansible.builtin.copy:
         src: "{{ platform_repo_root }}/deploy/controller/romanlms_ci_gate.py"
         dest: "{{ platform_root }}/controller/romanlms_ci_gate.py"

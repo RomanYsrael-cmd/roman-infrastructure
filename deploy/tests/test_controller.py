@@ -105,6 +105,8 @@ class WorkflowContractTests(unittest.TestCase):
         image_build = next(step for step in publish_steps if step.get("name") == "Build and publish immutable images")
         self.assertLess(publish_steps.index(proof), publish_steps.index(image_build))
         self.assertIn("romanlms_ci_gate.py", proof["run"])
+        self.assertIn("authorized-direct-main-push", proof["run"])
+        self.assertIn("intentionally has reduced test coverage", proof["run"])
         release_script = jobs["send-release"]["steps"][0]["run"]
         self.assertIn("commit_sha=$env:SOURCE_SHA", release_script)
         self.assertIn("trigger_run_id=$env:TRIGGER_RUN_ID", release_script)
