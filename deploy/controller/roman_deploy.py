@@ -319,7 +319,7 @@ def verify_required_ci(request: dict[str, Any], app: dict[str, Any]) -> None:
                 short_run_attempt=int(release["trigger_run_attempt"]) if release.get("mode") == "automatic" else None,
             )
         except (CiGateError, ValueError, TypeError) as exc:
-            raise DeploymentError(f"RomanLMS LONG/SHORT CI release proof failed: {exc}") from exc
+            raise DeploymentError(f"RomanLMS CI release authorization failed: {exc}") from exc
         if release.get("mode") == "automatic" and proof.get("productionChange") is not True:
             raise DeploymentError("Automatic release has no production application changes.")
         return

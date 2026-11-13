@@ -194,7 +194,7 @@ jobs:
           } finally { Pop-Location }
           if ($LASTEXITCODE -ne 0) { throw 'Controller policy tests failed.' }
 
-      - name: Verify exact RomanLMS LONG and SHORT proof before image publication
+      - name: Verify exact RomanLMS CI authorization before image publication
         if: ${{ inputs.app_id == 'romanlms-production' }}
         run: |
           $ErrorActionPreference = 'Stop'
@@ -212,10 +212,17 @@ jobs:
             $gateArguments += @('--short-run-id', $env:TRIGGER_RUN_ID, '--short-run-attempt', $env:TRIGGER_RUN_ATTEMPT)
           }
           $proofText = & python @gateArguments
-          if ($LASTEXITCODE -ne 0) { throw 'Exact LONG and SHORT CI verification failed before image builds.' }
+          if ($LASTEXITCODE -ne 0) { throw 'Exact source CI authorization failed before image builds.' }
           $proof = $proofText | ConvertFrom-Json
           if ($env:RELEASE_MODE -eq 'automatic' -and $proof.productionChange -ne $true) { throw 'No production application change is eligible for automatic image publication.' }
-          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value ('Verified RomanLMS release proof: LONG run ' + $proof.longRunId + ', SHORT run ' + $proof.shortRunId + ', source tree ' + $proof.sourceTreeSha + ', production change ' + $proof.productionChange + '.')
+          if ($proof.authorizationPath -eq 'validated-pr-merge') {
+            $releaseEvidence = 'Validated PR merge: LONG run ' + $proof.longRunId + ' and exact-main SHORT run ' + $proof.shortRunId + '.'
+          } elseif ($proof.authorizationPath -eq 'authorized-direct-main-push') {
+            $releaseEvidence = 'Authorized direct-main push: exact-main SHORT run ' + $proof.shortRunId + ' only; this path intentionally has reduced test coverage.'
+          } else {
+            throw 'The controller returned an unknown RomanLMS release authorization path.'
+          }
+          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value ('Verified RomanLMS release proof. ' + $releaseEvidence + ' Source tree ' + $proof.sourceTreeSha + '; production change ' + $proof.productionChange + '.')
 
       - name: Build and publish immutable images
         id: images
