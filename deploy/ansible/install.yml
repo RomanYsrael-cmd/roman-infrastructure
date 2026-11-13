@@ -497,6 +497,7 @@
         owner: root
         group: root
         mode: "0644"
+        backup: true
       tags: [romanlms-recovery-controller]
 
     - name: Install the RomanLMS CI release verifier
@@ -506,6 +507,7 @@
         owner: root
         group: root
         mode: "0644"
+        backup: true
       tags: [romanlms-recovery-controller]
 
     - name: Install the restricted command wrapper
@@ -605,6 +607,7 @@
         owner: root
         group: root
         mode: "0644"
+        backup: true
       tags: [romanlms-recovery-controller]
 
     - name: Create the restricted deployment account
