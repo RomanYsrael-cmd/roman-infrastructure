@@ -1041,6 +1041,7 @@ class RomanLmsProductionPolicyTests(unittest.TestCase):
             "df2711da492189c5e092338c92548c40011d1926",
             "dbe279fc2f67b3f5dbddd8b7e1eac8fffcd1a3ab",
             "55b1664f281fbc6a3530f54ac073a7ebc6de445c",
+            "6b4a259d625b8a27aebbbc864c3c66926900aec8",
         ])
         self.assertEqual(
             self.app["required_ci_workflow_blob_sha"],
