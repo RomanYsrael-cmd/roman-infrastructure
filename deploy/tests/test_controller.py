@@ -745,7 +745,8 @@ class FlywayMigrationPolicyTests(unittest.TestCase):
         with mock.patch.object(deploy, "run_command", return_value=subprocess.CompletedProcess([], 0, "0\n", "")) as run:
             deploy._assert_no_application_writers(self.app, values)
         args = run.call_args.args[0]
-        self.assertIn("app_user=roman_app", args)
+        self.assertTrue(any("usename = 'roman_app'" in arg for arg in args))
+        self.assertNotIn("app_user=roman_app", args)
         self.assertNotIn(values["DB_PASSWORD"], args)
         with mock.patch.object(deploy, "run_command") as run:
             with self.assertRaises(deploy.DeploymentError):

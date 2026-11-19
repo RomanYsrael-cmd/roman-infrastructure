@@ -1558,12 +1558,17 @@ def _assert_no_application_writers(app: dict[str, Any], env_values: dict[str, st
     username = env_values.get("DB_USERNAME", "")
     if not match or not re.fullmatch(r"[A-Za-z0-9_]+", username):
         raise DeploymentError("The production database identity is invalid for writer quiescence checks.")
-    query = "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND usename = :'app_user' AND pid <> pg_backend_pid()"
+    # username is constrained to alphanumeric/underscore characters above, so it
+    # can be embedded as a SQL literal without psql variable interpolation. psql
+    # does not expand :'var' inside a -c command string on all supported versions.
+    query = (
+        "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() "
+        f"AND usename = '{username}' AND pid <> pg_backend_pid()"
+    )
     result = run_command(
         [
             "/usr/sbin/runuser", "-u", "postgres", "--", "/usr/bin/psql",
-            "-d", match.group(1), "-At", "-v", "ON_ERROR_STOP=1",
-            "-v", f"app_user={username}", "-c", query,
+            "-d", match.group(1), "-At", "-v", "ON_ERROR_STOP=1", "-c", query,
         ],
         timeout=15,
     )
