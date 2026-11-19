@@ -462,6 +462,33 @@ class RomanLmsContainerPolicyTests(unittest.TestCase):
         with self.assertRaises(deploy.DeploymentError):
             deploy._verify_flyway_info(json.dumps(mismatched), "132", exceptions, flyway_version="11.14.1", schema_name="roman_lms")
 
+    def test_migration_credentials_are_separate_and_bound_to_the_runtime_database(self):
+        app = copy.deepcopy(CONFIG["applications"]["romanlms-production"])
+        url = "jdbc:postgresql://127.0.0.1:5432/romanlms_prod"
+        runtime = {"DB_URL": url, "DB_USERNAME": "romanlms_runtime", "DB_PASSWORD": "runtime-secret"}
+        valid = {"DB_URL": url, "DB_USERNAME": "romanlms_migrator", "DB_PASSWORD": "migration-secret"}
+        with mock.patch.object(deploy, "_secure_env_file", return_value=Path("/safe/migration.env")) as secure, \
+             mock.patch.object(deploy, "_env_file_values", return_value=valid):
+            path, loaded = deploy._migration_database_env(app, runtime)
+        self.assertEqual(path, Path("/safe/migration.env"))
+        self.assertEqual(loaded, valid)
+        secure.assert_called_once_with("/etc/roman-platform/romanlms-production/migration.env")
+
+        invalid = [
+            {**valid, "DB_URL": "jdbc:postgresql://other-host/other_db"},
+            {**valid, "DB_USERNAME": "romanlms_runtime"},
+            {**valid, "DB_USERNAME": "postgres"},
+            {**valid, "DB_PASSWORD": " "},
+            {**valid, "FLYWAY_LOCATIONS": "filesystem:/tmp/unapproved"},
+            {key: value for key, value in valid.items() if key != "DB_PASSWORD"},
+        ]
+        for values in invalid:
+            with self.subTest(username=values.get("DB_USERNAME"), url=values.get("DB_URL")), \
+                 mock.patch.object(deploy, "_secure_env_file", return_value=Path("/safe/migration.env")), \
+                 mock.patch.object(deploy, "_env_file_values", return_value=values), \
+                 self.assertRaises(deploy.DeploymentError):
+                deploy._migration_database_env(app, runtime)
+
     def test_database_preflight_rejects_missing_or_invalid_connection_before_registry_access(self):
         cases = [
             {"DB_URL": "jdbc:postgresql://db/stage", "DB_USERNAME": "", "DB_PASSWORD": "secret"},
@@ -580,7 +607,11 @@ class FlywayMigrationPolicyTests(unittest.TestCase):
                  "DB_URL": "jdbc:postgresql://127.0.0.1:5432/romanlms_prod",
                  "DB_USERNAME": "roman_app",
                  "DB_PASSWORD": "local-test-secret",
-             }), mock.patch.object(deploy, "registry_session", return_value=contextlib.nullcontext({})), \
+             }), mock.patch.object(deploy, "_migration_database_env", return_value=(Path("/safe/migration.env"), {
+                 "DB_URL": "jdbc:postgresql://127.0.0.1:5432/romanlms_prod",
+                 "DB_USERNAME": "romanlms_migrator",
+                 "DB_PASSWORD": "local-migration-secret",
+             })), mock.patch.object(deploy, "registry_session", return_value=contextlib.nullcontext({})), \
              mock.patch.object(deploy, "run_command", side_effect=commands), \
              mock.patch.object(deploy, "_verify_image"), mock.patch.object(deploy, "_append_audit"), \
              mock.patch.object(deploy, "_read_state", return_value={}), mock.patch.object(deploy, "_write_metrics"):
@@ -593,7 +624,11 @@ class FlywayMigrationPolicyTests(unittest.TestCase):
                  "DB_URL": "jdbc:postgresql://127.0.0.1:5432/romanlms_prod",
                  "DB_USERNAME": "roman_app",
                  "DB_PASSWORD": "local-test-secret",
-             }), mock.patch.object(deploy, "registry_session", return_value=contextlib.nullcontext({})), \
+             }), mock.patch.object(deploy, "_migration_database_env", return_value=(Path("/safe/migration.env"), {
+                 "DB_URL": "jdbc:postgresql://127.0.0.1:5432/romanlms_prod",
+                 "DB_USERNAME": "romanlms_migrator",
+                 "DB_PASSWORD": "local-migration-secret",
+             })), mock.patch.object(deploy, "registry_session", return_value=contextlib.nullcontext({})), \
              mock.patch.object(deploy, "run_command", side_effect=commands), \
              mock.patch.object(deploy, "_verify_image"), mock.patch.object(deploy, "_append_audit"), \
              mock.patch.object(deploy, "_read_state", return_value={}), mock.patch.object(deploy, "_write_metrics"):
@@ -606,7 +641,9 @@ class FlywayMigrationPolicyTests(unittest.TestCase):
         self.assertIn("--read-only", args)
         self.assertIn("--cap-drop", args)
         self.assertEqual(args[args.index("--env") + 1], "EXPECTED_TARGET_VERSION=133")
-        self.assertEqual(args[-2:], [request_value["migration_image"], "migrate"])
+        self.assertEqual(args[-3:], [request_value["migration_image"], '-initSql=SET ROLE "romanlms_app"', "migrate"])
+        validate_args = deploy._flyway_container_args(request_value, self.app, Path("/safe/database.env"), "validate")
+        self.assertNotIn('-initSql=SET ROLE "romanlms_app"', validate_args)
         with self.assertRaises(deploy.DeploymentError):
             deploy._flyway_container_args(request_value, self.app, Path("/safe/database.env"), "repair")
 
@@ -621,13 +658,18 @@ class FlywayMigrationPolicyTests(unittest.TestCase):
             missing,
             subprocess.CompletedProcess([], 0, "migrated", ""),
         ]) as run, mock.patch.object(deploy, "_append_audit"):
-            deploy._run_approved_migration(request_value, self.app, Path("/safe/database.env"), {
+            deploy._run_approved_migration(request_value, self.app, Path("/safe/migration.env"), {
                 "DB_URL": "jdbc:postgresql://127.0.0.1:5432/romanlms_prod",
-                "DB_USERNAME": "roman_app",
-                "DB_PASSWORD": "secret",
+                "DB_USERNAME": "romanlms_migrator",
+                "DB_PASSWORD": "migration-secret",
             })
         self.assertIn("--name", run.call_args_list[1].args[0])
         self.assertIn("romanlms-flyway-123-2", run.call_args_list[1].args[0])
+        command_args = run.call_args_list[1].args[0]
+        self.assertEqual(Path(command_args[command_args.index("--env-file") + 1]), Path("/safe/migration.env"))
+        self.assertEqual(run.call_args_list[1].kwargs["redactions"], (
+            "jdbc:postgresql://127.0.0.1:5432/romanlms_prod", "romanlms_migrator", "migration-secret",
+        ))
 
         with mock.patch.object(deploy, "run_command", side_effect=[
             missing,
@@ -636,10 +678,10 @@ class FlywayMigrationPolicyTests(unittest.TestCase):
             missing,
         ]) as run, mock.patch.object(deploy, "_append_audit"):
             with self.assertRaisesRegex(deploy.DeploymentError, "timed out"):
-                deploy._run_approved_migration(request_value, self.app, Path("/safe/database.env"), {
+                deploy._run_approved_migration(request_value, self.app, Path("/safe/migration.env"), {
                     "DB_URL": "jdbc:postgresql://127.0.0.1:5432/romanlms_prod",
-                    "DB_USERNAME": "roman_app",
-                    "DB_PASSWORD": "secret",
+                    "DB_USERNAME": "romanlms_migrator",
+                    "DB_PASSWORD": "migration-secret",
                 })
         self.assertEqual(run.call_args_list[2].args[0][:4], ["docker", "rm", "--force", "romanlms-flyway-123-2"])
 
@@ -650,10 +692,10 @@ class FlywayMigrationPolicyTests(unittest.TestCase):
             missing,
         ]) as run, mock.patch.object(deploy, "_append_audit"):
             with self.assertRaisesRegex(deploy.DeploymentError, "migration failed"):
-                deploy._run_approved_migration(request_value, self.app, Path("/safe/database.env"), {
+                deploy._run_approved_migration(request_value, self.app, Path("/safe/migration.env"), {
                     "DB_URL": "jdbc:postgresql://127.0.0.1:5432/romanlms_prod",
-                    "DB_USERNAME": "roman_app",
-                    "DB_PASSWORD": "secret",
+                    "DB_USERNAME": "romanlms_migrator",
+                    "DB_PASSWORD": "migration-secret",
                 })
         self.assertEqual(run.call_args_list[2].args[0][:4], ["docker", "rm", "--force", "romanlms-flyway-123-2"])
 
@@ -670,28 +712,28 @@ class FlywayMigrationPolicyTests(unittest.TestCase):
             deploy.DeploymentError("docker daemon unavailable"),
         ]), mock.patch.object(deploy, "_append_audit"):
             with self.assertRaises(deploy.MigrationOutcomeUnknown):
-                deploy._run_approved_migration(request_value, self.app, Path("/safe/database.env"), {
+                deploy._run_approved_migration(request_value, self.app, Path("/safe/migration.env"), {
                     "DB_URL": "jdbc:postgresql://127.0.0.1:5432/romanlms_prod",
-                    "DB_USERNAME": "roman_app",
-                    "DB_PASSWORD": "secret",
+                    "DB_USERNAME": "romanlms_migrator",
+                    "DB_PASSWORD": "migration-secret",
                 })
 
         with mock.patch.object(deploy, "run_command", return_value=subprocess.CompletedProcess([], 0, "running", "")), \
              mock.patch.object(deploy, "_append_audit"):
             with self.assertRaises(deploy.MigrationOutcomeUnknown):
-                deploy._run_approved_migration(request_value, self.app, Path("/safe/database.env"), {
+                deploy._run_approved_migration(request_value, self.app, Path("/safe/migration.env"), {
                     "DB_URL": "jdbc:postgresql://127.0.0.1:5432/romanlms_prod",
-                    "DB_USERNAME": "roman_app",
-                    "DB_PASSWORD": "secret",
+                    "DB_USERNAME": "romanlms_migrator",
+                    "DB_PASSWORD": "migration-secret",
                 })
 
         with mock.patch.object(deploy, "run_command", side_effect=deploy.DeploymentError("docker daemon unavailable")), \
              mock.patch.object(deploy, "_append_audit"):
             with self.assertRaises(deploy.MigrationOutcomeUnknown):
-                deploy._run_approved_migration(request_value, self.app, Path("/safe/database.env"), {
+                deploy._run_approved_migration(request_value, self.app, Path("/safe/migration.env"), {
                     "DB_URL": "jdbc:postgresql://127.0.0.1:5432/romanlms_prod",
-                    "DB_USERNAME": "roman_app",
-                    "DB_PASSWORD": "secret",
+                    "DB_USERNAME": "romanlms_migrator",
+                    "DB_PASSWORD": "migration-secret",
                 })
 
     def test_fresh_full_backup_is_required_and_its_identity_is_audited(self):
@@ -827,6 +869,7 @@ class StackDeploymentTests(unittest.TestCase):
             mock.patch.object(deploy, "_stop_stack_backend", side_effect=lambda *args: events.append("stop-backend")),
             mock.patch.object(deploy, "_secure_env_file", return_value=Path("/safe/database.env")),
             mock.patch.object(deploy, "_env_file_values", return_value={"DB_URL": "jdbc:postgresql://127.0.0.1:5432/romanlms_prod", "DB_USERNAME": "roman_app", "DB_PASSWORD": "secret"}),
+            mock.patch.object(deploy, "_migration_database_env", return_value=(Path("/safe/migration.env"), {"DB_URL": "jdbc:postgresql://127.0.0.1:5432/romanlms_prod", "DB_USERNAME": "romanlms_migrator", "DB_PASSWORD": "migration-secret"})),
             mock.patch.object(deploy, "_assert_no_application_writers", side_effect=lambda *args: events.append("writers-stopped")),
             mock.patch.object(deploy, "_run_approved_migration", side_effect=lambda *args: events.append("migrate")),
             mock.patch.object(deploy, "_check_backend_start_memory"),
@@ -947,6 +990,7 @@ class StackDeploymentTests(unittest.TestCase):
             mock.patch.object(deploy, "_stop_stack_backend"),
             mock.patch.object(deploy, "_secure_env_file", return_value=Path("/safe/database.env")),
             mock.patch.object(deploy, "_env_file_values", return_value={"DB_URL": "jdbc:postgresql://127.0.0.1:5432/romanlms_prod", "DB_USERNAME": "roman_app", "DB_PASSWORD": "secret"}),
+            mock.patch.object(deploy, "_migration_database_env", return_value=(Path("/safe/migration.env"), {"DB_URL": "jdbc:postgresql://127.0.0.1:5432/romanlms_prod", "DB_USERNAME": "romanlms_migrator", "DB_PASSWORD": "migration-secret"})),
             mock.patch.object(deploy, "_assert_no_application_writers"),
             mock.patch.object(deploy, "_run_approved_migration"),
             mock.patch.object(deploy, "_restart_stack_backend", side_effect=lambda *args: events.append("retained-backend-restored")),
@@ -1507,9 +1551,12 @@ class RomanLmsProductionPolicyTests(unittest.TestCase):
             "target_version": "133",
             "description": "tesda lamr report settings",
             "script": "V133__tesda_lamr_report_settings.sql",
-            "checksum": -664390374,
+            "checksum": 850684505,
+            "execution_role": "romanlms_app",
             "previous_release_compatible": True,
         })
+        self.assertEqual(self.app["migration_database_env_file"], "/etc/roman-platform/romanlms-production/migration.env")
+        self.assertEqual(self.app["migration_database_username"], "romanlms_migrator")
         self.assertEqual(self.app["production_backup"], {
             "config_file": "/etc/pgbackrest/pgbackrest.conf",
             "stanza": "roman-platform",
@@ -1536,6 +1583,9 @@ class RomanLmsProductionPolicyTests(unittest.TestCase):
         unsafe_rollback = copy.deepcopy(self.app)
         unsafe_rollback["schema_migration"]["previous_release_compatible"] = False
         bad_policies.append(unsafe_rollback)
+        unsafe_execution_role = copy.deepcopy(self.app)
+        unsafe_execution_role["schema_migration"]["execution_role"] = 'romanlms_app"; DROP TABLE roman_lms.users; --'
+        bad_policies.append(unsafe_execution_role)
         unprotected_backup = copy.deepcopy(self.app)
         unprotected_backup["production_backup"]["repository"] = True
         bad_policies.append(unprotected_backup)

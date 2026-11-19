@@ -423,6 +423,31 @@ def _env_file_values(path: Path) -> dict[str, str]:
     return values
 
 
+def _migration_database_env(app: dict[str, Any], runtime_values: dict[str, str]) -> tuple[Path, dict[str, str]]:
+    path = _secure_env_file(app.get("migration_database_env_file"))
+    values = _env_file_values(path)
+    required = {"DB_URL", "DB_USERNAME", "DB_PASSWORD"}
+    configured_user = app.get("migration_database_username")
+    runtime_user = runtime_values.get("DB_USERNAME", "")
+    expected_url = runtime_values.get("DB_URL", "")
+    allowed_urls = app.get("allowed_database_urls")
+    if (
+        set(values) != required
+        or any(not values.get(key, "").strip() for key in required)
+        or not isinstance(configured_user, str)
+        or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,62}", configured_user)
+        or configured_user != "romanlms_migrator"
+        or values.get("DB_USERNAME") != configured_user
+        or configured_user == runtime_user
+        or not re.fullmatch(r"jdbc:postgresql://[^\s/]+/[A-Za-z0-9_]+", values.get("DB_URL", ""))
+        or values.get("DB_URL") != expected_url
+        or not isinstance(allowed_urls, list)
+        or values.get("DB_URL") not in allowed_urls
+    ):
+        raise DeploymentError("The dedicated migration database credentials are invalid or target a different database.")
+    return path, values
+
+
 def _image_source_revision(request: dict[str, Any], app: dict[str, Any]) -> str:
     if app.get("image_revision_mode", "platform") == "caller":
         return request["commit_sha"]
@@ -1287,7 +1312,7 @@ def _schema_migration_policy(app: dict[str, Any]) -> dict[str, Any] | None:
         return None
     fields = {
         "source_version", "target_version", "description", "script", "checksum",
-        "previous_release_compatible",
+        "execution_role", "previous_release_compatible",
     }
     if (
         not isinstance(policy, dict)
@@ -1299,6 +1324,8 @@ def _schema_migration_policy(app: dict[str, Any]) -> dict[str, Any] | None:
         or policy["target_version"] != str(app.get("expected_schema_version"))
         or not re.fullmatch(r"V[1-9][0-9]{0,8}__[a-z0-9_]+\.sql", policy["script"])
         or policy["script"].split("__", 1)[0][1:] != policy["target_version"]
+        or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,62}", policy["execution_role"])
+        or policy["execution_role"] != "romanlms_app"
         or not policy["description"].strip()
         or isinstance(policy["checksum"], bool)
         or not isinstance(policy["checksum"], int)
@@ -1411,6 +1438,11 @@ def _flyway_container_args(
         args.extend(["--name", container_name])
     args.append(request["migration_image"])
     args.extend(["info", "-outputType=json"] if command == "info" else [command])
+    if command == "migrate":
+        policy = _schema_migration_policy(app)
+        if policy is None:
+            raise DeploymentError("No production migration is approved for this application.")
+        args[-1:-1] = [f'-initSql=SET ROLE "{policy["execution_role"]}"']
     return args
 
 
@@ -1704,6 +1736,8 @@ def _validate_database(request: dict[str, Any], app: dict[str, Any], *, allow_pe
             migration_pending = True
         else:
             _verify_flyway_info(result.stdout, str(app["expected_schema_version"]), app.get("flyway_history_exceptions"), flyway_version=app["flyway_cli_version"], schema_name=app.get("flyway_schema"))
+        if migration_pending:
+            _migration_database_env(app, env_values)
     duration = round(time.time() - started, 3)
     timestamp = datetime.now(timezone.utc).isoformat()
     _append_audit(app, {
@@ -2204,7 +2238,8 @@ def _deploy_stack(request: dict[str, Any], app: dict[str, Any]) -> dict[str, Any
             migration_started = True
             latest_database_status = _validate_database(request, app, allow_pending_migration=True)
             if latest_database_status["migration_pending"]:
-                _run_approved_migration(request, app, env_file, env_values)
+                migration_env_file, migration_env_values = _migration_database_env(app, env_values)
+                _run_approved_migration(request, app, migration_env_file, migration_env_values)
             _validate_database(request, app)
             _append_audit(app, {
                 "operation": "database-migration",
