@@ -8,6 +8,12 @@ The caller example includes a separate ROLLBACK SMOKE choice. It uses the same p
 
 Application rollback never reverses database migrations. The smoke service has no database. Any future database-backed application requires a backup and forward-compatible migration policy before production rollout.
 
+## RomanLMS production schema migration recovery
+
+The V132-to-V133 production migration is additive and the retained V132 application is approved to run against either the verified V132 source schema or the verified V133 target schema. The release controller records the pgBackRest backup-set label and migration outcome in the production deployment audit.
+
+If the controller cannot establish whether Flyway finished, leave the backend stopped and keep the existing route and release state in place. Do not retry the migration, run `flyway repair`, or edit `flyway_schema_history` while the outcome is uncertain. Use the audited backup-set label and pgBackRest's repository verification to establish the recovery point, restore to an isolated recovery database, and validate its schema and application data before any production restore or route change. Any recovery that would replace or restore the live database must use the separately approved database incident procedure; application rollback alone is not database recovery.
+
 ## RomanLMS private staging rollback
 
 RomanLMS stores a coordinated frontend/backend release in root-controlled state. The supported action is **ROLLBACK PRIVATE ROMANLMS** through the owner-only manual workflow on current `main`. The controller selects only the retained previous pair after checking its component identities, image metadata, schema version, storage mounts, capacity, and health. It validates and reloads the private Nginx include once for the pair, checks both routed components, updates the release pointer, and writes an audit/Prometheus result.

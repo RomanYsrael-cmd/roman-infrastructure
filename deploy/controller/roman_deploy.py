@@ -56,6 +56,10 @@ class DeploymentError(Exception):
     """A safe, user-facing deployment rejection or operational failure."""
 
 
+class MigrationOutcomeUnknown(DeploymentError):
+    """Flyway may still be running, so the old backend must remain stopped."""
+
+
 def _text(value: Any, name: str, limit: int = 160) -> str:
     if not isinstance(value, str) or not value or len(value) > limit or "\n" in value or "\r" in value:
         raise DeploymentError(f"Invalid {name}.")
@@ -1277,7 +1281,371 @@ def _verify_flyway_info(output: str, expected_version: str, allowed_exceptions: 
         raise DeploymentError("Approved migration history exceptions are missing.")
 
 
-def _validate_database(request: dict[str, Any], app: dict[str, Any]) -> dict[str, Any]:
+def _schema_migration_policy(app: dict[str, Any]) -> dict[str, Any] | None:
+    policy = app.get("schema_migration")
+    if policy is None:
+        return None
+    fields = {
+        "source_version", "target_version", "description", "script", "checksum",
+        "previous_release_compatible",
+    }
+    if (
+        not isinstance(policy, dict)
+        or set(policy) != fields
+        or not all(isinstance(policy.get(key), str) for key in ("source_version", "target_version", "description", "script"))
+        or not re.fullmatch(r"(?:0|[1-9][0-9]{0,8})", policy["source_version"])
+        or not re.fullmatch(r"(?:0|[1-9][0-9]{0,8})", policy["target_version"])
+        or int(policy["source_version"]) >= int(policy["target_version"])
+        or policy["target_version"] != str(app.get("expected_schema_version"))
+        or not re.fullmatch(r"V[1-9][0-9]{0,8}__[a-z0-9_]+\.sql", policy["script"])
+        or policy["script"].split("__", 1)[0][1:] != policy["target_version"]
+        or not policy["description"].strip()
+        or isinstance(policy["checksum"], bool)
+        or not isinstance(policy["checksum"], int)
+        or policy["previous_release_compatible"] is not True
+    ):
+        raise DeploymentError("The production schema migration policy is invalid.")
+    backup = app.get("production_backup")
+    if (
+        not isinstance(backup, dict)
+        or set(backup) != {"config_file", "stanza", "repository", "timeout_seconds"}
+        or backup.get("config_file") != "/etc/pgbackrest/pgbackrest.conf"
+        or backup.get("stanza") != "romanlms-prod"
+        or isinstance(backup.get("repository"), bool)
+        or backup.get("repository") != 1
+        or isinstance(backup.get("timeout_seconds"), bool)
+        or not isinstance(backup.get("timeout_seconds"), int)
+        or not 60 <= backup["timeout_seconds"] <= 1800
+    ):
+        raise DeploymentError("The production database backup policy is invalid.")
+    return policy
+
+
+def _verify_flyway_migration_plan(
+    output: str,
+    app: dict[str, Any],
+    allowed_exceptions: list[dict[str, str]] | None = None,
+    *,
+    flyway_version: str | None = None,
+    schema_name: str | None = None,
+) -> None:
+    policy = _schema_migration_policy(app)
+    if policy is None:
+        raise DeploymentError("No production migration is approved for this application.")
+    try:
+        info = json.loads(output)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise DeploymentError("Flyway did not return a valid migration plan.") from exc
+    if not isinstance(info, dict) or str(info.get("schemaVersion")) != policy["source_version"]:
+        raise DeploymentError("The live database is not at the approved migration source version.")
+    if flyway_version and info.get("flywayVersion") != flyway_version:
+        raise DeploymentError("Flyway version does not match the approved release.")
+    if schema_name and info.get("schemaName") != schema_name:
+        raise DeploymentError("Flyway selected an unapproved database schema.")
+    if info.get("warnings") not in (None, []):
+        raise DeploymentError("Flyway reported warnings requiring review.")
+    migrations = info.get("migrations")
+    if not isinstance(migrations, list) or not migrations:
+        raise DeploymentError("Flyway migration history is unavailable.")
+
+    target = {
+        "state": "Pending",
+        "category": "Versioned",
+        "type": "SQL",
+        "version": policy["target_version"],
+        "description": policy["description"],
+        "filepath": f"/flyway/sql/{policy['script']}",
+    }
+    exceptions = list(allowed_exceptions or [])
+    fields = {"state", "category", "type", "version", "description", "filepath"}
+    if any(not isinstance(rule, dict) or set(rule) != fields or any(not isinstance(value, str) for value in rule.values()) for rule in exceptions):
+        raise DeploymentError("The approved migration history exceptions are invalid.")
+    target_count = 0
+    remaining = list(exceptions)
+    for item in migrations:
+        if not isinstance(item, dict) or not isinstance(item.get("state"), str):
+            raise DeploymentError("Flyway migration history is invalid.")
+        if item["state"] == "Pending":
+            if any(item.get(key) != value for key, value in target.items()):
+                raise DeploymentError("Flyway's pending migration differs from the approved release.")
+            if item.get("checksum") is not None and str(item["checksum"]) != str(policy["checksum"]):
+                raise DeploymentError("Flyway's pending migration checksum differs from the approved release.")
+            target_count += 1
+            continue
+        if item["state"] == "Success":
+            continue
+        match = next((rule for rule in remaining if all(item.get(key) == value for key, value in rule.items())), None)
+        if match is None:
+            raise DeploymentError("Flyway history contains an unapproved non-success migration state.")
+        remaining.remove(match)
+    if target_count != 1 or remaining:
+        raise DeploymentError("Flyway's pending migration set does not match the approved release.")
+
+
+def _flyway_container_args(
+    request: dict[str, Any],
+    app: dict[str, Any],
+    env_file: Path,
+    command: str,
+    *,
+    container_name: str | None = None,
+) -> list[str]:
+    if command not in {"validate", "migrate", "info"}:
+        raise DeploymentError("The requested Flyway command is not approved.")
+    if container_name is not None and not re.fullmatch(r"romanlms-flyway-[0-9]{1,20}-[0-9]{1,20}", container_name):
+        raise DeploymentError("The Flyway migration container identity is invalid.")
+    args = [
+        "docker", "run", "--rm", "--read-only",
+        "--network", app["container_network"],
+        "--cap-drop", "ALL",
+        "--security-opt", "no-new-privileges:true",
+        "--pids-limit", "64",
+        "--memory", app.get("migration_memory", "512m"),
+        "--cpus", "1",
+        "--tmpfs", "/tmp:rw,nosuid,nodev,noexec,size=16m,mode=1777",
+        "--env-file", str(env_file),
+        "--env", f"EXPECTED_TARGET_VERSION={app['expected_schema_version']}",
+        "--env", f"FLYWAY_CLI_VERSION={app['flyway_cli_version']}",
+    ]
+    if container_name is not None:
+        args.extend(["--name", container_name])
+    args.append(request["migration_image"])
+    args.extend(["info", "-outputType=json"] if command == "info" else [command])
+    return args
+
+
+def _secure_pgbackrest_config(path: str) -> Path:
+    try:
+        import pwd
+        postgres = pwd.getpwnam("postgres")
+    except (ImportError, KeyError) as exc:
+        raise DeploymentError("The production backup account is unavailable.") from exc
+    config = Path(path)
+    try:
+        metadata = config.lstat()
+    except OSError as exc:
+        raise DeploymentError("The production backup configuration is unavailable.") from exc
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or config.is_symlink()
+        or os.path.realpath(path) != path
+        or metadata.st_uid != postgres.pw_uid
+        or metadata.st_gid != postgres.pw_gid
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+    ):
+        raise DeploymentError("The production backup configuration is not securely protected.")
+    return config
+
+
+def _pgbackrest_json(app: dict[str, Any]) -> list[dict[str, Any]]:
+    policy = app.get("production_backup")
+    if not isinstance(policy, dict):
+        raise DeploymentError("A production database backup is required before migration.")
+    config = _secure_pgbackrest_config(policy.get("config_file", ""))
+    args = [
+        "/usr/sbin/runuser", "-u", "postgres", "--", "/usr/bin/pgbackrest",
+        f"--config={config}", f"--stanza={policy['stanza']}",
+        f"--repo={policy['repository']}", "--output=json", "info",
+    ]
+    result = run_command(args, timeout=60, check=False)
+    if result.returncode != 0:
+        raise DeploymentError("The production backup repository could not be verified.")
+    try:
+        value = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise DeploymentError("The production backup repository returned invalid evidence.") from exc
+    if not isinstance(value, list) or any(not isinstance(item, dict) for item in value):
+        raise DeploymentError("The production backup repository returned invalid evidence.")
+    return value
+
+
+def _ensure_flyway_container_stopped(container_name: str) -> bool:
+    try:
+        removed = run_command(["docker", "rm", "--force", container_name], timeout=30, check=False)
+        inspected = run_command(["docker", "inspect", container_name], timeout=15, check=False)
+    except DeploymentError:
+        return False
+    if inspected.returncode == 0:
+        return False
+    missing_container = (inspected.stderr + inspected.stdout).lower()
+    return removed.returncode == 0 or "no such object" in missing_container or "no such container" in missing_container
+
+
+def _verify_production_backup_integrity(app: dict[str, Any], label: str) -> None:
+    policy = app.get("production_backup")
+    if (
+        not isinstance(policy, dict)
+        or not isinstance(label, str)
+        or not re.fullmatch(r"[0-9]{8}-[0-9]{6}F", label)
+    ):
+        raise DeploymentError("The production backup integrity check is not configured safely.")
+    config = _secure_pgbackrest_config(policy.get("config_file", ""))
+    result = run_command(
+        [
+            "/usr/sbin/runuser", "-u", "postgres", "--", "/usr/bin/pgbackrest",
+            f"--config={config}", f"--stanza={policy['stanza']}", f"--repo={policy['repository']}",
+            f"--set={label}", "verify",
+        ],
+        timeout=policy["timeout_seconds"],
+        check=False,
+    )
+    if result.returncode != 0:
+        raise DeploymentError("Fresh full production backup integrity verification failed; the migration was not started.")
+
+
+def _create_verified_production_backup(app: dict[str, Any], request: dict[str, Any]) -> str:
+    policy = _schema_migration_policy(app)
+    if policy is None:
+        raise DeploymentError("No production migration is approved for this application.")
+    backup_policy = app["production_backup"]
+    config = _secure_pgbackrest_config(backup_policy["config_file"])
+    started = time.time()
+    result = run_command(
+        [
+            "/usr/sbin/runuser", "-u", "postgres", "--", "/usr/bin/pgbackrest", f"--config={config}",
+            f"--stanza={backup_policy['stanza']}", f"--repo={backup_policy['repository']}",
+            "--type=full", "backup",
+        ],
+        timeout=backup_policy["timeout_seconds"],
+        check=False,
+    )
+    if result.returncode != 0:
+        raise DeploymentError("A fresh full production backup failed; the migration was not started.")
+    stanzas = _pgbackrest_json(app)
+    stanza = next((item for item in stanzas if item.get("name") == backup_policy["stanza"]), None)
+    backups = stanza.get("backup") if isinstance(stanza, dict) else None
+    if not isinstance(backups, list):
+        raise DeploymentError("The production backup repository did not record the new backup.")
+    fresh = []
+    for item in backups:
+        timestamp = item.get("timestamp") if isinstance(item, dict) else None
+        if not isinstance(timestamp, dict):
+            continue
+        start_time, stop_time = timestamp.get("start"), timestamp.get("stop")
+        if (
+            item.get("type") == "full"
+            and isinstance(start_time, (int, float))
+            and isinstance(stop_time, (int, float))
+            and start_time >= started - 10
+            and stop_time >= start_time
+            and stop_time <= time.time() + 10
+        ):
+            fresh.append(item)
+    if not fresh:
+        raise DeploymentError("The fresh full production backup could not be verified; the migration was not started.")
+    backup = max(fresh, key=lambda item: item["timestamp"]["stop"])
+    label = backup.get("label")
+    if not isinstance(label, str) or not re.fullmatch(r"[0-9]{8}-[0-9]{6}F", label):
+        raise DeploymentError("The fresh full production backup identity is invalid; the migration was not started.")
+    _verify_production_backup_integrity(app, label)
+    _append_audit(app, {
+        "operation": "database-backup",
+        "outcome": "success",
+        "backup_label": label,
+        "backup_type": "full",
+        "schema_source_version": policy["source_version"],
+        "schema_target_version": policy["target_version"],
+        "commit_sha": request["commit_sha"],
+        "workflow_run_id": request["release"]["run_id"],
+        "actor": request["release"]["actor"],
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    })
+    return label
+
+
+def _assert_no_application_writers(app: dict[str, Any], env_values: dict[str, str]) -> None:
+    match = re.fullmatch(r"jdbc:postgresql://[^/]+/([A-Za-z0-9_]+)", env_values.get("DB_URL", ""))
+    username = env_values.get("DB_USERNAME", "")
+    if not match or not re.fullmatch(r"[A-Za-z0-9_]+", username):
+        raise DeploymentError("The production database identity is invalid for writer quiescence checks.")
+    query = "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND usename = :'app_user' AND pid <> pg_backend_pid()"
+    result = run_command(
+        [
+            "/usr/sbin/runuser", "-u", "postgres", "--", "/usr/bin/psql",
+            "-d", match.group(1), "-At", "-v", "ON_ERROR_STOP=1",
+            "-v", f"app_user={username}", "-c", query,
+        ],
+        timeout=15,
+    )
+    try:
+        writer_count = int(result.stdout.strip())
+    except ValueError as exc:
+        raise DeploymentError("The production database writer state could not be verified.") from exc
+    if writer_count != 0:
+        raise DeploymentError("RomanLMS database writers remain active; the migration was not started.")
+
+
+def _run_approved_migration(request: dict[str, Any], app: dict[str, Any], env_file: Path, env_values: dict[str, str]) -> None:
+    policy = _schema_migration_policy(app)
+    if policy is None:
+        raise DeploymentError("No production migration is approved for this application.")
+    release = request.get("release")
+    if not isinstance(release, dict):
+        raise DeploymentError("Approved migration release identity is unavailable.")
+    run_id, run_attempt = release.get("run_id"), release.get("run_attempt")
+    if (
+        not isinstance(run_id, str)
+        or not run_id.isdigit()
+        or len(run_id) > 20
+        or not isinstance(run_attempt, str)
+        or not run_attempt.isdigit()
+        or len(run_attempt) > 20
+    ):
+        raise DeploymentError("Approved migration release identity is invalid.")
+    container_name = f"romanlms-flyway-{run_id}-{run_attempt}"
+    audit_event = {
+        "operation": "database-migration",
+        "schema_source_version": policy["source_version"],
+        "schema_target_version": policy["target_version"],
+        "migration_script": policy["script"],
+        "migration_checksum": policy["checksum"],
+        "commit_sha": request["commit_sha"],
+        "migration_image": request["migration_image"],
+        "workflow_run_id": run_id,
+        "workflow_run_attempt": run_attempt,
+        "actor": release.get("actor", ""),
+    }
+    try:
+        existing = run_command(["docker", "inspect", container_name], timeout=15, check=False)
+    except DeploymentError as exc:
+        _append_audit(app, {**audit_event, "outcome": "unknown", "timestamp": datetime.now(timezone.utc).isoformat()})
+        raise MigrationOutcomeUnknown("The Flyway migration container state could not be verified.") from exc
+    if existing.returncode == 0:
+        _append_audit(app, {**audit_event, "outcome": "unknown", "timestamp": datetime.now(timezone.utc).isoformat()})
+        raise MigrationOutcomeUnknown("A Flyway migration container already exists; its database outcome must be verified.")
+    missing_container = (existing.stderr + existing.stdout).lower()
+    if not ("no such object" in missing_container or "no such container" in missing_container):
+        _append_audit(app, {**audit_event, "outcome": "unknown", "timestamp": datetime.now(timezone.utc).isoformat()})
+        raise MigrationOutcomeUnknown("The Flyway migration container state could not be verified.")
+
+    _append_audit(app, {**audit_event, "outcome": "started", "timestamp": datetime.now(timezone.utc).isoformat()})
+    try:
+        result = run_command(
+            _flyway_container_args(request, app, env_file, "migrate", container_name=container_name),
+            timeout=int(app.get("migration_timeout_seconds", 180)),
+            check=False,
+            redactions=(env_values["DB_URL"], env_values["DB_USERNAME"], env_values["DB_PASSWORD"]),
+        )
+    except DeploymentError as exc:
+        if not _ensure_flyway_container_stopped(container_name):
+            _append_audit(app, {**audit_event, "outcome": "unknown", "timestamp": datetime.now(timezone.utc).isoformat()})
+            raise MigrationOutcomeUnknown("The migration outcome is unknown and its container could not be confirmed stopped.") from exc
+        _append_audit(app, {**audit_event, "outcome": "failed", "timestamp": datetime.now(timezone.utc).isoformat()})
+        raise
+    if result.returncode != 0:
+        if not _ensure_flyway_container_stopped(container_name):
+            _append_audit(app, {**audit_event, "outcome": "unknown", "timestamp": datetime.now(timezone.utc).isoformat()})
+            raise MigrationOutcomeUnknown("The migration outcome is unknown and its container could not be confirmed stopped.")
+        _append_audit(app, {**audit_event, "outcome": "failed", "timestamp": datetime.now(timezone.utc).isoformat()})
+        raise DeploymentError("The approved Flyway migration failed; no repair or history edit was attempted.")
+    _append_audit(app, {
+        **audit_event,
+        "outcome": "success",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    })
+
+
+def _validate_database(request: dict[str, Any], app: dict[str, Any], *, allow_pending_migration: bool = False) -> dict[str, Any]:
     env_file = _secure_env_file(app.get("database_env_file"))
     env_values = _env_file_values(env_file)
     required = {"DB_URL", "DB_USERNAME", "DB_PASSWORD"}
@@ -1291,43 +1659,50 @@ def _validate_database(request: dict[str, Any], app: dict[str, Any]) -> dict[str
     if allowed_urls is not None and (not isinstance(allowed_urls, list) or env_values["DB_URL"] not in allowed_urls):
         raise DeploymentError("The database destination is not allowlisted.")
     image = request["migration_image"]
+    migration_policy = _schema_migration_policy(app)
     started = time.time()
     with registry_session(app, request) as env:
         run_command(["docker", "pull", image], env=env, timeout=600)
         _verify_image(image, request, app, env)
-        args = [
-            "docker", "run", "--rm", "--read-only",
-            "--network", app["container_network"],
-            "--cap-drop", "ALL",
-            "--security-opt", "no-new-privileges:true",
-            "--pids-limit", "64",
-            "--memory", app.get("migration_memory", "512m"),
-            "--cpus", "1",
-            "--tmpfs", "/tmp:rw,nosuid,nodev,noexec,size=16m,mode=1777",
-            "--env-file", str(env_file),
-            "--env", f"EXPECTED_TARGET_VERSION={app['expected_schema_version']}",
-            "--env", f"FLYWAY_CLI_VERSION={app['flyway_cli_version']}",
-            image,
-            "validate",
-        ]
+        args = _flyway_container_args(request, app, env_file, "validate")
         run_command(
             args,
             env=env,
             timeout=int(app.get("migration_timeout_seconds", 180)),
             redactions=(env_values["DB_URL"], env_values["DB_USERNAME"], env_values["DB_PASSWORD"]),
         )
-        info_args = args[:-1] + ["info", "-outputType=json"]
+        info_args = _flyway_container_args(request, app, env_file, "info")
         result = run_command(
             info_args,
             env=env,
             timeout=int(app.get("migration_timeout_seconds", 180)),
             redactions=(env_values["DB_URL"], env_values["DB_USERNAME"], env_values["DB_PASSWORD"]),
         )
-        _verify_flyway_info(result.stdout, str(app["expected_schema_version"]), app.get("flyway_history_exceptions"), flyway_version=app["flyway_cli_version"], schema_name=app.get("flyway_schema"))
+        migration_pending = False
+        try:
+            info = json.loads(result.stdout)
+        except json.JSONDecodeError:
+            info = None
+        if (
+            allow_pending_migration
+            and migration_policy is not None
+            and isinstance(info, dict)
+            and str(info.get("schemaVersion")) == migration_policy["source_version"]
+        ):
+            _verify_flyway_migration_plan(
+                result.stdout,
+                app,
+                app.get("flyway_history_exceptions"),
+                flyway_version=app["flyway_cli_version"],
+                schema_name=app.get("flyway_schema"),
+            )
+            migration_pending = True
+        else:
+            _verify_flyway_info(result.stdout, str(app["expected_schema_version"]), app.get("flyway_history_exceptions"), flyway_version=app["flyway_cli_version"], schema_name=app.get("flyway_schema"))
     duration = round(time.time() - started, 3)
     timestamp = datetime.now(timezone.utc).isoformat()
     _append_audit(app, {
-        "operation": "validate-database",
+        "operation": "deploy-database-preflight" if allow_pending_migration else "validate-database",
         "outcome": "success",
         "commit_sha": request["commit_sha"],
         "migration_image": image,
@@ -1343,7 +1718,7 @@ def _validate_database(request: dict[str, Any], app: dict[str, Any]) -> dict[str
             app,
             _read_state(app["state_file"]),
             "success",
-            "validate-database",
+            "deploy-database-preflight" if allow_pending_migration else "validate-database",
             duration,
             request["release"]["run_id"],
             request["commit_sha"],
@@ -1356,6 +1731,7 @@ def _validate_database(request: dict[str, Any], app: dict[str, Any]) -> dict[str
         "operation": "validate-database",
         "expected_schema_version": str(app["expected_schema_version"]),
         "migration_image": image,
+        "migration_pending": migration_pending,
         "metrics_warning": metrics_warning,
     }
 
@@ -1757,7 +2133,7 @@ def _switch_stack_route(app: dict[str, Any], slot: str) -> None:
 
 def _deploy_stack(request: dict[str, Any], app: dict[str, Any]) -> dict[str, Any]:
     started = time.time()
-    _validate_database(request, app)
+    database_status = _validate_database(request, app, allow_pending_migration=True)
     state_path = Path(app["state_file"])
     state = _read_state(str(state_path))
     active = state.get("active")
@@ -1795,13 +2171,6 @@ def _deploy_stack(request: dict[str, Any], app: dict[str, Any]) -> dict[str, Any
             image = request["images"][name]
             run_command(["docker", "pull", image], env=env, timeout=600)
             _verify_image(image, request, app, env)
-    _append_audit(app, {"operation": "deploy-stack", "outcome": "started", "commit_sha": request["commit_sha"], "images": request["images"], "platform_sha": request["platform_sha"], "slot": slot, "workflow_run_id": request["release"]["run_id"], "actor": request["release"]["actor"], "timestamp": datetime.now(timezone.utc).isoformat()})
-    if state.get("previous"):
-        # The candidate reuses the retained slot. Clear the pointer before removing
-        # anything so an interrupted cleanup cannot advertise a nonexistent rollback.
-        state["previous"] = None
-        require_storage_mounts(app)
-        _atomic_write(state_path, json.dumps(state, indent=2, sort_keys=True) + "\n")
     route_path = Path(app["route_file"])
     prior_route = route_path.read_text(encoding="utf-8")
     prior_state = state_path.read_text(encoding="utf-8") if state_path.exists() else None
@@ -1809,7 +2178,46 @@ def _deploy_stack(request: dict[str, Any], app: dict[str, Any]) -> dict[str, Any
     route_switched = False
     backend_maintenance = app.get("single_backend_maintenance") is True and active is not None
     records: dict[str, Any] = {}
+    migration_started = False
     try:
+        if database_status["migration_pending"]:
+            if app.get("single_backend_maintenance") is not True:
+                raise DeploymentError("Production migration requires the approved single-backend maintenance policy.")
+            migration_policy = _schema_migration_policy(app)
+            if migration_policy is None:
+                raise DeploymentError("No production migration is approved for this application.")
+            if active and active.get("schema_version") != migration_policy["source_version"]:
+                raise DeploymentError("The retained application release is not on the approved migration source schema.")
+            backup_label = _create_verified_production_backup(app, request)
+            if active:
+                _stop_stack_backend(app, active)
+            env_file = _secure_env_file(app.get("database_env_file"))
+            env_values = _env_file_values(env_file)
+            _assert_no_application_writers(app, env_values)
+            # Re-read the exact pending plan after backup and writer quiescence.
+            # The initial preflight may be stale by the time migration can start.
+            migration_started = True
+            latest_database_status = _validate_database(request, app, allow_pending_migration=True)
+            if latest_database_status["migration_pending"]:
+                _run_approved_migration(request, app, env_file, env_values)
+            _validate_database(request, app)
+            _append_audit(app, {
+                "operation": "database-migration",
+                "outcome": "verified",
+                "backup_label": backup_label,
+                "schema_version": str(app["expected_schema_version"]),
+                "commit_sha": request["commit_sha"],
+                "workflow_run_id": request["release"]["run_id"],
+                "actor": request["release"]["actor"],
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            })
+        _append_audit(app, {"operation": "deploy-stack", "outcome": "started", "commit_sha": request["commit_sha"], "images": request["images"], "platform_sha": request["platform_sha"], "slot": slot, "workflow_run_id": request["release"]["run_id"], "actor": request["release"]["actor"], "timestamp": datetime.now(timezone.utc).isoformat()})
+        if state.get("previous"):
+            # The candidate reuses the retained slot. Clear the pointer before removing
+            # anything so an interrupted cleanup cannot advertise a nonexistent rollback.
+            state["previous"] = None
+            require_storage_mounts(app)
+            _atomic_write(state_path, json.dumps(state, indent=2, sort_keys=True) + "\n")
         component_order = sorted(app["components"])
         if app.get("single_backend_maintenance") is True:
             component_order.sort(key=lambda name: (name == "backend", name))
@@ -1836,22 +2244,32 @@ def _deploy_stack(request: dict[str, Any], app: dict[str, Any]) -> dict[str, Any
         require_storage_mounts(app)
         _atomic_write(state_path, json.dumps(new_state, indent=2, sort_keys=True) + "\n")
         _append_audit(app, {"operation": "deploy-stack", "outcome": "success", "commit_sha": request["commit_sha"], "images": request["images"], "platform_sha": request["platform_sha"], "slot": slot, "workflow_run_id": request["release"]["run_id"], "actor": request["release"]["actor"], "timestamp": release["deployed_at"]})
-    except Exception:
+    except Exception as deployment_exc:
         if route_switched:
             _atomic_write(route_path, prior_route)
             run_command(["nginx", "-t"], timeout=20, check=False)
             run_command(["systemctl", "reload", "nginx"], timeout=20, check=False)
-            if prior_state is None:
-                state_path.unlink(missing_ok=True)
-            else:
-                _atomic_write(state_path, prior_state)
+        if prior_state is None:
+            state_path.unlink(missing_ok=True)
+        else:
+            _atomic_write(state_path, prior_state)
         for container in reversed(started_names):
             run_command(["docker", "rm", "-f", container], timeout=30, check=False)
         if backend_maintenance:
             try:
+                if migration_started:
+                    if isinstance(deployment_exc, MigrationOutcomeUnknown):
+                        raise DeploymentError("The migration outcome could not be verified; the retained backend remains stopped for safe recovery.") from deployment_exc
+                    # Restart the retained release only when Flyway proves either
+                    # the exact pending source plan or the approved additive target.
+                    _validate_database(request, app, allow_pending_migration=True)
+                    policy = _schema_migration_policy(app)
+                    if policy is None or policy["previous_release_compatible"] is not True:
+                        raise DeploymentError("The retained application is not approved for the migrated schema.")
                 _restart_stack_backend(app, active)
             except Exception as recovery_exc:
-                raise DeploymentError("The candidate failed and the retained backend could not be restored automatically.") from recovery_exc
+                message = "The migration outcome could not be verified; the retained backend remains stopped for safe recovery." if migration_started else "The candidate failed and the retained backend could not be restored automatically."
+                raise DeploymentError(message) from recovery_exc
         raise
     metrics_warning = False
     try:

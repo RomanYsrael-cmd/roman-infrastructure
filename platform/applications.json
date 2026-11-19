@@ -179,7 +179,21 @@
       "allowed_database_urls": ["jdbc:postgresql://127.0.0.1:5432/romanlms_prod"],
       "flyway_cli_version": "11.14.1",
       "flyway_schema": "roman_lms",
-      "expected_schema_version": "132",
+      "expected_schema_version": "133",
+      "schema_migration": {
+        "source_version": "132",
+        "target_version": "133",
+        "description": "tesda lamr report settings",
+        "script": "V133__tesda_lamr_report_settings.sql",
+        "checksum": -664390374,
+        "previous_release_compatible": true
+      },
+      "production_backup": {
+        "config_file": "/etc/pgbackrest/pgbackrest.conf",
+        "stanza": "romanlms-prod",
+        "repository": 1,
+        "timeout_seconds": 1200
+      },
       "flyway_history_exceptions": [
         {"state": "Deleted", "category": "Repeatable", "type": "SQL", "version": "", "description": "seed dev data", "filepath": ""},
         {"state": "Missing", "category": "Repeatable", "type": "SQL", "version": "", "description": "seed dev data", "filepath": ""}
