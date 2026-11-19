@@ -160,7 +160,7 @@
       "reusable_workflow_path": "RomanYsrael-cmd/roman-infrastructure/.github/workflows/romanlms-private-deploy.yml",
       "required_ci_workflow_file": "ci.yml",
       "authorized_actors": ["RomanYsrael-cmd"],
-      "allowed_platform_shas": ["f14001afa20e54681826394dd06a485dafbdcdac", "d5a4b3589c1c5057b94f7355f4f4e5f89a646ea6", "03ccb655ad7102decea52b1d3dbd67a53b7933d0", "0a6f8563dbb5e8c0d98c7a245c3792d80457f1b7", "6dd7bbb99ba15d801ce5de34dcda9fe4670657a1", "63b54022e990c0d010cd6ac65902afbb3e1d07d5", "eff9b117a741fa17722d85511e24878cb2651707", "df2711da492189c5e092338c92548c40011d1926", "dbe279fc2f67b3f5dbddd8b7e1eac8fffcd1a3ab", "55b1664f281fbc6a3530f54ac073a7ebc6de445c", "6b4a259d625b8a27aebbbc864c3c66926900aec8"],
+      "allowed_platform_shas": ["f14001afa20e54681826394dd06a485dafbdcdac", "d5a4b3589c1c5057b94f7355f4f4e5f89a646ea6", "03ccb655ad7102decea52b1d3dbd67a53b7933d0", "0a6f8563dbb5e8c0d98c7a245c3792d80457f1b7", "6dd7bbb99ba15d801ce5de34dcda9fe4670657a1", "63b54022e990c0d010cd6ac65902afbb3e1d07d5", "eff9b117a741fa17722d85511e24878cb2651707", "df2711da492189c5e092338c92548c40011d1926", "dbe279fc2f67b3f5dbddd8b7e1eac8fffcd1a3ab", "55b1664f281fbc6a3530f54ac073a7ebc6de445c", "6b4a259d625b8a27aebbbc864c3c66926900aec8", "db3150973746fad8497becd39dfb9bbb3f701556"],
       "workflow_event": "workflow_dispatch",
       "automatic_workflow_event": "workflow_run",
       "automatic_release_enabled": true,
@@ -176,6 +176,8 @@
       "image_source_repository": "RomanYsrael-cmd/roman-infrastructure",
       "migration_image_namespace": "ghcr.io/romanysrael-cmd/romanlms-prod-migrator",
       "database_env_file": "/etc/roman-platform/romanlms-production/database.env",
+      "migration_database_env_file": "/etc/roman-platform/romanlms-production/migration.env",
+      "migration_database_username": "romanlms_migrator",
       "allowed_database_urls": ["jdbc:postgresql://127.0.0.1:5432/romanlms_prod"],
       "flyway_cli_version": "11.14.1",
       "flyway_schema": "roman_lms",
@@ -185,7 +187,8 @@
         "target_version": "133",
         "description": "tesda lamr report settings",
         "script": "V133__tesda_lamr_report_settings.sql",
-        "checksum": -664390374,
+        "checksum": 850684505,
+        "execution_role": "romanlms_app",
         "previous_release_compatible": true
       },
       "production_backup": {
