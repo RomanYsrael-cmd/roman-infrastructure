@@ -1310,7 +1310,7 @@ def _schema_migration_policy(app: dict[str, Any]) -> dict[str, Any] | None:
         not isinstance(backup, dict)
         or set(backup) != {"config_file", "stanza", "repository", "timeout_seconds"}
         or backup.get("config_file") != "/etc/pgbackrest/pgbackrest.conf"
-        or backup.get("stanza") != "romanlms-prod"
+        or backup.get("stanza") != "roman-platform"
         or isinstance(backup.get("repository"), bool)
         or backup.get("repository") != 1
         or isinstance(backup.get("timeout_seconds"), bool)

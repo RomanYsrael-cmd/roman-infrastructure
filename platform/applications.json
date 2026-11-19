@@ -190,7 +190,7 @@
       },
       "production_backup": {
         "config_file": "/etc/pgbackrest/pgbackrest.conf",
-        "stanza": "romanlms-prod",
+        "stanza": "roman-platform",
         "repository": 1,
         "timeout_seconds": 1200
       },

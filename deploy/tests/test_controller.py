@@ -697,7 +697,7 @@ class FlywayMigrationPolicyTests(unittest.TestCase):
     def test_fresh_full_backup_is_required_and_its_identity_is_audited(self):
         request_value = {"commit_sha": SHA, "release": {"run_id": "123", "actor": "RomanYsrael-cmd"}}
         evidence = [{
-            "name": "romanlms-prod",
+            "name": "roman-platform",
             "backup": [{
                 "type": "full",
                 "label": "20261119-010203F",
@@ -724,7 +724,7 @@ class FlywayMigrationPolicyTests(unittest.TestCase):
                 deploy._verify_production_backup_integrity(self.app, "20261119-010203F")
         self.assertEqual(verify.call_args.args[0][-2:], ["--set=20261119-010203F", "verify"])
 
-        stale = [{"name": "romanlms-prod", "backup": [{
+        stale = [{"name": "roman-platform", "backup": [{
             "type": "full", "label": "20261118-010203F",
             "timestamp": {"start": 900, "stop": 901},
         }]}]
@@ -1511,7 +1511,7 @@ class RomanLmsProductionPolicyTests(unittest.TestCase):
         })
         self.assertEqual(self.app["production_backup"], {
             "config_file": "/etc/pgbackrest/pgbackrest.conf",
-            "stanza": "romanlms-prod",
+            "stanza": "roman-platform",
             "repository": 1,
             "timeout_seconds": 1200,
         })
@@ -1538,6 +1538,9 @@ class RomanLmsProductionPolicyTests(unittest.TestCase):
         unprotected_backup = copy.deepcopy(self.app)
         unprotected_backup["production_backup"]["repository"] = True
         bad_policies.append(unprotected_backup)
+        unknown_backup_stanza = copy.deepcopy(self.app)
+        unknown_backup_stanza["production_backup"]["stanza"] = "romanlms-prod"
+        bad_policies.append(unknown_backup_stanza)
         for policy in bad_policies:
             with self.subTest(policy=policy), self.assertRaises(deploy.DeploymentError):
                 deploy._schema_migration_policy(policy)
