@@ -1541,10 +1541,11 @@ class RomanLmsProductionPolicyTests(unittest.TestCase):
             "6b4a259d625b8a27aebbbc864c3c66926900aec8",
             "db3150973746fad8497becd39dfb9bbb3f701556",
             "cf74c8031de7e46fce8fd49f401be973820bfa50",
+            "7daa21f7b9ba3f0ee74f58b3e9c74ab2a7ecb87b",
         ])
         self.assertEqual(
             self.app["required_ci_workflow_blob_sha"],
-            "2735e91f2e7f2df6ca1bdf282a105d36641b07e8",
+            "32b39d87e8949601c162cd3a8b8eac076bc6684b",
         )
         self.assertEqual(self.app["allowed_database_urls"], ["jdbc:postgresql://127.0.0.1:5432/romanlms_prod"])
         self.assertEqual(self.app["expected_schema_version"], "133")
