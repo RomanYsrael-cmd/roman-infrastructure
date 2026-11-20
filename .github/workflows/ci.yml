@@ -40,7 +40,7 @@ jobs:
         working-directory: deploy/tests
         run: |
           python3 -m py_compile ../controller/roman_deploy.py ../controller/romanlms_ci_gate.py test_controller.py test_romanlms_ci_gate.py
-          python3 -m unittest test_romanlms_ci_gate test_controller.WorkflowContractTests test_controller.RequestValidationTests test_controller.RomanLmsContainerPolicyTests test_controller.FlywayMigrationPolicyTests test_controller.StackDeploymentTests test_controller.RomanLmsProductionPolicyTests test_controller.WorkflowOriginTests test_controller.ImageProvenanceTests -v
+          python3 -m unittest test_forward_migration_plan test_romanlms_ci_gate test_controller.WorkflowContractTests test_controller.RequestValidationTests test_controller.RomanLmsContainerPolicyTests test_controller.FlywayMigrationPolicyTests test_controller.StackDeploymentTests test_controller.RomanLmsProductionPolicyTests test_controller.WorkflowOriginTests test_controller.ImageProvenanceTests -v
 
       - name: Validate application policy JSON
         if: ${{ steps.changes.outputs.configuration == 'true' }}
