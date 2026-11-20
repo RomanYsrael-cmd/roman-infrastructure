@@ -12,6 +12,10 @@ The intended release route is:
 
 The workflow material is staged as an example for RomanLMS. The server installation, dedicated deployment key, private image pull, and production route have not been applied or verified because the current laptop SSH identity cannot authenticate to roman-server.
 
+## Universal deployment platform (in progress)
+
+See [the multi-project rollout contract](docs/universal-deployment-platform.md) for the planned project registry, version-agnostic migration policy, supported workload profiles and staging gates. The initial forward-migration planner is isolated: production remains on the current V133-specific controller policy until the new path is integrated and verified.
+
 ## Cost target and branch policy
 
 The setup uses the public infrastructure repository, public-repository GitHub Actions runs, the existing self-hosted laptop runner, GHCR, and the existing Tailscale connection. It creates no paid compute service, hosted runner, second runner, external monitoring account, or public ingress route.
