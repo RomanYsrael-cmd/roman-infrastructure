@@ -85,6 +85,12 @@ run_flyway() {
     "$image" "$@"
 }
 
+flyway_history() {
+  docker exec -e PGPASSWORD="$MIGRATION_DB_PASSWORD" "$POSTGRES_CONTAINER" \
+    psql -h 127.0.0.1 -p 5432 -U roman_migration_runner -d roman_migration_it -Atqc \
+    "SELECT COALESCE(json_agg(json_build_object('version',version,'description',description,'type',type,'script',script,'checksum',checksum,'success',success) ORDER BY installed_rank),'[]'::json)::text FROM roman_lms.flyway_schema_history"
+}
+
 run_flyway "$baseline_image" -target=133 migrate
 initial_info="$(run_flyway "$single_image" info -outputType=json)"
 printf '%s' "$initial_info" | python3 -c '
@@ -93,34 +99,59 @@ report = json.load(sys.stdin)
 fields = ("version", "state", "category", "type", "checksum", "filepath", "script", "description")
 print("Flyway plan diagnostic:", json.dumps([{key: row.get(key) for key in fields} for row in report.get("migrations", [])], sort_keys=True))
 ' >&2
-single_plan_target="$(printf '%s' "$initial_info" | PYTHONPATH=deploy/controller python3 -c '
-import json, sys
-from forward_migration_plan import validate_forward_plan
-plan = validate_forward_plan(sys.stdin.read(), max_pending=1, expected_flyway_version="11.14.1", expected_schema_name="roman_lms")
+single_plan_target="$(printf '%s' "$initial_info" | env \
+FLYWAY_HISTORY_JSON="$(flyway_history)" \
+MIGRATION_SQL_DIR="$context_root/single/sql" \
+PLAN_FILE="$context_root/single-plan.json" \
+PYTHONPATH=deploy/controller python3 -c '
+import json, os, sys
+from pathlib import Path
+from forward_migration_plan import bind_flyway_checksums, migration_artifact_checksums, validate_forward_plan
+checksums = migration_artifact_checksums(Path(os.environ["MIGRATION_SQL_DIR"]))
+bound = bind_flyway_checksums(sys.stdin.read(), os.environ["FLYWAY_HISTORY_JSON"], checksums)
+plan = validate_forward_plan(bound, max_pending=1, expected_flyway_version="11.14.1", expected_schema_name="roman_lms")
 assert len(plan.pending) == 1, plan.pending
 assert plan.source_version == "133", plan.source_version
+Path(os.environ["PLAN_FILE"]).write_text(json.dumps({"source_version": plan.source_version, "target_version": plan.target_version, "pending": plan.pending, "fingerprint": plan.fingerprint}), encoding="utf-8")
 print(plan.target_version)
 ')"
 [[ "$single_plan_target" == "134" ]]
 run_flyway "$single_image" -target="$single_plan_target" migrate
 
 multi_info="$(run_flyway "$multi_image" info -outputType=json)"
-batch_target="$(printf '%s' "$multi_info" | PYTHONPATH=deploy/controller python3 -c '
-import sys
-from forward_migration_plan import validate_forward_plan
-plan = validate_forward_plan(sys.stdin.read(), max_pending=3, expected_flyway_version="11.14.1", expected_schema_name="roman_lms")
+batch_target="$(printf '%s' "$multi_info" | env \
+FLYWAY_HISTORY_JSON="$(flyway_history)" \
+MIGRATION_SQL_DIR="$context_root/multi/sql" \
+PLAN_FILE="$context_root/multi-plan.json" \
+PYTHONPATH=deploy/controller python3 -c '
+import json, os, sys
+from pathlib import Path
+from forward_migration_plan import bind_flyway_checksums, migration_artifact_checksums, validate_forward_plan
+checksums = migration_artifact_checksums(Path(os.environ["MIGRATION_SQL_DIR"]))
+bound = bind_flyway_checksums(sys.stdin.read(), os.environ["FLYWAY_HISTORY_JSON"], checksums)
+plan = validate_forward_plan(bound, max_pending=3, expected_flyway_version="11.14.1", expected_schema_name="roman_lms")
 assert len(plan.pending) == 3, plan.pending
 assert plan.source_version == "134", plan.source_version
+Path(os.environ["PLAN_FILE"]).write_text(json.dumps({"source_version": plan.source_version, "target_version": plan.target_version, "pending": plan.pending, "fingerprint": plan.fingerprint}), encoding="utf-8")
 print(plan.target_version)
 ')"
 [[ "$batch_target" == "137" ]]
 run_flyway "$multi_image" -target="$batch_target" migrate
 
 clean_info="$(run_flyway "$multi_image" info -outputType=json)"
-printf '%s' "$clean_info" | PYTHONPATH=deploy/controller python3 -c '
-import sys
-from forward_migration_plan import validate_forward_plan
-plan = validate_forward_plan(sys.stdin.read(), expected_flyway_version="11.14.1", expected_schema_name="roman_lms")
+printf '%s' "$clean_info" | env \
+FLYWAY_HISTORY_JSON="$(flyway_history)" \
+MIGRATION_SQL_DIR="$context_root/multi/sql" \
+PLAN_FILE="$context_root/multi-plan.json" \
+PYTHONPATH=deploy/controller python3 -c '
+import json, os, sys
+from pathlib import Path
+from forward_migration_plan import ForwardMigrationPlan, bind_flyway_checksums, migration_artifact_checksums, validate_migration_result
+checksums = migration_artifact_checksums(Path(os.environ["MIGRATION_SQL_DIR"]))
+bound = bind_flyway_checksums(sys.stdin.read(), os.environ["FLYWAY_HISTORY_JSON"], checksums)
+plan_data = json.loads(Path(os.environ["PLAN_FILE"]).read_text(encoding="utf-8"))
+planned = ForwardMigrationPlan(plan_data["source_version"], plan_data["target_version"], tuple(tuple(row) for row in plan_data["pending"]), plan_data["fingerprint"])
+plan = validate_migration_result(bound, planned, expected_flyway_version="11.14.1", expected_schema_name="roman_lms")
 assert not plan.pending, plan.pending
 assert plan.source_version == "137", plan.source_version
 '

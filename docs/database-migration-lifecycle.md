@@ -4,13 +4,13 @@ This guide describes the implemented PostgreSQL/Flyway migration adapter. The co
 
 ## Release contents
 
-The application release contains the migration directory and the migrator image build specification. RomanLMS release metadata v2 identifies the Flyway CLI and schema but has no fixed source version, target version, filename, or checksum. The source image and migrator image are built from the same verified source commit and released by immutable digest.
+The application release contains the migration directory and the migrator image build specification. RomanLMS release metadata v2 identifies the Flyway CLI and schema but has no fixed source version, target version, filename, or checksum. The source image and migrator image are built from the same verified source commit and released by immutable digest. Flyway 11's `info -outputType=json` may omit SQL checksums, so the controller joins its migration identities to the dedicated database history query and computes pending SQL checksums from `/flyway/sql` copied out of the exact verified image. The image is created with a read-only filesystem and no network and is never started for inspection. The resulting checksums and applied history are part of the release plan fingerprint.
 
 Only versioned SQL migrations run automatically. The validator confirms canonical numeric versions, strictly increasing unique order, expected SQL path and names, valid Flyway checksums, no modified successful migrations, and no failed/unknown history. Unsupported repeatable, missing, out-of-order, injected, or malformed migration states stop the release.
 
 ## No pending migrations
 
-The controller runs Flyway information and validation against the exact release migrator. It records the observed schema version and an empty pending plan. It does not stop database writers, create a full backup, or run migration credentials. The application release then follows its normal health-checked rollout.
+The controller runs Flyway information and validation against the exact release migrator. It records the observed schema version and an empty pending plan. It does not stop database writers, create a full backup, or run migration credentials. After the candidate passes health checks, it re-reads the schema history and requires the same plan fingerprint before switching traffic.
 
 ## One or more pending migrations
 

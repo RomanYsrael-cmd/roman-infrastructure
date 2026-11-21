@@ -741,6 +741,7 @@ class FlywayMigrationPolicyTests(unittest.TestCase):
             subprocess.CompletedProcess([], 0, "", ""),
             subprocess.CompletedProcess([], 0, "", ""),
             subprocess.CompletedProcess([], 0, json.dumps(self.pending_info), ""),
+            subprocess.CompletedProcess([], 0, "[]", ""),
         ]
         with mock.patch.object(deploy, "_secure_env_file", return_value=Path("/safe/database.env")), \
              mock.patch.object(deploy, "_env_file_values", return_value={
@@ -753,12 +754,13 @@ class FlywayMigrationPolicyTests(unittest.TestCase):
                  "DB_PASSWORD": "local-migration-secret",
              })), mock.patch.object(deploy, "registry_session", return_value=contextlib.nullcontext({})), \
              mock.patch.object(deploy, "run_command", side_effect=commands), \
+             mock.patch.object(deploy, "_bind_flyway_plan_checksums", side_effect=lambda info, history, image, app, env: info), \
              mock.patch.object(deploy, "_verify_image"), mock.patch.object(deploy, "_append_audit"), \
              mock.patch.object(deploy, "_read_state", return_value={}), mock.patch.object(deploy, "_write_metrics"):
             result = deploy._validate_database(request_value, self.app, allow_pending_migration=True)
         self.assertTrue(result["migration_pending"])
 
-        commands[-1] = subprocess.CompletedProcess([], 0, json.dumps({
+        commands[2] = subprocess.CompletedProcess([], 0, json.dumps({
             **self.pending_info,
             "migrations": [self.pending_info["migrations"][0], *self.exceptions],
         }), "")
@@ -773,6 +775,7 @@ class FlywayMigrationPolicyTests(unittest.TestCase):
                  "DB_PASSWORD": "local-migration-secret",
              })), mock.patch.object(deploy, "registry_session", return_value=contextlib.nullcontext({})), \
              mock.patch.object(deploy, "run_command", side_effect=commands), \
+             mock.patch.object(deploy, "_bind_flyway_plan_checksums", side_effect=lambda info, history, image, app, env: info), \
              mock.patch.object(deploy, "_verify_image"), mock.patch.object(deploy, "_append_audit"), \
              mock.patch.object(deploy, "_read_state", return_value={}), mock.patch.object(deploy, "_write_metrics"):
             result = deploy._validate_database(request_value, self.app, allow_pending_migration=True)
@@ -789,6 +792,8 @@ class FlywayMigrationPolicyTests(unittest.TestCase):
         self.assertIn("FLYWAY_SCHEMA=roman_lms", args)
         validate_args = deploy._flyway_container_args(request_value, self.app, Path("/safe/database.env"), "validate")
         self.assertNotIn("MIGRATION_EXECUTION_ROLE=romanlms_app", validate_args)
+        history_args = deploy._flyway_container_args(request_value, self.app, Path("/safe/database.env"), "history")
+        self.assertEqual(history_args[-2:], [request_value["migration_image"], "history"])
         with self.assertRaises(deploy.DeploymentError):
             deploy._flyway_container_args(request_value, self.app, Path("/safe/database.env"), "repair")
 
@@ -1245,6 +1250,36 @@ class StackDeploymentTests(unittest.TestCase):
         self.assertEqual(self.route.read_text(encoding="utf-8"), "switched blue")
         candidate_commands = [args for args in commands if args[:2] == ["docker", "run"]]
         self.assertTrue(all("--publish" not in args and "--ip" in args for args in candidate_commands))
+
+    def test_app_only_release_rechecks_schema_history_before_switching_traffic(self):
+        initial = self._database_status()
+        changed = copy.deepcopy(initial)
+        changed["migration_plan"]["fingerprint"] = "e" * 64
+        statuses = iter((initial, changed))
+        commands = []
+
+        def run(args, **kwargs):
+            commands.append(args)
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        with mock.patch.object(deploy, "_validate_database", side_effect=lambda *args, **kwargs: next(statuses)), \
+             mock.patch.object(deploy, "registry_session", return_value=contextlib.nullcontext({})), \
+             mock.patch.object(deploy, "run_command", side_effect=run), mock.patch.object(deploy, "_verify_image"), \
+             mock.patch.object(deploy, "_remove_inactive_slot"), mock.patch.object(deploy, "_stack_release_healthy"), \
+             mock.patch.object(deploy, "verify_release_origin"), mock.patch.object(deploy, "_switch_stack_route") as switch, \
+             mock.patch.object(deploy, "_create_verified_production_backup") as backup, \
+             mock.patch.object(deploy, "_stop_stack_backend") as stop_backend, \
+             mock.patch.object(deploy, "require_storage_mounts"), mock.patch.object(deploy, "_append_audit"), \
+             mock.patch.object(deploy, "_write_metrics"):
+            with self.assertRaisesRegex(deploy.DeploymentError, "history changed during the application rollout"):
+                deploy._deploy_stack(self.request, self.app)
+
+        switch.assert_not_called()
+        backup.assert_not_called()
+        stop_backend.assert_not_called()
+        self.assertEqual(self.route.read_text(encoding="utf-8"), "return 503;\n")
+        self.assertEqual(sum(args[:2] == ["docker", "run"] for args in commands), 2)
+        self.assertEqual(sum(args[:3] == ["docker", "rm", "-f"] for args in commands), 2)
 
     def _active_refresh_release(self):
         commit_sha = "d" * 40

@@ -1,12 +1,19 @@
 """Regression tests for the opt-in, version-agnostic migration planner."""
 import copy
 import json
+import tempfile
 import sys
 import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "controller"))
-from forward_migration_plan import MigrationPlanError, validate_forward_plan, validate_migration_result
+from forward_migration_plan import (
+    MigrationPlanError,
+    bind_flyway_checksums,
+    migration_artifact_checksums,
+    validate_forward_plan,
+    validate_migration_result,
+)
 
 
 def example():
@@ -41,6 +48,71 @@ def check(report, **kwargs):
 
 
 class ForwardMigrationPlanTests(unittest.TestCase):
+    def test_flyway_info_checksums_are_bound_to_database_history_and_release_sql(self):
+        report = example()
+        report["migrations"] = report["migrations"][:2]
+        report["migrations"][0]["checksum"] = None
+        report["migrations"][1]["checksum"] = None
+        history = [{
+            "version": "133",
+            "description": "existing migration",
+            "type": "SQL",
+            "script": "V133__existing_migration.sql",
+            "checksum": 231,
+            "success": True,
+        }]
+        enriched = bind_flyway_checksums(
+            json.dumps(report),
+            json.dumps(history),
+            {"V133__existing_migration.sql": 231, "V134__add_attendance_metadata.sql": -321},
+        )
+        plan = check(json.loads(enriched), max_pending=1)
+        self.assertEqual(plan.pending, (("134", "V134__add_attendance_metadata.sql", "add attendance metadata", -321),))
+        self.assertIn(("Success", "Versioned", "SQL", "133", "existing migration", "/flyway/sql/V133__existing_migration.sql", 231), plan.history)
+
+    def test_checksum_binding_rejects_history_drift_and_missing_release_migrations(self):
+        report = example()
+        report["migrations"] = report["migrations"][:2]
+        report["migrations"][0]["checksum"] = None
+        report["migrations"][1]["checksum"] = None
+        history = [{
+            "version": "133", "description": "existing migration", "type": "SQL",
+            "script": "V133__existing_migration.sql", "checksum": 231, "success": True,
+        }]
+        cases = (
+            ({"V133__existing_migration.sql": 232, "V134__add_attendance_metadata.sql": -321}, history),
+            ({"V133__existing_migration.sql": 231}, history),
+            ({"V133__existing_migration.sql": 231, "V134__add_attendance_metadata.sql": -321}, []),
+        )
+        for checksums, database_history in cases:
+            with self.subTest(checksums=checksums, database_history=database_history), self.assertRaises(MigrationPlanError):
+                bind_flyway_checksums(json.dumps(report), json.dumps(database_history), checksums)
+
+    def test_migration_artifact_checksum_reader_is_line_ending_and_bom_stable(self):
+        with tempfile.TemporaryDirectory(prefix="roman-flyway-checksum-") as temp:
+            directory = Path(temp)
+            (directory / "V134__add_attendance_metadata.sql").write_bytes(
+                "\ufeffCREATE TABLE attendance (id int);\r\nINSERT INTO attendance VALUES (1);\r\n".encode("utf-8")
+            )
+            checksum = migration_artifact_checksums(directory)["V134__add_attendance_metadata.sql"]
+            (directory / "V135__add_other_metadata.sql").write_text("CREATE TABLE other (id int);\n", encoding="utf-8")
+            checksums = migration_artifact_checksums(directory)
+            self.assertEqual(checksums["V134__add_attendance_metadata.sql"], checksum)
+            self.assertEqual(set(checksums), {"V134__add_attendance_metadata.sql", "V135__add_other_metadata.sql"})
+
+    def test_migration_artifact_rejects_duplicate_and_unsafe_versions(self):
+        for filenames in (
+            ("V134__first.sql", "V134__second.sql"),
+            ("V01__bad.sql",),
+            ("V134__BadCase.sql",),
+        ):
+            with tempfile.TemporaryDirectory(prefix="roman-flyway-identity-") as temp:
+                directory = Path(temp)
+                for filename in filenames:
+                    (directory / filename).write_text("SELECT 1;\n", encoding="utf-8")
+                with self.subTest(filenames=filenames), self.assertRaises(MigrationPlanError):
+                    migration_artifact_checksums(directory)
+
     def test_multiple_pending_versions_without_manifest_version_pin(self):
         plan = check(example())
         self.assertTrue(plan.needs_migration)

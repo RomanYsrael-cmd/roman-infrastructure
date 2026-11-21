@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import zlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -54,6 +55,151 @@ def _validate_exceptions(value: list[dict[str, str]] | None) -> list[dict[str, s
     ):
         raise MigrationPlanError("Flyway history exception policy is invalid.")
     return exceptions
+
+
+def flyway_sql_checksum(path: Path) -> int:
+    """Calculate Flyway's UTF-8 SQL CRC32 with line ending and BOM normalization."""
+    checksum = 0
+    try:
+        with path.open("r", encoding="utf-8", newline=None) as stream:
+            for line_number, line in enumerate(stream):
+                if line.endswith("\n"):
+                    line = line[:-1]
+                if line_number == 0 and line.startswith("\ufeff"):
+                    line = line[1:]
+                checksum = zlib.crc32(line.encode("utf-8"), checksum)
+    except (OSError, UnicodeError) as exc:
+        raise MigrationPlanError("A release SQL migration is unavailable or is not valid UTF-8.") from exc
+    return checksum if checksum < 2**31 else checksum - 2**32
+
+
+def migration_artifact_checksums(directory: Path) -> dict[str, int]:
+    """Read versioned SQL identities and Flyway checksums from the exact migrator image."""
+    if directory.is_symlink() or not directory.is_dir():
+        raise MigrationPlanError("The verified SQL migration directory is unavailable or unsafe.")
+    checksums: dict[str, int] = {}
+    versions: set[tuple[int, ...]] = set()
+    try:
+        paths = sorted(directory.iterdir(), key=lambda path: path.name)
+    except OSError as exc:
+        raise MigrationPlanError("The verified SQL migration directory cannot be read.") from exc
+    for path in paths:
+        if path.is_symlink() or not path.is_file():
+            raise MigrationPlanError("Nested or linked SQL migration paths are unsupported.")
+        if not path.name.startswith("V"):
+            continue
+        match = MIGRATION_FILE.fullmatch(path.name)
+        if match is None:
+            raise MigrationPlanError("A versioned SQL migration has an invalid Flyway identity.")
+        version = match.group(1).replace("_", ".")
+        parts = _version_tuple(version)
+        if parts in versions:
+            raise MigrationPlanError("The release artifact contains duplicate versioned SQL identities.")
+        versions.add(parts)
+        checksums[path.name] = flyway_sql_checksum(path)
+    return checksums
+
+
+def bind_flyway_checksums(
+    info_output: str,
+    history_output: str,
+    release_checksums: dict[str, int] | None = None,
+) -> str:
+    """Bind Flyway info identities to PostgreSQL history and exact release SQL checksums."""
+    try:
+        report = json.loads(info_output)
+        database_history = json.loads(history_output)
+    except (TypeError, ValueError) as exc:
+        raise MigrationPlanError("Flyway info or database history is not valid JSON.") from exc
+    if not isinstance(report, dict) or not isinstance(report.get("migrations"), list):
+        raise MigrationPlanError("Flyway info has no migration list to bind.")
+    if not isinstance(database_history, list):
+        raise MigrationPlanError("The database returned malformed Flyway history.")
+    if release_checksums is not None and (
+        not isinstance(release_checksums, dict)
+        or any(
+            not isinstance(name, str)
+            or isinstance(checksum, bool)
+            or not isinstance(checksum, int)
+            or not -(2**31) <= checksum < 2**31
+            for name, checksum in release_checksums.items()
+        )
+    ):
+        raise MigrationPlanError("The release migration checksum set is malformed.")
+
+    def migration_key(version: Any, description: Any, migration_type: Any, script: Any) -> tuple[str, str, str, str]:
+        if not isinstance(version, str) or not isinstance(description, str) or not isinstance(migration_type, str) or not isinstance(script, str):
+            raise MigrationPlanError("The Flyway migration identity is malformed.")
+        if not script or "/" in script or "\\" in script or script in {".", ".."}:
+            raise MigrationPlanError("The Flyway migration script identity is unsafe.")
+        return version, description, migration_type, script
+
+    applied: dict[tuple[str, str, str, str], int] = {}
+    database_versioned_keys: set[tuple[str, str, str, str]] = set()
+    for row in database_history:
+        if not isinstance(row, dict):
+            raise MigrationPlanError("The database returned malformed Flyway history.")
+        version = row.get("version")
+        if version is None:
+            continue
+        if not isinstance(version, str) or not version:
+            raise MigrationPlanError("The database returned a malformed applied migration version.")
+        if row.get("type") != "SQL":
+            continue
+        key = migration_key(version, row.get("description"), row.get("type"), row.get("script"))
+        if key in database_versioned_keys:
+            raise MigrationPlanError("The database contains duplicate applied versioned migration identities.")
+        database_versioned_keys.add(key)
+        success = row.get("success")
+        if not isinstance(success, bool):
+            raise MigrationPlanError("The database returned an invalid Flyway success state.")
+        if success:
+            checksum = row.get("checksum")
+            if isinstance(checksum, bool) or not isinstance(checksum, int) or not -(2**31) <= checksum < 2**31:
+                raise MigrationPlanError("Applied versioned migrations need database SQL checksums.")
+            applied[key] = checksum
+
+    info_versioned_keys: set[tuple[str, str, str, str]] = set()
+    for entry in report["migrations"]:
+        if not isinstance(entry, dict):
+            raise MigrationPlanError("Flyway info contains a malformed migration identity.")
+        category = entry.get("category")
+        migration_type = entry.get("type")
+        state = entry.get("state")
+        version = entry.get("version", "")
+        description = entry.get("description", "")
+        filepath = entry.get("filepath", "")
+        if category != "Versioned" or migration_type != "SQL" or not version:
+            continue
+        if not isinstance(filepath, str) or not filepath.startswith("/flyway/sql/"):
+            raise MigrationPlanError("A versioned migration path is outside the verified SQL directory.")
+        script = filepath.removeprefix("/flyway/sql/")
+        key = migration_key(version, description, migration_type, script)
+        if state == "Success":
+            if key in info_versioned_keys:
+                raise MigrationPlanError("Flyway info contains a duplicate applied migration identity.")
+            info_versioned_keys.add(key)
+            checksum = applied.pop(key, None)
+            if checksum is None:
+                raise MigrationPlanError("Flyway info and PostgreSQL migration history disagree.")
+            reported_checksum = entry.get("checksum")
+            if reported_checksum is not None and reported_checksum != checksum:
+                raise MigrationPlanError("Flyway info and PostgreSQL migration checksums disagree.")
+            if release_checksums is not None and release_checksums.get(script) != checksum:
+                raise MigrationPlanError("An applied migration differs from the verified release SQL artifact.")
+            entry["checksum"] = checksum
+        elif state == "Pending":
+            checksum = release_checksums.get(script) if release_checksums is not None else None
+            if isinstance(checksum, bool) or not isinstance(checksum, int):
+                raise MigrationPlanError("A pending migration checksum is unavailable from the verified release image.")
+            reported_checksum = entry.get("checksum")
+            if reported_checksum is not None and reported_checksum != checksum:
+                raise MigrationPlanError("Flyway info and verified release migration checksums disagree.")
+            entry["checksum"] = checksum
+
+    if applied or info_versioned_keys != database_versioned_keys.intersection(info_versioned_keys):
+        raise MigrationPlanError("Flyway info and PostgreSQL migration history disagree.")
+    return json.dumps(report, sort_keys=True, separators=(",", ":"))
 
 
 def validate_forward_plan(

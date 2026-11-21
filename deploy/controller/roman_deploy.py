@@ -19,6 +19,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -27,6 +28,8 @@ from application_registry import RegistryError, validate_registry
 from forward_migration_plan import (
     ForwardMigrationPlan,
     MigrationPlanError,
+    bind_flyway_checksums,
+    migration_artifact_checksums,
     validate_forward_plan,
     validate_migration_result,
 )
@@ -1896,6 +1899,71 @@ def _verify_flyway_info(
     return plan
 
 
+def _flyway_image_checksums(
+    image: str,
+    app: dict[str, Any],
+    env: dict[str, str] | None = None,
+    *,
+    temp_parent: Path | None = None,
+) -> dict[str, int]:
+    """Read migration SQL from the already verified immutable image without running it."""
+    parent = temp_parent if temp_parent is not None else Path(app.get("runtime_tmp_dir", ""))
+    if not parent.is_absolute() or parent.is_symlink() or not parent.is_dir():
+        raise DeploymentError("The private migration-inspection directory is unavailable.")
+    try:
+        info = parent.lstat()
+    except OSError as exc:
+        raise DeploymentError("The private migration-inspection directory is unavailable.") from exc
+    if not stat.S_ISDIR(info.st_mode) or stat.S_IMODE(info.st_mode) & 0o077:
+        raise DeploymentError("The private migration-inspection directory is not protected.")
+    if temp_parent is None and info.st_uid != 0:
+        raise DeploymentError("The migration-inspection directory is not root-owned.")
+
+    token = uuid.uuid4().hex
+    container = f"roman-platform-migration-inspect-{app['app_id']}-{token}"
+    with tempfile.TemporaryDirectory(prefix=f"migration-plan-{app['app_id']}-", dir=parent) as temp:
+        created = run_command(
+            ["docker", "create", "--read-only", "--network", "none", "--name", container, image],
+            env=env,
+            timeout=60,
+            check=False,
+        )
+        if created.returncode != 0:
+            raise DeploymentError("The verified migration image could not be inspected safely.")
+        try:
+            run_command(["docker", "cp", f"{container}:/flyway/sql", temp], env=env, timeout=60)
+            try:
+                return migration_artifact_checksums(Path(temp) / "sql")
+            except MigrationPlanError as exc:
+                raise DeploymentError(f"The verified migration image is invalid: {exc}") from exc
+        finally:
+            run_command(["docker", "rm", container], env=env, timeout=30, check=False)
+
+
+def _bind_flyway_plan_checksums(
+    info_output: str,
+    history_output: str,
+    image: str,
+    app: dict[str, Any],
+    env: dict[str, str] | None = None,
+) -> str:
+    try:
+        report = json.loads(info_output)
+    except (TypeError, ValueError) as exc:
+        raise DeploymentError("Flyway did not return valid migration JSON.") from exc
+    if not isinstance(report, dict) or not isinstance(report.get("migrations"), list):
+        raise DeploymentError("Flyway migration history is unavailable.")
+    pending = any(
+        isinstance(entry, dict) and entry.get("state") == "Pending"
+        for entry in report["migrations"]
+    )
+    checksums = _flyway_image_checksums(image, app, env) if pending else None
+    try:
+        return bind_flyway_checksums(info_output, history_output, checksums)
+    except MigrationPlanError as exc:
+        raise DeploymentError(f"Flyway history checksums do not match the verified release: {exc}") from exc
+
+
 def _migration_plan_data(plan: ForwardMigrationPlan) -> dict[str, Any]:
     return {
         "source_version": plan.source_version,
@@ -2036,7 +2104,7 @@ def _flyway_container_args(
     container_name: str | None = None,
     migration_plan: ForwardMigrationPlan | None = None,
 ) -> list[str]:
-    if command not in {"validate", "migrate", "info"}:
+    if command not in {"validate", "migrate", "info", "history"}:
         raise DeploymentError("The requested Flyway command is not approved.")
     expected_container = re.compile(
         rf"roman-platform-migration-{re.escape(app['app_id'])}-[0-9]{{1,20}}-[0-9]{{1,20}}"
@@ -2073,6 +2141,8 @@ def _flyway_container_args(
         args.append("migrate")
     elif command == "info":
         args.extend(["info", "-outputType=json"])
+    elif command == "history":
+        args.append("history")
     else:
         args.append(command)
     return args
@@ -2644,12 +2714,26 @@ def _validate_database(
             timeout=int(app.get("migration_timeout_seconds", 180)),
             redactions=(env_values["DB_URL"], env_values["DB_USERNAME"], env_values["DB_PASSWORD"]),
         )
+        history_args = _flyway_container_args(request, app, env_file, "history")
+        history_result = run_command(
+            history_args,
+            env=env,
+            timeout=int(app.get("migration_timeout_seconds", 180)),
+            redactions=(env_values["DB_URL"], env_values["DB_USERNAME"], env_values["DB_PASSWORD"]),
+        )
+        bound_info = _bind_flyway_plan_checksums(
+            result.stdout,
+            history_result.stdout,
+            image,
+            app,
+            env,
+        )
         max_pending = migration_policy["max_pending"] if migration_policy else 32
         allow_initial = migration_policy["allow_initial_schema"] if migration_policy else False
         if expected_plan is not None:
             try:
                 plan = validate_migration_result(
-                    result.stdout,
+                    bound_info,
                     expected_plan,
                     allowed_exceptions=app.get("flyway_history_exceptions"),
                     expected_flyway_version=app["flyway_cli_version"],
@@ -2659,7 +2743,7 @@ def _validate_database(
                 raise DeploymentError(f"Flyway postflight did not match the approved migration plan: {exc}") from exc
         else:
             plan = _verify_flyway_info(
-                result.stdout,
+                bound_info,
                 allowed_exceptions=app.get("flyway_history_exceptions"),
                 flyway_version=app["flyway_cli_version"],
                 schema_name=app.get("flyway_schema"),
@@ -3243,6 +3327,15 @@ def _deploy_stack(request: dict[str, Any], app: dict[str, Any]) -> dict[str, Any
         }
         _stack_release_healthy(app, release)
         verify_release_origin(request, app)
+        if not validated_plan.needs_migration:
+            # App-only releases do not stop writers or create a database backup,
+            # but an unexpected schema change during candidate startup must not
+            # be hidden by switching traffic using the stale observation.
+            latest_database_status = _validate_database(request, app)
+            latest_plan = _migration_plan_from_data(latest_database_status["migration_plan"])
+            if latest_plan.fingerprint != validated_plan.fingerprint:
+                raise DeploymentError("Database migration history changed during the application rollout; traffic was not switched.")
+            database_status = latest_database_status
         _switch_stack_route(app, slot)
         route_switched = True
         previous_release = active
