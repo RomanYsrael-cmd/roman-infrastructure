@@ -1,35 +1,29 @@
 # Roman Infrastructure
 
-This repository holds the shared deployment controller, the allowlist for approved applications, a harmless HTTP smoke service, and reusable workflow material for RomanLMS.
+Roman Infrastructure is a restricted deployment platform for independently registered applications. The server controller reads a root-owned app registry and supports HTTP applications, coordinated multi-container releases, workers, scheduled jobs, stateful TCP services, game servers with TCP/UDP ports, and build-only projects that publish artifacts without host access.
 
-The intended release route is:
+## Current implementation
 
-1. The infrastructure repository runs source-policy tests and builds the smoke container on GitHub's hosted Linux runner.
-2. The repository owner manually starts the RomanLMS smoke workflow from main and selects the explicit deployment or rollback confirmation.
-3. The existing Windows laptop runner checks the smoke image, publishes it to the RomanLMS GHCR namespace using the workflow token, and connects over the laptop's existing Tailscale connection.
-4. A forced-command SSH key submits one JSON request to the root-owned deployment controller.
-5. The controller verifies the workflow run, both main-branch revisions, the pinned reusable workflow, the allowlisted image digest, mounts, capacity, services, and health before changing its private Nginx route.
+The universal migration and application workflow changes are under review in [Infrastructure PR #26](https://github.com/RomanYsrael-cmd/roman-infrastructure/pull/26) with the matching RomanLMS changes on a coordinated branch. The local implementation contains:
 
-The workflow material is staged as an example for RomanLMS. The server installation, dedicated deployment key, private image pull, and production route have not been applied or verified because the current laptop SSH identity cannot authenticate to roman-server.
+- A strict root-owned application registry with port, route, subnet, network and resource conflict checks.
+- App-specific build definitions, immutable image digests, GitHub OIDC provenance and authorized reusable workflows.
+- Profile-specific deployment, health, persistent-volume, backup, route-switch and rollback adapters.
+- A version-agnostic PostgreSQL/Flyway migration planner and executor. It supports multiple ordered migrations, skips backups when there are none, verifies a fresh backup when needed, and does not roll SQL back.
+- A separate build-only workflow for Android/JVM, Maven, npm and Python artifacts; it has no server secrets or production job.
+- Per-app deployment audit and metrics through the existing Prometheus, Grafana and Telegram monitoring path.
 
-## Cost target and branch policy
+The branch changes are not production-installed until both repositories' CI passes and the controller, root registry, caller workflow and migrator revisions are verified as a compatible set. See [the platform overview](docs/universal-deployment-platform.md), [onboarding guide](docs/application-onboarding.md), [migration lifecycle](docs/database-migration-lifecycle.md), and [operations runbook](docs/universal-deployment-runbook.md).
 
-The setup uses the public infrastructure repository, public-repository GitHub Actions runs, the existing self-hosted laptop runner, GHCR, and the existing Tailscale connection. It creates no paid compute service, hosted runner, second runner, external monitoring account, or public ingress route.
+## Repository map
 
-The main branch is intentionally left unprotected. No branch protection rule or ruleset is required. The deploy example is manually dispatched and restricted to the repository owner account, with an explicit confirmation choice; server-side actor and release allowlists and forced-command SSH provide additional checks. Since main is unprotected, a person with write access can still push directly to it.
+- `deploy/controller/`: restricted deployment controller, application registry, migration planner and OIDC verifier.
+- `deploy/scripts/`: registered container builds, build-only artifact creation and release authorization.
+- `deploy/ansible/`: opt-in installation and configuration of the root-owned controller, routes and monitoring.
+- `platform/applications.json`: root-owned application registration source.
+- `examples/application-profiles.json`: validated manifests for each supported workload profile.
+- `.github/workflows/deploy-application.yml`: reusable registered container deployment workflow.
+- `.github/workflows/build-application.yml`: reusable build-only artifact workflow.
+- `deploy/tests/`: controller, migration, registry, authorization, resource, route and service-profile regressions.
 
-The free-cost assumption depends on GitHub's current public-repository and container-registry policies and a personal, non-commercial Tailscale use case. See the cost notes in docs/cost-model.md.
-
-## Contents
-
-- deploy/controller: restricted Python deployment controller
-- deploy/ansible: opt-in server bootstrap playbook; not yet run
-- deploy/tests: validation, workflow-origin, storage, capacity, lock, and route rollback tests
-- platform/applications.json: root-owned server allowlist source
-- app/smoke: stateless health-check service used for deployment validation
-- .github/workflows/ci.yml: public-repository test and local container smoke checks
-- .github/workflows/romanlms-smoke-deploy.yml: reusable workflow for a manual RomanLMS deployment
-- examples/romanlms/roman-platform-smoke.yml: caller workflow example, pinned after the reusable workflow commit
-- docs/romanlms-release-policy.md: RomanLMS production CI authorization paths and retained safety gates
-
-See docs/status.md for the verified state and remaining server-side steps.
+RomanLMS keeps its existing direct-owner-main SHORT CI and PR/LONG CI authorization paths. Main remains unprotected. Registration and deployment remain explicit; GitHub repositories are never deployed automatically merely because they exist.

@@ -73,48 +73,47 @@ class WorkflowContractTests(unittest.TestCase):
                 deploy.verify_required_ci(value, app)
 
     def test_private_release_requires_owner_manual_main_and_successful_ci(self):
-        workflow = (ROOT / ".github" / "workflows" / "romanlms-private-deploy.yml").read_text(encoding="utf-8")
+        workflow = yaml.safe_load((ROOT / ".github" / "workflows" / "romanlms-private-deploy.yml").read_text(encoding="utf-8"))
+        text = (ROOT / ".github" / "workflows" / "romanlms-private-deploy.yml").read_text(encoding="utf-8")
+        self.assertIn("workflow_call", workflow.get("on", workflow.get(True, {})))
+        self.assertEqual(workflow["jobs"]["delegate-registered-release"]["uses"], "./.github/workflows/deploy-application.yml")
         for required in ("github.actor == 'RomanYsrael-cmd'", "github.event_name == 'workflow_dispatch'",
                          "github.ref == 'refs/heads/main'", "DEPLOY PRIVATE ROMANLMS",
-                         "ROLLBACK PRIVATE ROMANLMS", "actions/workflows/ci.yml/runs?head_sha=",
-                         "$latest.conclusion -ne 'success'", "$currentRun.referenced_workflows",
-                         "actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803"):
-            self.assertIn(required, workflow)
+                         "ROLLBACK PRIVATE ROMANLMS", "inputs.source_sha == github.event.workflow_run.head_sha",
+                         "inputs.trigger_run_attempt == format('{0}', github.event.workflow_run.run_attempt)"):
+            self.assertIn(required, text)
 
     def test_private_release_publishes_with_buildkit_and_verifies_immutable_digest(self):
-        workflow = (ROOT / ".github" / "workflows" / "romanlms-private-deploy.yml").read_text(encoding="utf-8")
-        self.assertIn("'buildx','build','--push','--metadata-file'", workflow)
-        self.assertIn("$publishMetadata.'containerimage.digest'", workflow)
-        self.assertIn("& docker pull $digestReference", workflow)
-        self.assertIn("$repoDigests -notcontains $digestReference", workflow)
-        self.assertNotIn("'--load'", workflow)
-        self.assertNotIn("& docker push $tag", workflow)
-        self.assertIn("inputs.operation == 'deploy-stack' || inputs.operation == 'rollback-stack' || inputs.operation == 'test-stack'", workflow)
+        adapter = (ROOT / ".github" / "workflows" / "romanlms-private-deploy.yml").read_text(encoding="utf-8")
+        generic = (ROOT / ".github" / "workflows" / "deploy-application.yml").read_text(encoding="utf-8")
+        self.assertIn("uses: ./.github/workflows/deploy-application.yml", adapter)
+        self.assertIn("build_release.py", generic)
+        self.assertIn("--provenance=mode=max", (ROOT / "deploy" / "scripts" / "build_release.py").read_text(encoding="utf-8"))
+        self.assertIn("containerimage.digest", (ROOT / "deploy" / "scripts" / "build_release.py").read_text(encoding="utf-8"))
+        self.assertIn("--platform-sha \"$PLATFORM_REF\"", generic)
 
     def test_server_handoff_uses_a_read_only_token_after_prebuild_ci_proof(self):
-        workflow = yaml.safe_load(
-            (ROOT / ".github" / "workflows" / "romanlms-private-deploy.yml").read_text(encoding="utf-8")
-        )
-        jobs = workflow["jobs"]
-        self.assertEqual(jobs["publish-images"]["permissions"]["packages"], "write")
-        self.assertEqual(jobs["send-release"]["permissions"]["packages"], "read")
-        self.assertEqual(jobs["send-release"]["permissions"]["actions"], "read")
-        self.assertEqual(jobs["send-release"]["permissions"]["pull-requests"], "read")
-        publish_steps = jobs["publish-images"]["steps"]
-        proof = next(step for step in publish_steps if step.get("name") == "Verify exact RomanLMS CI authorization before image publication")
-        image_build = next(step for step in publish_steps if step.get("name") == "Build and publish immutable images")
-        self.assertLess(publish_steps.index(proof), publish_steps.index(image_build))
-        self.assertIn("romanlms_ci_gate.py", proof["run"])
-        self.assertIn("authorized-direct-main-push", proof["run"])
-        self.assertIn("intentionally has reduced test coverage", proof["run"])
-        release_script = jobs["send-release"]["steps"][0]["run"]
-        self.assertIn("commit_sha=$env:SOURCE_SHA", release_script)
-        self.assertIn("trigger_run_id=$env:TRIGGER_RUN_ID", release_script)
+        adapter = yaml.safe_load((ROOT / ".github" / "workflows" / "romanlms-private-deploy.yml").read_text(encoding="utf-8"))
+        generic = yaml.safe_load((ROOT / ".github" / "workflows" / "deploy-application.yml").read_text(encoding="utf-8"))
+        delegated = adapter["jobs"]["delegate-registered-release"]
+        self.assertEqual(delegated["permissions"]["id-token"], "write")
+        self.assertEqual(delegated["permissions"]["packages"], "write")
+        self.assertEqual(generic["jobs"]["authorize-release"]["permissions"]["actions"], "read")
+        self.assertEqual(generic["jobs"]["build-release"]["permissions"]["packages"], "write")
+        self.assertEqual(generic["jobs"]["build-release"].get("needs"), ["authorize-release"])
+        self.assertIn("needs.build-release.result == 'success'", generic["jobs"]["submit-release"]["if"])
+        self.assertEqual(generic["jobs"]["submit-release"]["permissions"]["packages"], "read")
+        self.assertEqual(generic["jobs"]["submit-release"]["permissions"]["id-token"], "write")
 
     def test_ansible_installs_the_ci_proof_module_as_root_owned_controller_code(self):
         install = (ROOT / "deploy" / "ansible" / "install.yml").read_text(encoding="utf-8")
         for required in (
             "deploy/controller/romanlms_ci_gate.py",
+            "deploy/controller/application_registry.py",
+            "deploy/controller/forward_migration_plan.py",
+            "deploy/controller/oidc_provenance.py",
+            "tasks/validate-registered-route.yml",
+            "templates/registered-application-site.conf.j2",
             "/controller/romanlms_ci_gate.py",
             "owner: root",
             "group: root",
@@ -125,22 +124,64 @@ class WorkflowContractTests(unittest.TestCase):
         tasks = {task["name"]: task for task in playbook[0]["tasks"] if isinstance(task, dict) and task.get("name")}
         for task_name in (
             "Install the Python controller",
+            "Install the universal application registry validator",
+            "Install the release-scoped Flyway migration planner",
+            "Install GitHub OIDC release provenance verifier",
             "Install the RomanLMS CI release verifier",
             "Install the server allowlist",
         ):
             with self.subTest(task=task_name):
                 self.assertEqual(tasks[task_name]["ansible.builtin.copy"].get("backup"), "true")
+        for task_name in (
+            "Validate existing files and listeners for registered application routes",
+            "Create a closed include for each registered application route",
+            "Install Nginx virtual hosts for registered application routes",
+        ):
+            self.assertIn(task_name, tasks)
+
+    def test_generic_deployment_workflow_uses_registered_builds_and_scoped_ssh_release(self):
+        workflow_text = (ROOT / ".github" / "workflows" / "deploy-application.yml").read_text(encoding="utf-8")
+        workflow = yaml.safe_load(workflow_text)
+        self.assertIn("workflow_call", workflow.get("on", workflow.get(True, {})))
+        self.assertIn("verify_release_request.py", workflow_text)
+        self.assertIn("build_release.py", workflow_text)
+        self.assertIn("id-token: write", workflow_text)
+        self.assertIn("ACTIONS_ID_TOKEN_REQUEST_URL", workflow_text)
+        self.assertIn("roman-deploy@100.67.102.11", workflow_text)
+        self.assertNotIn("sudo ", workflow_text.lower())
+        self.assertIn("needs.authorize-release.result == 'success'", workflow_text)
+        self.assertIn("needs.build-release.result == 'success'", workflow_text)
+        self.assertIn("inputs.operation", workflow_text)
+        workflow_call = workflow.get("on", workflow.get(True, {})).get("workflow_call", {})
+        self.assertIn("platform_ref", workflow_call["inputs"])
+        self.assertIn("registry_ref: ${{ steps.registry-snapshot.outputs.registry_ref }}", workflow_text)
+        self.assertIn("id: registry-snapshot", workflow_text)
+        self.assertIn("path: registry", workflow_text)
+        self.assertIn("path: platform", workflow_text)
+        self.assertIn("--platform-sha \"$PLATFORM_REF\"", workflow_text)
+
+    def test_build_only_workflow_has_no_server_credentials_and_uploads_a_registered_artifact(self):
+        workflow_text = (ROOT / ".github" / "workflows" / "build-application.yml").read_text(encoding="utf-8")
+        workflow = yaml.safe_load(workflow_text)
+        self.assertIn("build_artifact.py", workflow_text)
+        self.assertIn("verify_release_request.py", workflow_text)
+        self.assertIn("actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02", workflow_text)
+        self.assertNotIn("ROMAN_PLATFORM_SSH_PRIVATE_KEY", workflow_text)
+        self.assertNotIn("id-token: write", workflow_text)
+        self.assertNotIn("packages: write", workflow_text)
+        self.assertEqual(workflow["jobs"]["build-and-package"]["permissions"], {"contents": "read"})
+        self.assertIn("inputs.app_id", workflow_text)
 
     def test_production_profile_is_manual_owner_only_and_server_policy_scoped(self):
         workflow = (ROOT / ".github" / "workflows" / "romanlms-private-deploy.yml").read_text(encoding="utf-8")
         for required in (
-            "'romanlms-production' = @{ Workflow='.github/workflows/romanlms-production-deploy.yml'; Environment='production'; ImagePrefix='romanlms-prod' }",
             "github.actor == 'RomanYsrael-cmd'",
             "github.event_name == 'workflow_dispatch'",
             "github.ref == 'refs/heads/main'",
-            "app_id=$env:APP_ID",
-            "environment=$env:DEPLOYMENT_ENVIRONMENT",
-            "currentRun.path -ne $profile.Workflow",
+            "pull-requests: read",
+            "packages: write",
+            "id-token: write",
+            "uses: ./.github/workflows/deploy-application.yml",
         ):
             self.assertIn(required, workflow)
         self.assertIn("inputs.app_id == 'romanlms-production'", workflow)
@@ -150,9 +191,10 @@ class WorkflowContractTests(unittest.TestCase):
 
     def test_expected_unhealthy_rejection_resets_powershell_exit_code(self):
         workflow = (ROOT / ".github" / "workflows" / "romanlms-smoke-deploy.yml").read_text(encoding="utf-8")
-        confirmation = "Write-Host 'Server rejected the unhealthy candidate at the readiness gate.'"
-        self.assertIn(confirmation, workflow)
-        self.assertIn(confirmation + "\n              $global:LASTEXITCODE = 0", workflow)
+        self.assertIn("inputs.operation == 'unhealthy-test' && inputs.confirmation == 'TEST UNHEALTHY SMOKE'", workflow)
+        self.assertIn("'TEST UNHEALTHY PLATFORM SMOKE'", workflow)
+        self.assertIn("'ROLLBACK PLATFORM SMOKE'", workflow)
+        self.assertIn("uses: ./.github/workflows/deploy-application.yml", workflow)
 
 
 class RetainedReleaseContainerTests(unittest.TestCase):
@@ -205,6 +247,10 @@ def request(**overrides):
         "release": {"run_id": "12345", "run_attempt": "1", "actor": "RomanYsrael-cmd"},
     }
     value.update(overrides)
+    if value["operation"] in deploy.PROVENANCE_OPERATIONS:
+        registered = CONFIG["applications"].get(value["app_id"], APP)
+        value["build_spec_sha256"] = deploy._canonical_json_sha256(registered["build"])
+        value["provenance_token"] = "e30.e30.c2ln"
     return value
 
 
@@ -266,8 +312,9 @@ class RequestValidationTests(unittest.TestCase):
                 "trigger_run_attempt": "1",
             },
         )
+        value["build_spec_sha256"] = deploy._canonical_json_sha256(production["build"])
         value.pop("image")
-        with self.assertRaisesRegex(deploy.DeploymentError, "Automatic production release is not enabled"):
+        with self.assertRaisesRegex(deploy.DeploymentError, "Automatic release is not enabled"):
             disabled = json.loads(json.dumps(production))
             disabled["automatic_release_enabled"] = False
             deploy.validate_request(value, {"applications": {"romanlms-production": disabled}})
@@ -349,6 +396,69 @@ class RequestValidationTests(unittest.TestCase):
         value.pop("strategy")
         with self.assertRaisesRegex(deploy.DeploymentError, "not enabled"):
             deploy.validate_request(value, CONFIG)
+
+
+class UniversalServiceDeploymentTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.examples = json.loads((ROOT / "examples" / "application-profiles.json").read_text(encoding="utf-8"))
+
+    def app(self, app_id):
+        return copy.deepcopy(self.examples["applications"][app_id] | {"allowed_platform_shas": [WORKFLOW_SHA]})
+
+    def test_service_request_is_profile_and_digest_allowlisted(self):
+        app = self.app("sample-worker")
+        value = request(
+            operation="deploy-service", app_id=app["app_id"], repository=app["repository"],
+            environment=app["environment"], strategy=app["strategy"],
+            image=app["image_namespace"] + "@sha256:" + DIGEST,
+        )
+        value["build_spec_sha256"] = deploy._canonical_json_sha256(app["build"])
+        config = {"applications": {app["app_id"]: app}}
+        validated, _ = deploy.validate_request(value, config)
+        self.assertEqual(validated["deployment_profile"], "worker")
+        with self.assertRaisesRegex(deploy.DeploymentError, "allowlisted GHCR package"):
+            deploy.validate_request({**value, "image": "ghcr.io/attacker/worker@sha256:" + DIGEST}, config)
+
+    def test_service_request_rejects_a_profile_without_service_adapter(self):
+        with self.assertRaisesRegex(deploy.DeploymentError, "no approved service deployment adapter"):
+            deploy.validate_request(request(operation="deploy-service"), CONFIG)
+
+    def test_service_container_args_enforce_resources_secrets_and_udp_ports(self):
+        app = self.app("sample-game-server")
+        value = request(commit_sha=SHA)
+        image = app["image_namespace"] + "@sha256:" + DIGEST
+        with tempfile.TemporaryDirectory(prefix="service-volume-test-", dir="D:\\CodexTemp") as tmp:
+            data_root = Path(tmp) / "data"
+            with mock.patch.object(deploy, "_service_data_root", return_value=data_root), \
+                 mock.patch.object(deploy.os, "chown", create=True), \
+                 mock.patch.object(deploy, "_secure_env_file", return_value=Path("/safe/game.env")), \
+                 mock.patch.object(deploy, "_env_file_values", return_value={"SERVER_MODE": "production"}):
+                args = deploy._service_container_args(app, value, image, "roman-platform-sample-game-server-aaaaaaaaaaaa")
+        self.assertIn("--memory", args)
+        self.assertIn("2048m", args)
+        self.assertIn("--cpus", args)
+        self.assertIn("--user", args)
+        self.assertIn("10001:10001", args)
+        self.assertIn("0.0.0.0:19132:19132/udp", args)
+        self.assertTrue(any(item.startswith("type=bind,src=") and item.endswith(",dst=/data") for item in args))
+        self.assertIn("--env-file", args)
+
+    def test_scheduled_job_unit_uses_one_immutable_image_and_a_systemd_timer(self):
+        app = self.app("sample-scheduled-job")
+        value = request(commit_sha=SHA)
+        image = app["image_namespace"] + "@sha256:" + DIGEST
+        service, timer = deploy._scheduled_unit_content(app, value, image)
+        self.assertIn("ExecStart=/usr/bin/docker run --rm", service)
+        self.assertIn(image, service)
+        self.assertIn("OnCalendar=Mon..Fri *-*-* 03:00:00 UTC", timer)
+        self.assertIn("roman-platform-sample-scheduled-job.service", timer)
+        self.assertNotIn("docker run --rm --restart", service)
+
+    def test_unhealthy_service_container_is_rejected(self):
+        with mock.patch.object(deploy, "run_command", return_value=subprocess.CompletedProcess([], 0, "unhealthy|running", "")):
+            with self.assertRaisesRegex(deploy.DeploymentError, "failed its configured Docker health check"):
+                deploy._wait_service_container("roman-platform-worker", 10)
 
 
 class RomanLmsContainerPolicyTests(unittest.TestCase):
@@ -501,7 +611,11 @@ class RomanLmsContainerPolicyTests(unittest.TestCase):
                  mock.patch.object(deploy, "_env_file_values", return_value=values), \
                  mock.patch.object(deploy, "registry_session") as registry:
                 with self.assertRaises(deploy.DeploymentError):
-                    deploy._validate_database({}, {"database_env_file": "/private/env"})
+                    deploy._validate_database(
+                        {"operation": "deploy-stack", "migration_image": "ghcr.io/example/migrator@sha256:" + DIGEST},
+                        {"database_env_file": "/private/env", "database": {"migration_adapter": "flyway"},
+                         "flyway_cli_version": "11.14.1", "schema_migration": None},
+                    )
                 registry.assert_not_called()
 
     def test_missing_environment_file_is_rejected(self):
@@ -540,13 +654,23 @@ class FlywayMigrationPolicyTests(unittest.TestCase):
     def setUp(self):
         self.app = copy.deepcopy(CONFIG["applications"]["romanlms-production"])
         self.exceptions = self.app["flyway_history_exceptions"]
+        self.plan = deploy.ForwardMigrationPlan(
+            "132", "133",
+            (("133", "V133__tesda_lamr_report_settings.sql", "tesda lamr report settings", 850684505),),
+            "f" * 64,
+        )
         self.pending_info = {
             "schemaVersion": "132",
             "flywayVersion": "11.14.1",
             "schemaName": "roman_lms",
             "warnings": None,
             "migrations": [
-                {"state": "Success", "version": "132"},
+                {
+                    "state": "Success", "category": "Versioned", "type": "SQL", "version": "132",
+                    "description": "chat attachments and reactions",
+                    "filepath": "/flyway/sql/V132__chat_attachments_and_reactions.sql",
+                    "checksum": 339539790,
+                },
                 *copy.deepcopy(self.exceptions),
                 {
                     "state": "Pending",
@@ -555,11 +679,25 @@ class FlywayMigrationPolicyTests(unittest.TestCase):
                     "version": "133",
                     "description": "tesda lamr report settings",
                     "filepath": "/flyway/sql/V133__tesda_lamr_report_settings.sql",
+                    "checksum": 850684505,
                 },
             ],
         }
 
-    def test_only_the_exact_approved_v133_migration_and_legacy_rows_are_accepted(self):
+    def _bound_plan(self, request_value, database_values):
+        fingerprint = deploy._release_plan_fingerprint(
+            self.plan, request_value, self.app, database_values,
+        )
+        return deploy.ForwardMigrationPlan(
+            self.plan.source_version,
+            self.plan.target_version,
+            self.plan.pending,
+            self.plan.fingerprint,
+            self.plan.history,
+            fingerprint,
+        )
+
+    def test_multiple_pending_migrations_are_ordered_and_dynamically_targeted(self):
         deploy._verify_flyway_migration_plan(
             json.dumps(self.pending_info),
             self.app,
@@ -569,17 +707,17 @@ class FlywayMigrationPolicyTests(unittest.TestCase):
         )
         rejected = []
         wrong_path = copy.deepcopy(self.pending_info)
-        wrong_path["migrations"][-1]["filepath"] = "/flyway/sql/V133__unapproved.sql"
+        wrong_path["migrations"][-1]["filepath"] = "/tmp/V133__tesda_lamr_report_settings.sql"
         rejected.append(wrong_path)
-        wrong_checksum = copy.deepcopy(self.pending_info)
-        wrong_checksum["migrations"][-1]["checksum"] = 123
-        rejected.append(wrong_checksum)
         wrong_source = copy.deepcopy(self.pending_info)
         wrong_source["schemaVersion"] = "131"
         rejected.append(wrong_source)
-        multiple_pending = copy.deepcopy(self.pending_info)
-        multiple_pending["migrations"].append({**multiple_pending["migrations"][-1], "version": "134"})
-        rejected.append(multiple_pending)
+        duplicate_version = copy.deepcopy(self.pending_info)
+        duplicate_version["migrations"].append({**duplicate_version["migrations"][-1], "version": "133"})
+        rejected.append(duplicate_version)
+        out_of_order = copy.deepcopy(self.pending_info)
+        out_of_order["migrations"].append({**out_of_order["migrations"][-1], "version": "132.5"})
+        rejected.append(out_of_order)
         unapproved_state = copy.deepcopy(self.pending_info)
         unapproved_state["migrations"].append({"state": "Failed", "version": "129"})
         rejected.append(unapproved_state)
@@ -590,17 +728,34 @@ class FlywayMigrationPolicyTests(unittest.TestCase):
             with self.subTest(report=report), self.assertRaises(deploy.DeploymentError):
                 deploy._verify_flyway_migration_plan(json.dumps(report), self.app, self.exceptions)
 
+        multi = copy.deepcopy(self.pending_info)
+        multi["migrations"].append({
+            "state": "Pending", "category": "Versioned", "type": "SQL", "version": "134",
+            "description": "gds simulator tables", "filepath": "/flyway/sql/V134__gds_simulator_tables.sql",
+            "checksum": 123456789,
+        })
+        plan = deploy._verify_flyway_migration_plan(json.dumps(multi), self.app, self.exceptions)
+        self.assertEqual(plan.source_version, "132")
+        self.assertEqual(plan.target_version, "134")
+        self.assertEqual([row[0] for row in plan.pending], ["133", "134"])
+        changed_checksum = copy.deepcopy(self.pending_info)
+        changed_checksum["migrations"][-1]["checksum"] = 123
+        changed_plan = deploy._verify_flyway_migration_plan(json.dumps(changed_checksum), self.app, self.exceptions)
+        self.assertNotEqual(plan.fingerprint, changed_plan.fingerprint)
+
     def test_deploy_preflight_recognizes_only_the_exact_pending_plan(self):
         request_value = {
             "operation": "deploy-stack",
             "commit_sha": SHA,
+            "platform_sha": WORKFLOW_SHA,
             "migration_image": "registry/migrator@sha256:" + DIGEST,
-            "release": {"run_id": "123", "actor": "RomanYsrael-cmd"},
+            "release": {"run_id": "123", "run_attempt": "1", "actor": "RomanYsrael-cmd"},
         }
         commands = [
             subprocess.CompletedProcess([], 0, "", ""),
             subprocess.CompletedProcess([], 0, "", ""),
             subprocess.CompletedProcess([], 0, json.dumps(self.pending_info), ""),
+            subprocess.CompletedProcess([], 0, "[]", ""),
         ]
         with mock.patch.object(deploy, "_secure_env_file", return_value=Path("/safe/database.env")), \
              mock.patch.object(deploy, "_env_file_values", return_value={
@@ -613,12 +768,17 @@ class FlywayMigrationPolicyTests(unittest.TestCase):
                  "DB_PASSWORD": "local-migration-secret",
              })), mock.patch.object(deploy, "registry_session", return_value=contextlib.nullcontext({})), \
              mock.patch.object(deploy, "run_command", side_effect=commands), \
+             mock.patch.object(deploy, "_bind_flyway_plan_checksums", side_effect=lambda info, history, image, app, env: info), \
              mock.patch.object(deploy, "_verify_image"), mock.patch.object(deploy, "_append_audit"), \
              mock.patch.object(deploy, "_read_state", return_value={}), mock.patch.object(deploy, "_write_metrics"):
             result = deploy._validate_database(request_value, self.app, allow_pending_migration=True)
         self.assertTrue(result["migration_pending"])
+        self.assertRegex(result["migration_plan"]["release_fingerprint"], r"^[0-9a-f]{64}$")
 
-        commands[-1] = subprocess.CompletedProcess([], 0, json.dumps({**self.pending_info, "migrations": []}), "")
+        commands[2] = subprocess.CompletedProcess([], 0, json.dumps({
+            **self.pending_info,
+            "migrations": [self.pending_info["migrations"][0], *self.exceptions],
+        }), "")
         with mock.patch.object(deploy, "_secure_env_file", return_value=Path("/safe/database.env")), \
              mock.patch.object(deploy, "_env_file_values", return_value={
                  "DB_URL": "jdbc:postgresql://127.0.0.1:5432/romanlms_prod",
@@ -630,30 +790,43 @@ class FlywayMigrationPolicyTests(unittest.TestCase):
                  "DB_PASSWORD": "local-migration-secret",
              })), mock.patch.object(deploy, "registry_session", return_value=contextlib.nullcontext({})), \
              mock.patch.object(deploy, "run_command", side_effect=commands), \
+             mock.patch.object(deploy, "_bind_flyway_plan_checksums", side_effect=lambda info, history, image, app, env: info), \
              mock.patch.object(deploy, "_verify_image"), mock.patch.object(deploy, "_append_audit"), \
              mock.patch.object(deploy, "_read_state", return_value={}), mock.patch.object(deploy, "_write_metrics"):
-            with self.assertRaises(deploy.DeploymentError):
-                deploy._validate_database(request_value, self.app, allow_pending_migration=True)
+            result = deploy._validate_database(request_value, self.app, allow_pending_migration=True)
+        self.assertFalse(result["migration_pending"])
 
     def test_database_preflight_never_runs_unapproved_flyway_commands(self):
         request_value = {"migration_image": "registry/migrator@sha256:" + DIGEST}
-        args = deploy._flyway_container_args(request_value, self.app, Path("/safe/database.env"), "migrate")
+        args = deploy._flyway_container_args(request_value, self.app, Path("/safe/database.env"), "migrate", migration_plan=self.plan)
         self.assertIn("--read-only", args)
         self.assertIn("--cap-drop", args)
-        self.assertEqual(args[args.index("--env") + 1], "EXPECTED_TARGET_VERSION=133")
-        self.assertEqual(args[-3:], [request_value["migration_image"], '-initSql=SET ROLE "romanlms_app"', "migrate"])
+        self.assertEqual(args[args.index("--env") + 1], "FLYWAY_CLI_VERSION=11.14.1")
+        self.assertIn("MIGRATION_TARGET_VERSION=133", args)
+        self.assertEqual(args[-2:], [request_value["migration_image"], "migrate"])
+        self.assertIn("FLYWAY_SCHEMA=roman_lms", args)
         validate_args = deploy._flyway_container_args(request_value, self.app, Path("/safe/database.env"), "validate")
-        self.assertNotIn('-initSql=SET ROLE "romanlms_app"', validate_args)
+        self.assertNotIn("MIGRATION_EXECUTION_ROLE=romanlms_app", validate_args)
+        history_args = deploy._flyway_container_args(request_value, self.app, Path("/safe/database.env"), "history")
+        self.assertEqual(history_args[-2:], [request_value["migration_image"], "history"])
         with self.assertRaises(deploy.DeploymentError):
             deploy._flyway_container_args(request_value, self.app, Path("/safe/database.env"), "repair")
 
     def test_migration_uses_a_release_scoped_container_and_removes_it_after_timeout(self):
         request_value = {
             "commit_sha": SHA,
+            "platform_sha": WORKFLOW_SHA,
             "migration_image": "registry/migrator@sha256:" + DIGEST,
             "release": {"run_id": "123", "run_attempt": "2", "actor": "RomanYsrael-cmd"},
         }
-        missing = subprocess.CompletedProcess([], 1, "", "Error: No such object: romanlms-flyway-123-2")
+        migration_values = {
+            "DB_URL": "jdbc:postgresql://127.0.0.1:5432/romanlms_prod",
+            "DB_USERNAME": "romanlms_migrator",
+            "DB_PASSWORD": "migration-secret",
+        }
+        bound_plan = self._bound_plan(request_value, migration_values)
+        migration_container = "roman-platform-migration-romanlms-production-123-2"
+        missing = subprocess.CompletedProcess([], 1, "", f"Error: No such object: {migration_container}")
         with mock.patch.object(deploy, "run_command", side_effect=[
             missing,
             subprocess.CompletedProcess([], 0, "migrated", ""),
@@ -662,9 +835,9 @@ class FlywayMigrationPolicyTests(unittest.TestCase):
                 "DB_URL": "jdbc:postgresql://127.0.0.1:5432/romanlms_prod",
                 "DB_USERNAME": "romanlms_migrator",
                 "DB_PASSWORD": "migration-secret",
-            })
+            }, bound_plan)
         self.assertIn("--name", run.call_args_list[1].args[0])
-        self.assertIn("romanlms-flyway-123-2", run.call_args_list[1].args[0])
+        self.assertIn(migration_container, run.call_args_list[1].args[0])
         command_args = run.call_args_list[1].args[0]
         self.assertEqual(Path(command_args[command_args.index("--env-file") + 1]), Path("/safe/migration.env"))
         self.assertEqual(run.call_args_list[1].kwargs["redactions"], (
@@ -677,13 +850,13 @@ class FlywayMigrationPolicyTests(unittest.TestCase):
             subprocess.CompletedProcess([], 0, "removed", ""),
             missing,
         ]) as run, mock.patch.object(deploy, "_append_audit"):
-            with self.assertRaisesRegex(deploy.DeploymentError, "timed out"):
+            with self.assertRaisesRegex(deploy.MigrationOutcomeUnknown, "outcome is unknown"):
                 deploy._run_approved_migration(request_value, self.app, Path("/safe/migration.env"), {
                     "DB_URL": "jdbc:postgresql://127.0.0.1:5432/romanlms_prod",
                     "DB_USERNAME": "romanlms_migrator",
                     "DB_PASSWORD": "migration-secret",
-                })
-        self.assertEqual(run.call_args_list[2].args[0][:4], ["docker", "rm", "--force", "romanlms-flyway-123-2"])
+                }, bound_plan)
+        self.assertEqual(run.call_args_list[2].args[0][:4], ["docker", "rm", "--force", migration_container])
 
         with mock.patch.object(deploy, "run_command", side_effect=[
             missing,
@@ -691,21 +864,64 @@ class FlywayMigrationPolicyTests(unittest.TestCase):
             subprocess.CompletedProcess([], 0, "removed", ""),
             missing,
         ]) as run, mock.patch.object(deploy, "_append_audit"):
-            with self.assertRaisesRegex(deploy.DeploymentError, "migration failed"):
+            with self.assertRaisesRegex(deploy.MigrationOutcomeUnknown, "migration failure"):
                 deploy._run_approved_migration(request_value, self.app, Path("/safe/migration.env"), {
                     "DB_URL": "jdbc:postgresql://127.0.0.1:5432/romanlms_prod",
                     "DB_USERNAME": "romanlms_migrator",
                     "DB_PASSWORD": "migration-secret",
-                })
-        self.assertEqual(run.call_args_list[2].args[0][:4], ["docker", "rm", "--force", "romanlms-flyway-123-2"])
+                }, bound_plan)
+        self.assertEqual(run.call_args_list[2].args[0][:4], ["docker", "rm", "--force", migration_container])
+
+    def test_migration_plan_rejects_a_different_release_or_database_binding(self):
+        request_value = {
+            "commit_sha": SHA,
+            "platform_sha": WORKFLOW_SHA,
+            "migration_image": "registry/migrator@sha256:" + DIGEST,
+            "release": {"run_id": "123", "run_attempt": "1", "actor": "RomanYsrael-cmd"},
+        }
+        migration_values = {
+            "DB_URL": "jdbc:postgresql://127.0.0.1:5432/romanlms_prod",
+            "DB_USERNAME": "romanlms_migrator",
+            "DB_PASSWORD": "migration-secret",
+        }
+        bound_plan = self._bound_plan(request_value, migration_values)
+        alternatives = (
+            ({**request_value, "commit_sha": "e" * 40}, migration_values),
+            ({**request_value, "migration_image": "registry/migrator@sha256:" + "d" * 64}, migration_values),
+            (request_value, {**migration_values, "DB_URL": "jdbc:postgresql://127.0.0.1:5432/other_db"}),
+        )
+        for changed_request, changed_database in alternatives:
+            with self.subTest(request=changed_request, database=changed_database), \
+                 mock.patch.object(deploy, "run_command") as run:
+                with self.assertRaisesRegex(deploy.DeploymentError, "not bound to this exact release"):
+                    deploy._run_approved_migration(
+                        changed_request, self.app, Path("/safe/migration.env"), changed_database, bound_plan,
+                    )
+                run.assert_not_called()
+
+        with self.assertRaisesRegex(deploy.DeploymentError, "credentials must use"):
+            deploy._release_plan_fingerprint(
+                self.plan,
+                request_value,
+                self.app,
+                {**migration_values, "DB_URL": "jdbc:postgresql://migrator:secret@127.0.0.1:5432/romanlms_prod"},
+            )
 
     def test_unconfirmed_migration_container_cleanup_marks_the_outcome_unknown(self):
         request_value = {
             "commit_sha": SHA,
+            "platform_sha": WORKFLOW_SHA,
             "migration_image": "registry/migrator@sha256:" + DIGEST,
             "release": {"run_id": "123", "run_attempt": "2", "actor": "RomanYsrael-cmd"},
         }
-        missing = subprocess.CompletedProcess([], 1, "", "Error: No such object: romanlms-flyway-123-2")
+        migration_values = {
+            "DB_URL": "jdbc:postgresql://127.0.0.1:5432/romanlms_prod",
+            "DB_USERNAME": "romanlms_migrator",
+            "DB_PASSWORD": "migration-secret",
+        }
+        bound_plan = self._bound_plan(request_value, migration_values)
+        migration_container = "roman-platform-migration-romanlms-production-123-2"
+        missing = subprocess.CompletedProcess([], 1, "", f"Error: No such object: {migration_container}")
         with mock.patch.object(deploy, "run_command", side_effect=[
             missing,
             deploy.DeploymentError("migration command timed out"),
@@ -716,7 +932,7 @@ class FlywayMigrationPolicyTests(unittest.TestCase):
                     "DB_URL": "jdbc:postgresql://127.0.0.1:5432/romanlms_prod",
                     "DB_USERNAME": "romanlms_migrator",
                     "DB_PASSWORD": "migration-secret",
-                })
+                }, bound_plan)
 
         with mock.patch.object(deploy, "run_command", return_value=subprocess.CompletedProcess([], 0, "running", "")), \
              mock.patch.object(deploy, "_append_audit"):
@@ -725,7 +941,7 @@ class FlywayMigrationPolicyTests(unittest.TestCase):
                     "DB_URL": "jdbc:postgresql://127.0.0.1:5432/romanlms_prod",
                     "DB_USERNAME": "romanlms_migrator",
                     "DB_PASSWORD": "migration-secret",
-                })
+                }, bound_plan)
 
         with mock.patch.object(deploy, "run_command", side_effect=deploy.DeploymentError("docker daemon unavailable")), \
              mock.patch.object(deploy, "_append_audit"):
@@ -734,7 +950,7 @@ class FlywayMigrationPolicyTests(unittest.TestCase):
                     "DB_URL": "jdbc:postgresql://127.0.0.1:5432/romanlms_prod",
                     "DB_USERNAME": "romanlms_migrator",
                     "DB_PASSWORD": "migration-secret",
-                })
+                }, bound_plan)
 
     def test_fresh_full_backup_is_required_and_its_identity_is_audited(self):
         request_value = {"commit_sha": SHA, "release": {"run_id": "123", "actor": "RomanYsrael-cmd"}}
@@ -753,7 +969,7 @@ class FlywayMigrationPolicyTests(unittest.TestCase):
                  subprocess.CompletedProcess([], 0, "verified", ""),
              ]) as run, mock.patch.object(deploy, "time") as clock, mock.patch.object(deploy, "_append_audit") as audit:
             clock.time.return_value = 1000
-            label = deploy._create_verified_production_backup(self.app, request_value)
+            label = deploy._create_verified_production_backup(self.app, request_value, self.plan)
         self.assertEqual(label, "20261119-010203F")
         self.assertIn("--type=full", run.call_args_list[0].args[0])
         self.assertEqual(run.call_args_list[0].args[0][-1], "backup")
@@ -776,7 +992,7 @@ class FlywayMigrationPolicyTests(unittest.TestCase):
                  subprocess.CompletedProcess([], 0, json.dumps(stale), ""),
              ]), mock.patch.object(deploy.time, "time", return_value=1000), mock.patch.object(deploy, "_append_audit"):
             with self.assertRaisesRegex(deploy.DeploymentError, "could not be verified"):
-                deploy._create_verified_production_backup(self.app, request_value)
+                deploy._create_verified_production_backup(self.app, request_value, self.plan)
 
     def test_database_writer_check_uses_the_app_role_without_exposing_password(self):
         values = {
@@ -787,12 +1003,14 @@ class FlywayMigrationPolicyTests(unittest.TestCase):
         with mock.patch.object(deploy, "run_command", return_value=subprocess.CompletedProcess([], 0, "0\n", "")) as run:
             deploy._assert_no_application_writers(self.app, values)
         args = run.call_args.args[0]
-        self.assertTrue(any("usename = 'roman_app'" in arg for arg in args))
+        self.assertTrue(any("usename IN ('romanlms_app')" in arg for arg in args))
         self.assertNotIn("app_user=roman_app", args)
         self.assertNotIn(values["DB_PASSWORD"], args)
         with mock.patch.object(deploy, "run_command") as run:
+            bad_policy = copy.deepcopy(self.app)
+            bad_policy["schema_migration"]["writer_usernames"] = ["bad'role"]
             with self.assertRaises(deploy.DeploymentError):
-                deploy._assert_no_application_writers(self.app, {**values, "DB_USERNAME": "bad'role"})
+                deploy._assert_no_application_writers(bad_policy, values)
         run.assert_not_called()
 
 
@@ -805,11 +1023,23 @@ class StackDeploymentTests(unittest.TestCase):
         self.route.write_text("return 503;\n", encoding="utf-8")
         self.state = root / "state.json"
         self.app = dict(APP, app_id="test-stack", state_file=str(self.state), route_file=str(self.route),
-                        container_network="private-stack", network_subnet="172.30.66.0/24", private_listener_port=18081, container_publish=False, expected_schema_version="132", components={
+                        container_network="private-stack", network_subnet="172.30.66.0/24", private_listener_port=18081, container_publish=False, components={
             "backend": {"route_prefix": "/lms/", "container_port": 8080, "slot_ips": {"blue": "172.30.66.21", "green": "172.30.66.22"}, "route_health_url": "http://127.0.0.1:18081/lms/actuator/health"},
             "frontend": {"route_prefix": "/", "container_port": 3000, "slot_ips": {"blue": "172.30.66.31", "green": "172.30.66.32"}, "route_health_url": "http://127.0.0.1:18081/"},
         })
         self.request = request(operation="deploy-stack", images={"backend": "image-b", "frontend": "image-f"}, migration_image="migration")
+
+    @staticmethod
+    def _database_status(*, pending=False, schema_version="132"):
+        rows = (("133", "V133__tesda_lamr_report_settings.sql", "tesda lamr report settings", 850684505),) if pending else ()
+        target = "133" if pending else schema_version
+        plan = deploy.ForwardMigrationPlan("132" if pending else schema_version, target, rows, "d" * 64)
+        return {
+            "migration_pending": pending,
+            "schema_version": schema_version,
+            "migration_target_version": target,
+            "migration_plan": deploy._migration_plan_data(plan),
+        }
 
     def _active_release_with_backend(self):
         old_sha = "d" * 40
@@ -826,15 +1056,17 @@ class StackDeploymentTests(unittest.TestCase):
             "app_id": self.app["app_id"],
             "slot": "green",
             "commit_sha": old_sha,
+            "platform_sha": WORKFLOW_SHA,
             "schema_version": "132",
+            "migration_image": "ghcr.io/romanysrael-cmd/romanlms-prod-migrator@sha256:" + DIGEST,
             "components": components,
         }
 
     def _configure_v133_migration(self):
         production = CONFIG["applications"]["romanlms-production"]
-        self.app["expected_schema_version"] = "133"
         self.app["schema_migration"] = copy.deepcopy(production["schema_migration"])
         self.app["production_backup"] = copy.deepcopy(production["production_backup"])
+        self.app["database"] = copy.deepcopy(production["database"])
 
     def test_migration_waits_for_backup_quiescence_and_a_fresh_pending_plan(self):
         self._configure_v133_migration()
@@ -842,11 +1074,15 @@ class StackDeploymentTests(unittest.TestCase):
         active = self._active_release_with_backend()
         self.state.write_text(json.dumps({"active": active, "previous": None}), encoding="utf-8")
         events = []
-        statuses = iter((True, True, False))
+        statuses = iter((
+            self._database_status(pending=True),
+            self._database_status(pending=True),
+            self._database_status(schema_version="133"),
+        ))
 
         def validate(*args, **kwargs):
             events.append("database-preflight" if len(events) == 0 else "database-recheck")
-            return {"migration_pending": next(statuses)}
+            return next(statuses)
 
         def run(args, **kwargs):
             if args[:2] == ["docker", "run"]:
@@ -871,7 +1107,7 @@ class StackDeploymentTests(unittest.TestCase):
             mock.patch.object(deploy, "_env_file_values", return_value={"DB_URL": "jdbc:postgresql://127.0.0.1:5432/romanlms_prod", "DB_USERNAME": "roman_app", "DB_PASSWORD": "secret"}),
             mock.patch.object(deploy, "_migration_database_env", return_value=(Path("/safe/migration.env"), {"DB_URL": "jdbc:postgresql://127.0.0.1:5432/romanlms_prod", "DB_USERNAME": "romanlms_migrator", "DB_PASSWORD": "migration-secret"})),
             mock.patch.object(deploy, "_assert_no_application_writers", side_effect=lambda *args: events.append("writers-stopped")),
-            mock.patch.object(deploy, "_run_approved_migration", side_effect=lambda *args: events.append("migrate")),
+             mock.patch.object(deploy, "_run_approved_migration", side_effect=lambda *args: events.append("migrate")),
             mock.patch.object(deploy, "_check_backend_start_memory"),
             mock.patch.object(deploy, "available_memory_bytes", return_value=4 * 1024**3),
         ]
@@ -894,7 +1130,7 @@ class StackDeploymentTests(unittest.TestCase):
         self.state.write_text(json.dumps({"active": active, "previous": None}), encoding="utf-8")
         commands = []
         run = lambda args, **kwargs: commands.append(args) or subprocess.CompletedProcess(args, 0, "", "")
-        with mock.patch.object(deploy, "_validate_database", return_value={"migration_pending": True}), \
+        with mock.patch.object(deploy, "_validate_database", return_value=self._database_status(pending=True)), \
              mock.patch.object(deploy, "registry_session", return_value=contextlib.nullcontext({})), \
              mock.patch.object(deploy, "run_command", side_effect=run), mock.patch.object(deploy, "_verify_image"), \
              mock.patch.object(deploy, "_stack_release_healthy"), mock.patch.object(deploy, "_create_verified_production_backup", side_effect=deploy.DeploymentError("backup failed")), \
@@ -913,7 +1149,7 @@ class StackDeploymentTests(unittest.TestCase):
         active = self._active_release_with_backend()
         active["schema_version"] = "131"
         self.state.write_text(json.dumps({"active": active, "previous": None}), encoding="utf-8")
-        with mock.patch.object(deploy, "_validate_database", return_value={"migration_pending": True}), \
+        with mock.patch.object(deploy, "_validate_database", return_value=self._database_status(pending=True)), \
              mock.patch.object(deploy, "registry_session", return_value=contextlib.nullcontext({})), \
              mock.patch.object(deploy, "run_command", return_value=subprocess.CompletedProcess([], 0, "", "")), \
              mock.patch.object(deploy, "_verify_image"), mock.patch.object(deploy, "_stack_release_healthy"), \
@@ -931,14 +1167,14 @@ class StackDeploymentTests(unittest.TestCase):
         self.app["single_backend_maintenance"] = True
         active = self._active_release_with_backend()
         self.state.write_text(json.dumps({"active": active, "previous": None}), encoding="utf-8")
-        statuses = iter((True, True))
+        statuses = iter((self._database_status(pending=True), self._database_status(pending=True)))
         commands = []
 
         def run(args, **kwargs):
             commands.append(args)
             return subprocess.CompletedProcess(args, 0, "", "")
 
-        with mock.patch.object(deploy, "_validate_database", side_effect=lambda *args, **kwargs: {"migration_pending": next(statuses)}), \
+        with mock.patch.object(deploy, "_validate_database", side_effect=lambda *args, **kwargs: next(statuses)), \
              mock.patch.object(deploy, "registry_session", return_value=contextlib.nullcontext({})), \
              mock.patch.object(deploy, "run_command", side_effect=run), mock.patch.object(deploy, "_verify_image"), \
              mock.patch.object(deploy, "_stack_release_healthy"), mock.patch.object(deploy, "_create_verified_production_backup", return_value="20261119-010203F"), \
@@ -952,18 +1188,23 @@ class StackDeploymentTests(unittest.TestCase):
         restart.assert_not_called()
         self.assertFalse(any(args[:2] == ["docker", "run"] for args in commands))
 
-    def test_candidate_failure_restores_old_backend_only_after_schema_compatibility_check(self):
+    def test_candidate_failure_after_forward_migration_keeps_old_backend_stopped(self):
         self._configure_v133_migration()
         self.app["single_backend_maintenance"] = True
         active = self._active_release_with_backend()
         self.state.write_text(json.dumps({"active": active, "previous": None}), encoding="utf-8")
         events = []
-        statuses = iter((True, True, False, False))
+        statuses = iter((
+            self._database_status(pending=True),
+            self._database_status(pending=True),
+            self._database_status(schema_version="133"),
+            self._database_status(schema_version="133"),
+        ))
         readiness = iter((None, deploy.DeploymentError("candidate readiness failed")))
 
         def validate(*args, **kwargs):
             events.append("schema-checked")
-            return {"migration_pending": next(statuses)}
+            return next(statuses)
 
         def run(args, **kwargs):
             if args[:2] == ["docker", "run"]:
@@ -1001,11 +1242,10 @@ class StackDeploymentTests(unittest.TestCase):
             for patcher in patches:
                 stack.enter_context(patcher)
             switch = stack.enter_context(mock.patch.object(deploy, "_switch_stack_route"))
-            with self.assertRaisesRegex(deploy.DeploymentError, "candidate readiness failed"):
+            with self.assertRaisesRegex(deploy.DeploymentError, "database migrated forward"):
                 deploy._deploy_stack(self.request, self.app)
 
-        last_schema_check = max(index for index, event in enumerate(events) if event == "schema-checked")
-        self.assertLess(last_schema_check, events.index("retained-backend-restored"))
+        self.assertNotIn("retained-backend-restored", events)
         self.assertEqual(events.count("candidate-start"), 2)
         switch.assert_not_called()
         self.assertEqual(self.route.read_text(encoding="utf-8"), "return 503;\n")
@@ -1062,7 +1302,7 @@ class StackDeploymentTests(unittest.TestCase):
         def switch(app, slot):
             self.assertEqual(sum(args[:2] == ["docker", "run"] for args in commands), 2)
             self.route.write_text("switched " + slot, encoding="utf-8")
-        with mock.patch.object(deploy, "_validate_database", return_value={"migration_pending": False}), mock.patch.object(deploy, "registry_session", return_value=contextlib.nullcontext({})), \
+        with mock.patch.object(deploy, "_validate_database", return_value=self._database_status()), mock.patch.object(deploy, "registry_session", return_value=contextlib.nullcontext({})), \
              mock.patch.object(deploy, "run_command", side_effect=run), mock.patch.object(deploy, "_verify_image"), \
              mock.patch.object(deploy, "_remove_inactive_slot"), mock.patch.object(deploy, "_stack_release_healthy"), \
              mock.patch.object(deploy, "verify_release_origin"), mock.patch.object(deploy, "_switch_stack_route", side_effect=switch), \
@@ -1074,6 +1314,36 @@ class StackDeploymentTests(unittest.TestCase):
         self.assertEqual(self.route.read_text(encoding="utf-8"), "switched blue")
         candidate_commands = [args for args in commands if args[:2] == ["docker", "run"]]
         self.assertTrue(all("--publish" not in args and "--ip" in args for args in candidate_commands))
+
+    def test_app_only_release_rechecks_schema_history_before_switching_traffic(self):
+        initial = self._database_status()
+        changed = copy.deepcopy(initial)
+        changed["migration_plan"]["fingerprint"] = "e" * 64
+        statuses = iter((initial, changed))
+        commands = []
+
+        def run(args, **kwargs):
+            commands.append(args)
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        with mock.patch.object(deploy, "_validate_database", side_effect=lambda *args, **kwargs: next(statuses)), \
+             mock.patch.object(deploy, "registry_session", return_value=contextlib.nullcontext({})), \
+             mock.patch.object(deploy, "run_command", side_effect=run), mock.patch.object(deploy, "_verify_image"), \
+             mock.patch.object(deploy, "_remove_inactive_slot"), mock.patch.object(deploy, "_stack_release_healthy"), \
+             mock.patch.object(deploy, "verify_release_origin"), mock.patch.object(deploy, "_switch_stack_route") as switch, \
+             mock.patch.object(deploy, "_create_verified_production_backup") as backup, \
+             mock.patch.object(deploy, "_stop_stack_backend") as stop_backend, \
+             mock.patch.object(deploy, "require_storage_mounts"), mock.patch.object(deploy, "_append_audit"), \
+             mock.patch.object(deploy, "_write_metrics"):
+            with self.assertRaisesRegex(deploy.DeploymentError, "history changed during the application rollout"):
+                deploy._deploy_stack(self.request, self.app)
+
+        switch.assert_not_called()
+        backup.assert_not_called()
+        stop_backend.assert_not_called()
+        self.assertEqual(self.route.read_text(encoding="utf-8"), "return 503;\n")
+        self.assertEqual(sum(args[:2] == ["docker", "run"] for args in commands), 2)
+        self.assertEqual(sum(args[:3] == ["docker", "rm", "-f"] for args in commands), 2)
 
     def _active_refresh_release(self):
         commit_sha = "d" * 40
@@ -1108,7 +1378,8 @@ class StackDeploymentTests(unittest.TestCase):
         def switch(app, slot):
             self.route.write_text("switched " + slot, encoding="utf-8")
         refresh_request = request(operation="refresh-stack")
-        with mock.patch.object(deploy, "_stack_release_healthy"), mock.patch.object(deploy, "_stack_route_healthy"), \
+        with mock.patch.object(deploy, "_validate_database", return_value=self._database_status()), \
+             mock.patch.object(deploy, "_stack_release_healthy"), mock.patch.object(deploy, "_stack_route_healthy"), \
              mock.patch.object(deploy, "_verify_retained_stack_images"), mock.patch.object(deploy, "_remove_inactive_slot"), \
              mock.patch.object(deploy, "_container_run_args", return_value=["docker", "run"]), mock.patch.object(deploy, "run_command", side_effect=run), \
              mock.patch.object(deploy, "_switch_stack_route", side_effect=switch), mock.patch.object(deploy, "verify_release_origin"), \
@@ -1135,7 +1406,8 @@ class StackDeploymentTests(unittest.TestCase):
             commands.append(args)
             return subprocess.CompletedProcess(args, 0, "", "")
         refresh_request = request(operation="refresh-stack")
-        with mock.patch.object(deploy, "_stack_release_healthy", side_effect=[None, deploy.DeploymentError("candidate failed")]), \
+        with mock.patch.object(deploy, "_validate_database", return_value=self._database_status()), \
+             mock.patch.object(deploy, "_stack_release_healthy", side_effect=[None, deploy.DeploymentError("candidate failed")]), \
              mock.patch.object(deploy, "_stack_route_healthy"), mock.patch.object(deploy, "_verify_retained_stack_images"), \
              mock.patch.object(deploy, "_remove_inactive_slot"), mock.patch.object(deploy, "_container_run_args", return_value=["docker", "run"]), \
              mock.patch.object(deploy, "run_command", side_effect=run), mock.patch.object(deploy, "_stop_stack_backend"), \
@@ -1177,7 +1449,7 @@ class StackDeploymentTests(unittest.TestCase):
         def switch(app, slot):
             self.route.write_text("switched " + slot, encoding="utf-8")
 
-        with mock.patch.object(deploy, "_validate_database", return_value={"migration_pending": False}), mock.patch.object(deploy, "registry_session", return_value=contextlib.nullcontext({})), \
+        with mock.patch.object(deploy, "_validate_database", return_value=self._database_status()), mock.patch.object(deploy, "registry_session", return_value=contextlib.nullcontext({})), \
              mock.patch.object(deploy, "run_command", side_effect=run), mock.patch.object(deploy, "_verify_image"), \
              mock.patch.object(deploy, "_remove_inactive_slot"), mock.patch.object(deploy, "_release_container_available", return_value=True), \
              mock.patch.object(deploy, "_stack_release_healthy"), mock.patch.object(deploy, "verify_release_origin"), \
@@ -1218,7 +1490,7 @@ class StackDeploymentTests(unittest.TestCase):
 
         failure = deploy.DeploymentError("Readiness check failed: candidate did not start.")
         health = [None, failure, None]
-        with mock.patch.object(deploy, "_validate_database", return_value={"migration_pending": False}), mock.patch.object(deploy, "registry_session", return_value=contextlib.nullcontext({})), \
+        with mock.patch.object(deploy, "_validate_database", return_value=self._database_status()), mock.patch.object(deploy, "registry_session", return_value=contextlib.nullcontext({})), \
              mock.patch.object(deploy, "run_command", side_effect=run), mock.patch.object(deploy, "_verify_image"), \
              mock.patch.object(deploy, "_remove_inactive_slot"), mock.patch.object(deploy, "_release_container_available", return_value=True), \
              mock.patch.object(deploy, "available_memory_bytes", return_value=4 * 1024**3), mock.patch.object(deploy, "_stack_release_healthy", side_effect=health), \
@@ -1238,7 +1510,7 @@ class StackDeploymentTests(unittest.TestCase):
         active = {"slot": "green", "commit_sha": "b" * 40, "schema_version": "132"}
         previous = {"slot": "blue", "commit_sha": "a" * 40, "schema_version": "132"}
         self.state.write_text(json.dumps({"active": active, "previous": previous}), encoding="utf-8")
-        with mock.patch.object(deploy, "_validate_database", return_value={"migration_pending": False}), mock.patch.object(deploy, "_stop_stack_backend"), \
+        with mock.patch.object(deploy, "_validate_database", return_value=self._database_status()), mock.patch.object(deploy, "_stop_stack_backend"), \
              mock.patch.object(deploy, "available_memory_bytes", return_value=1024 * 1024**2), \
              mock.patch.object(deploy, "_start_retained_stack") as start_previous, \
              mock.patch.object(deploy, "_restart_stack_backend") as restore_active, mock.patch.object(deploy, "require_storage_mounts"), \
@@ -1261,7 +1533,7 @@ class StackDeploymentTests(unittest.TestCase):
         def start_previous(*args):
             events.append("start-retained-release")
             return []
-        with mock.patch.object(deploy, "_validate_database", return_value={"migration_pending": False}), mock.patch.object(deploy, "_stop_stack_backend", side_effect=stop_backend), \
+        with mock.patch.object(deploy, "_validate_database", return_value=self._database_status()), mock.patch.object(deploy, "_stop_stack_backend", side_effect=stop_backend), \
              mock.patch.object(deploy, "_start_retained_stack", side_effect=start_previous), mock.patch.object(deploy, "verify_release_origin"), \
              mock.patch.object(deploy, "available_memory_bytes", return_value=4 * 1024**3), mock.patch.object(deploy, "_switch_stack_route"), mock.patch.object(deploy, "require_storage_mounts"), \
              mock.patch.object(deploy, "_append_audit"), mock.patch.object(deploy, "_write_metrics"):
@@ -1271,7 +1543,7 @@ class StackDeploymentTests(unittest.TestCase):
 
     def test_unhealthy_active_release_can_be_replaced_after_candidate_is_healthy(self):
         self.app["allow_unhealthy_active_replacement"] = True
-        active = {"slot": "blue", "commit_sha": "b" * 40, "components": {}}
+        active = {"slot": "blue", "commit_sha": "b" * 40, "schema_version": "132", "components": {}}
         self.state.write_text(json.dumps({"active": active, "previous": None}), encoding="utf-8")
         commands = []
         audit = []
@@ -1284,7 +1556,7 @@ class StackDeploymentTests(unittest.TestCase):
             self.assertEqual(sum(args[:2] == ["docker", "run"] for args in commands), 2)
             self.route.write_text("switched " + slot, encoding="utf-8")
 
-        with mock.patch.object(deploy, "_validate_database", return_value={"migration_pending": False}), mock.patch.object(deploy, "registry_session", return_value=contextlib.nullcontext({})), \
+        with mock.patch.object(deploy, "_validate_database", return_value=self._database_status()), mock.patch.object(deploy, "registry_session", return_value=contextlib.nullcontext({})), \
              mock.patch.object(deploy, "run_command", side_effect=run), mock.patch.object(deploy, "_verify_image"), \
              mock.patch.object(deploy, "_remove_inactive_slot"), \
              mock.patch.object(deploy, "_stack_release_healthy", side_effect=[deploy.DeploymentError("Readiness check failed: TimeoutError."), None]), \
@@ -1302,7 +1574,7 @@ class StackDeploymentTests(unittest.TestCase):
 
     def test_unhealthy_active_replacement_does_not_hide_candidate_readiness_failure(self):
         self.app["allow_unhealthy_active_replacement"] = True
-        active = {"slot": "blue", "commit_sha": "b" * 40, "components": {}}
+        active = {"slot": "blue", "commit_sha": "b" * 40, "schema_version": "132", "components": {}}
         self.state.write_text(json.dumps({"active": active, "previous": None}), encoding="utf-8")
         commands = []
 
@@ -1310,7 +1582,7 @@ class StackDeploymentTests(unittest.TestCase):
             commands.append(args)
             return subprocess.CompletedProcess(args, 0, "", "")
 
-        with mock.patch.object(deploy, "_validate_database", return_value={"migration_pending": False}), mock.patch.object(deploy, "registry_session", return_value=contextlib.nullcontext({})), \
+        with mock.patch.object(deploy, "_validate_database", return_value=self._database_status()), mock.patch.object(deploy, "registry_session", return_value=contextlib.nullcontext({})), \
              mock.patch.object(deploy, "run_command", side_effect=run), mock.patch.object(deploy, "_verify_image"), \
              mock.patch.object(deploy, "_remove_inactive_slot"), \
              mock.patch.object(deploy, "_stack_release_healthy", side_effect=[deploy.DeploymentError("Readiness check failed: TimeoutError."), deploy.DeploymentError("Readiness check failed: HTTP 503 or unexpected response.")]), \
@@ -1328,7 +1600,7 @@ class StackDeploymentTests(unittest.TestCase):
         self.app["allow_unhealthy_active_replacement"] = True
         active = {"slot": "blue", "commit_sha": "b" * 40, "components": {}}
         self.state.write_text(json.dumps({"active": active, "previous": None}), encoding="utf-8")
-        with mock.patch.object(deploy, "_validate_database", return_value={"migration_pending": False}), \
+        with mock.patch.object(deploy, "_validate_database", return_value=self._database_status()), \
              mock.patch.object(deploy, "_stack_release_healthy", side_effect=deploy.DeploymentError("The retained application release state is invalid.")), \
              mock.patch.object(deploy, "registry_session") as registry, mock.patch.object(deploy, "_switch_stack_route") as switch:
             with self.assertRaisesRegex(deploy.DeploymentError, "state is invalid"):
@@ -1339,7 +1611,7 @@ class StackDeploymentTests(unittest.TestCase):
     def test_unhealthy_active_replacement_requires_explicit_server_policy(self):
         active = {"slot": "blue", "commit_sha": "b" * 40, "components": {}}
         self.state.write_text(json.dumps({"active": active, "previous": None}), encoding="utf-8")
-        with mock.patch.object(deploy, "_validate_database", return_value={"migration_pending": False}), \
+        with mock.patch.object(deploy, "_validate_database", return_value=self._database_status()), \
              mock.patch.object(deploy, "_stack_release_healthy", side_effect=deploy.DeploymentError("Readiness check failed: TimeoutError.")), \
              mock.patch.object(deploy, "registry_session") as registry, mock.patch.object(deploy, "_switch_stack_route") as switch:
             with self.assertRaisesRegex(deploy.DeploymentError, "Readiness check failed"):
@@ -1354,7 +1626,7 @@ class StackDeploymentTests(unittest.TestCase):
             if args[:2] == ["docker", "run"] and sum(c[:2] == ["docker", "run"] for c in commands) == 2:
                 raise deploy.DeploymentError("candidate failed")
             return subprocess.CompletedProcess(args, 0, "", "")
-        with mock.patch.object(deploy, "_validate_database", return_value={"migration_pending": False}), mock.patch.object(deploy, "registry_session", return_value=contextlib.nullcontext({})), \
+        with mock.patch.object(deploy, "_validate_database", return_value=self._database_status()), mock.patch.object(deploy, "registry_session", return_value=contextlib.nullcontext({})), \
              mock.patch.object(deploy, "run_command", side_effect=run), mock.patch.object(deploy, "_verify_image"), \
              mock.patch.object(deploy, "_remove_inactive_slot"), mock.patch.object(deploy, "_append_audit"), mock.patch.object(deploy, "_switch_stack_route") as switch:
             with self.assertRaisesRegex(deploy.DeploymentError, "candidate failed"):
@@ -1399,7 +1671,7 @@ class StackDeploymentTests(unittest.TestCase):
         def run(args, **kwargs):
             commands.append(args)
             return subprocess.CompletedProcess(args, 0, "", "")
-        with mock.patch.object(deploy, "_validate_database", return_value={"migration_pending": False}), mock.patch.object(deploy, "registry_session", return_value=contextlib.nullcontext({})), \
+        with mock.patch.object(deploy, "_validate_database", return_value=self._database_status()), mock.patch.object(deploy, "registry_session", return_value=contextlib.nullcontext({})), \
              mock.patch.object(deploy, "run_command", side_effect=run), mock.patch.object(deploy, "_verify_image"), \
              mock.patch.object(deploy, "_remove_inactive_slot"), mock.patch.object(deploy, "_stack_release_healthy", side_effect=deploy.DeploymentError("unhealthy")), \
              mock.patch.object(deploy, "_append_audit"), mock.patch.object(deploy, "_switch_stack_route") as switch:
@@ -1490,7 +1762,7 @@ class StackDeploymentTests(unittest.TestCase):
         active = {"slot": "green", "commit_sha": "b" * 40, "schema_version": "132"}
         previous = {"slot": "blue", "commit_sha": "a" * 40, "schema_version": "132"}
         self.state.write_text(json.dumps({"active": active, "previous": previous}), encoding="utf-8")
-        with mock.patch.object(deploy, "_validate_database", return_value={"migration_pending": False}), mock.patch.object(deploy, "_start_retained_stack", return_value=[]) as health, \
+        with mock.patch.object(deploy, "_validate_database", return_value=self._database_status()), mock.patch.object(deploy, "_start_retained_stack", return_value=[]) as health, \
              mock.patch.object(deploy, "verify_release_origin"), mock.patch.object(deploy, "_switch_stack_route") as switch, \
              mock.patch.object(deploy, "require_storage_mounts"), mock.patch.object(deploy, "_append_audit"), mock.patch.object(deploy, "_write_metrics"):
             result = deploy._rollback_stack(self.request, self.app)
@@ -1503,7 +1775,7 @@ class StackDeploymentTests(unittest.TestCase):
 
     def test_rollback_rejects_a_different_schema_version(self):
         self.state.write_text(json.dumps({"active": {"slot": "green"}, "previous": {"slot": "blue", "schema_version": "131"}}), encoding="utf-8")
-        with mock.patch.object(deploy, "_validate_database", return_value={"migration_pending": False}), mock.patch.object(deploy, "_switch_stack_route") as switch:
+        with mock.patch.object(deploy, "_validate_database", return_value=self._database_status()), mock.patch.object(deploy, "_switch_stack_route") as switch:
             with self.assertRaisesRegex(deploy.DeploymentError, "schema policy"):
                 deploy._rollback_stack(self.request, self.app)
         switch.assert_not_called()
@@ -1528,6 +1800,7 @@ class RomanLmsProductionPolicyTests(unittest.TestCase):
         self.assertRegex(self.app["required_ci_workflow_blob_sha"], r"^[0-9a-f]{40}$")
         self.assertTrue(self.app["allow_unhealthy_active_replacement"])
         self.assertEqual(self.app["allowed_platform_shas"], [
+            "cc58db3a4ac802249992e60ef498205f5d48e1bb",
             "f14001afa20e54681826394dd06a485dafbdcdac",
             "d5a4b3589c1c5057b94f7355f4f4e5f89a646ea6",
             "03ccb655ad7102decea52b1d3dbd67a53b7933d0",
@@ -1549,15 +1822,14 @@ class RomanLmsProductionPolicyTests(unittest.TestCase):
             "32b39d87e8949601c162cd3a8b8eac076bc6684b",
         )
         self.assertEqual(self.app["allowed_database_urls"], ["jdbc:postgresql://127.0.0.1:5432/romanlms_prod"])
-        self.assertEqual(self.app["expected_schema_version"], "133")
+        self.assertNotIn("expected_schema_version", self.app)
         self.assertEqual(deploy._schema_migration_policy(self.app), {
-            "source_version": "132",
-            "target_version": "133",
-            "description": "tesda lamr report settings",
-            "script": "V133__tesda_lamr_report_settings.sql",
-            "checksum": 850684505,
+            "adapter": "flyway",
             "execution_role": "romanlms_app",
-            "previous_release_compatible": True,
+            "max_pending": 32,
+            "writer_usernames": ["romanlms_app"],
+            "rollback_after_migration": "forward-only",
+            "allow_initial_schema": False,
         })
         self.assertEqual(self.app["migration_database_env_file"], "/etc/roman-platform/romanlms-production/migration.env")
         self.assertEqual(self.app["migration_database_username"], "romanlms_migrator")
@@ -1578,14 +1850,11 @@ class RomanLmsProductionPolicyTests(unittest.TestCase):
 
     def test_production_migration_policy_fails_closed_on_unapproved_or_non_forward_changes(self):
         bad_policies = []
-        wrong_source = copy.deepcopy(self.app)
-        wrong_source["schema_migration"]["source_version"] = "133"
-        bad_policies.append(wrong_source)
-        wrong_script = copy.deepcopy(self.app)
-        wrong_script["schema_migration"]["script"] = "V132__other.sql"
-        bad_policies.append(wrong_script)
+        invalid_batch = copy.deepcopy(self.app)
+        invalid_batch["schema_migration"]["max_pending"] = 0
+        bad_policies.append(invalid_batch)
         unsafe_rollback = copy.deepcopy(self.app)
-        unsafe_rollback["schema_migration"]["previous_release_compatible"] = False
+        unsafe_rollback["schema_migration"]["rollback_after_migration"] = "automatic"
         bad_policies.append(unsafe_rollback)
         unsafe_execution_role = copy.deepcopy(self.app)
         unsafe_execution_role["schema_migration"]["execution_role"] = 'romanlms_app"; DROP TABLE roman_lms.users; --'
@@ -1859,6 +2128,9 @@ class ReadinessCheckTests(unittest.TestCase):
 class WorkflowOriginTests(unittest.TestCase):
     def setUp(self):
         self.app = dict(APP, allowed_platform_shas=[WORKFLOW_SHA])
+        self.provenance = mock.patch.object(deploy, "verify_release_provenance", return_value={})
+        self.provenance.start()
+        self.addCleanup(self.provenance.stop)
 
     def _responses(self):
         return [
@@ -1878,6 +2150,11 @@ class WorkflowOriginTests(unittest.TestCase):
             {"commit": {"sha": WORKFLOW_SHA}},
             {"commit": {"sha": SHA}},
             {"sha": SHA},
+            {"workflow_runs": [{
+                "id": 10, "run_attempt": 1, "head_sha": SHA, "head_branch": "main",
+                "event": "push", "status": "completed", "conclusion": "success",
+                "actor": {"login": "RomanYsrael-cmd"},
+            }]},
         ]
 
     def test_accepts_only_configured_in_progress_main_workflow(self):
@@ -1888,6 +2165,8 @@ class WorkflowOriginTests(unittest.TestCase):
     def test_accepts_only_an_explicit_automatic_workflow_run_with_source_ci_identity(self):
         value = request(
             operation="deploy-stack",
+            images={"backend": f"ghcr.io/example/backend@sha256:{DIGEST}", "frontend": f"ghcr.io/example/frontend@sha256:{DIGEST}"},
+            migration_image=f"ghcr.io/example/migrator@sha256:{DIGEST}",
             release={
                 "run_id": "12345",
                 "run_attempt": "1",
@@ -1897,7 +2176,12 @@ class WorkflowOriginTests(unittest.TestCase):
                 "trigger_run_attempt": "2",
             },
         )
-        app = dict(self.app, automatic_workflow_event="workflow_run", automatic_release_enabled=True)
+        app = dict(
+            self.app,
+            automatic_workflow_event="workflow_run",
+            automatic_release_enabled=True,
+            automatic_operations=["deploy-stack"],
+        )
         responses = self._responses()
         responses[0]["event"] = "workflow_run"
         with mock.patch.object(deploy, "github_json", side_effect=responses), \
@@ -2064,7 +2348,7 @@ class GateTests(unittest.TestCase):
             marker.write_text(json.dumps({"source_sha256": "a" * 64, "schema_version": "132"}), encoding="utf-8")
             marker.chmod(0o600)
             app = dict(APP, backup_marker=str(marker), backup_max_age_hours=24,
-                       backup_marker_expected_source_sha256="a" * 64, expected_schema_version="132")
+                       backup_marker_expected_source_sha256="a" * 64, restore_expected_schema_version="132")
             patches = self._healthy_preflight()
             with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6]:
                 deploy.preflight(app)

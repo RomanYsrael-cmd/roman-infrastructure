@@ -16,6 +16,16 @@ jobs:
   validate-and-smoke:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_PASSWORD: migration-integration-only
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
     steps:
       - name: Check out source
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
@@ -39,12 +49,29 @@ jobs:
         if: ${{ steps.changes.outputs.controller == 'true' || steps.changes.outputs.configuration == 'true' || steps.changes.outputs.workflow == 'true' }}
         working-directory: deploy/tests
         run: |
-          python3 -m py_compile ../controller/roman_deploy.py ../controller/romanlms_ci_gate.py test_controller.py test_romanlms_ci_gate.py
-          python3 -m unittest test_romanlms_ci_gate test_controller.WorkflowContractTests test_controller.RequestValidationTests test_controller.RomanLmsContainerPolicyTests test_controller.FlywayMigrationPolicyTests test_controller.StackDeploymentTests test_controller.RomanLmsProductionPolicyTests test_controller.WorkflowOriginTests test_controller.ImageProvenanceTests -v
+          python3 -m py_compile ../controller/roman_deploy.py ../controller/application_registry.py ../controller/forward_migration_plan.py ../controller/romanlms_ci_gate.py ../controller/oidc_provenance.py ../scripts/build_release.py ../scripts/build_artifact.py ../scripts/verify_release_request.py test_controller.py test_application_registry.py test_romanlms_ci_gate.py test_oidc_provenance.py test_release_authorization.py test_build_artifact.py
+          python3 -m unittest test_application_registry test_forward_migration_plan test_romanlms_ci_gate test_oidc_provenance test_release_authorization test_build_artifact test_controller.WorkflowContractTests test_controller.RequestValidationTests test_controller.RomanLmsContainerPolicyTests test_controller.FlywayMigrationPolicyTests test_controller.StackDeploymentTests test_controller.RomanLmsProductionPolicyTests test_controller.WorkflowOriginTests test_controller.ImageProvenanceTests -v
+
+      - name: Exercise dynamic Flyway plans against disposable PostgreSQL
+        if: ${{ steps.changes.outputs.controller == 'true' || steps.changes.outputs.configuration == 'true' }}
+        env:
+          POSTGRES_CONTAINER: ${{ job.services.postgres.id }}
+          MIGRATION_DB_PASSWORD: migration-integration-only
+          RUNNER_TEMP: ${{ runner.temp }}
+        run: bash deploy/tests/run_flyway_postgres_integration.sh
 
       - name: Validate application policy JSON
         if: ${{ steps.changes.outputs.configuration == 'true' }}
-        run: python3 -m json.tool platform/applications.json >/dev/null
+        run: |
+          python3 -m json.tool platform/applications.json >/dev/null
+          python3 -m json.tool examples/application-profiles.json >/dev/null
+          PYTHONPATH=deploy/controller python3 - <<'PY'
+          import json
+          from pathlib import Path
+          from application_registry import validate_registry
+          for path in (Path('platform/applications.json'), Path('examples/application-profiles.json')):
+              validate_registry(json.loads(path.read_text(encoding='utf-8')))
+          PY
 
       - name: Validate changed deployment shell entry points
         if: ${{ steps.changes.outputs.controller == 'true' }}

@@ -13,10 +13,16 @@ class ChangeScopeTests(unittest.TestCase):
         result = classify_paths([
             "deploy/controller/roman_deploy.py",
             "deploy/controller/romanlms_ci_gate.py",
+            "deploy/scripts/build_artifact.py",
+            "deploy/tests/test_build_artifact.py",
+            "examples/application-profiles.json",
+            "examples/workflows/build-only-release.yml",
             "deploy/tests/test_controller.py",
             "deploy/tests/test_romanlms_ci_gate.py",
         ])
         self.assertTrue(result["controller"])
+        self.assertTrue(result["configuration"])
+        self.assertTrue(result["workflow"])
         self.assertFalse(result["smoke"])
         self.assertFalse(result["ansible"])
         self.assertEqual(result["unknown_paths"], [])

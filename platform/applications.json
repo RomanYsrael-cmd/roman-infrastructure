@@ -1,25 +1,56 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "applications": {
     "platform-smoke": {
       "app_id": "platform-smoke",
+      "deployment_profile": "static-web",
+      "resources": {
+        "cpu_cores": 1,
+        "memory_mb": 512,
+        "pids_limit": 128
+      },
       "repository": "RomanYsrael-cmd/roman-lms",
       "workflow_repository": "RomanYsrael-cmd/roman-lms",
       "workflow_path": ".github/workflows/roman-platform-smoke.yml",
-      "reusable_workflow_path": "RomanYsrael-cmd/roman-infrastructure/.github/workflows/romanlms-smoke-deploy.yml",
+      "required_ci_workflow_file": "ci.yml",
+      "reusable_workflow_path": "RomanYsrael-cmd/roman-infrastructure/.github/workflows/deploy-application.yml",
       "authorized_actors": [
         "RomanYsrael-cmd"
       ],
       "allowed_platform_shas": [
+        "cc58db3a4ac802249992e60ef498205f5d48e1bb",
         "d95b276cf3d257a685fe7bb7464197c44f4b4ea8"
       ],
       "workflow_event": "workflow_dispatch",
       "production_branch": "main",
       "environment": "production",
       "strategy": "blue-green",
+      "image_revision_mode": "platform",
       "image_namespace": "ghcr.io/romanysrael-cmd/roman-lms-platform-smoke",
       "image_package_repository": "RomanYsrael-cmd/roman-lms",
       "image_source_repository": "RomanYsrael-cmd/roman-infrastructure",
+      "provenance_mode": "github-oidc",
+      "build": {
+        "components": {
+          "main": {
+            "source": "platform",
+            "context": "app/smoke",
+            "dockerfile": "app/smoke/Dockerfile",
+            "build_args": {
+              "PACKAGE_REPO": "https://github.com/RomanYsrael-cmd/roman-lms",
+              "SOURCE_REPO": "https://github.com/RomanYsrael-cmd/roman-infrastructure"
+            }
+          }
+        },
+        "operation_build_args": {
+          "deploy": {
+            "SMOKE_HEALTH_MODE": "healthy"
+          },
+          "unhealthy-test": {
+            "SMOKE_HEALTH_MODE": "unhealthy"
+          }
+        }
+      },
       "required_mounts": [
         "/srv/apps"
       ],
@@ -51,17 +82,36 @@
       "pids_limit": 64,
       "health_path": "/health",
       "expected_health_text": "\"status\":\"ok\"",
-      "readiness_timeout_seconds": 45
+      "readiness_timeout_seconds": 45,
+      "confirmation_phrases": {
+        "deploy": "DEPLOY PLATFORM SMOKE",
+        "unhealthy-test": "TEST UNHEALTHY PLATFORM SMOKE",
+        "rollback": "ROLLBACK PLATFORM SMOKE"
+      }
     },
     "romanlms-phase6": {
       "app_id": "romanlms-phase6",
+      "deployment_profile": "full-stack",
+      "resources": {
+        "cpu_cores": 4,
+        "memory_mb": 4096,
+        "pids_limit": 512
+      },
+      "database": {
+        "engine": "postgresql",
+        "migration_adapter": "flyway",
+        "backup_adapter": "verified-dump"
+      },
       "repository": "RomanYsrael-cmd/roman-lms",
       "workflow_repository": "RomanYsrael-cmd/roman-lms",
       "workflow_path": ".github/workflows/romanlms-phase6-staging.yml",
-      "reusable_workflow_path": "RomanYsrael-cmd/roman-infrastructure/.github/workflows/romanlms-private-deploy.yml",
+      "reusable_workflow_path": "RomanYsrael-cmd/roman-infrastructure/.github/workflows/deploy-application.yml",
       "required_ci_workflow_file": "ci.yml",
-      "authorized_actors": ["RomanYsrael-cmd"],
+      "authorized_actors": [
+        "RomanYsrael-cmd"
+      ],
       "allowed_platform_shas": [
+        "cc58db3a4ac802249992e60ef498205f5d48e1bb",
         "a9153164e3ecc2a10f24f2d36c2f32a99a433ff2",
         "60c74abfec435dd3eb20ea71b9246d7de476615e"
       ],
@@ -72,6 +122,26 @@
       "image_revision_mode": "caller",
       "image_package_repository": "RomanYsrael-cmd/roman-lms",
       "image_source_repository": "RomanYsrael-cmd/roman-infrastructure",
+      "provenance_mode": "github-oidc",
+      "build": {
+        "components": {
+          "backend": {
+            "context": "backend",
+            "dockerfile": "backend/Dockerfile"
+          },
+          "frontend": {
+            "context": "frontend",
+            "dockerfile": "frontend/Dockerfile"
+          }
+        },
+        "migrator": {
+          "context": ".",
+          "dockerfile": "ops/deploy/migration/Dockerfile",
+          "build_args": {
+            "FLYWAY_CLI_VERSION": "11.14.1"
+          }
+        }
+      },
       "migration_image_namespace": "ghcr.io/romanysrael-cmd/romanlms-phase6-migrator",
       "database_env_file": "/etc/roman-platform/romanlms-phase6/database.env",
       "allowed_database_urls": [
@@ -80,24 +150,52 @@
       ],
       "flyway_cli_version": "11.14.1",
       "flyway_schema": "roman_lms",
-      "expected_schema_version": "132",
+      "restore_expected_schema_version": "132",
       "flyway_history_exceptions": [
-        {"state": "Deleted", "category": "Repeatable", "type": "SQL", "version": "", "description": "seed dev data", "filepath": ""},
-        {"state": "Missing", "category": "Repeatable", "type": "SQL", "version": "", "description": "seed dev data", "filepath": ""}
+        {
+          "state": "Deleted",
+          "category": "Repeatable",
+          "type": "SQL",
+          "version": "",
+          "description": "seed dev data",
+          "filepath": ""
+        },
+        {
+          "state": "Missing",
+          "category": "Repeatable",
+          "type": "SQL",
+          "version": "",
+          "description": "seed dev data",
+          "filepath": ""
+        }
       ],
       "migration_memory": "512m",
       "migration_timeout_seconds": 180,
-      "required_mounts": ["/srv/apps", "/srv/databases", "/srv/data"],
+      "required_mounts": [
+        "/srv/apps",
+        "/srv/databases",
+        "/srv/data"
+      ],
       "docker_root_prefix": "/srv/apps",
       "storage_root": "/srv/apps/romanlms-phase6",
       "minimum_free_gib": 10,
       "minimum_cpu_cores": 2,
       "minimum_available_memory_mb": 3072,
-      "required_services": ["docker.service", "nginx.service"],
+      "required_services": [
+        "docker.service",
+        "nginx.service"
+      ],
       "container_network": "romanlms-phase6-staging",
       "network_subnet": "172.30.66.0/24",
-      "reserved_network_ips": ["172.30.66.1", "172.30.66.10", "172.30.66.11"],
-      "required_healthy_containers": ["romanlms-phase6-db", "romanlms-phase6-object"],
+      "reserved_network_ips": [
+        "172.30.66.1",
+        "172.30.66.10",
+        "172.30.66.11"
+      ],
+      "required_healthy_containers": [
+        "romanlms-phase6-db",
+        "romanlms-phase6-object"
+      ],
       "container_publish": false,
       "container_restart_policy": "no",
       "stack_test_enabled": true,
@@ -115,15 +213,23 @@
         "backend": {
           "image_namespace": "ghcr.io/romanysrael-cmd/romanlms-phase6-backend",
           "route_prefix": "/lms/",
-          "slot_ips": {"blue": "172.30.66.21", "green": "172.30.66.22", "test": "172.30.66.41"},
+          "slot_ips": {
+            "blue": "172.30.66.21",
+            "green": "172.30.66.22",
+            "test": "172.30.66.41"
+          },
           "container_port": 8080,
           "container_memory": "1536m",
           "container_cpus": 2.0,
           "pids_limit": 256,
           "container_env_file": "/etc/roman-platform/romanlms-phase6/runtime.env",
-          "container_tmpfs": ["/tmp:rw,nosuid,nodev,size=512m,mode=1777"],
+          "container_tmpfs": [
+            "/tmp:rw,nosuid,nodev,size=512m,mode=1777"
+          ],
           "revision_environment_variable": "APP_DEPLOYMENT_SHA",
-          "unhealthy_test_environment": {"DB_URL": "jdbc:postgresql://unreachable-phase6.invalid:5432/romanlms_phase6"},
+          "unhealthy_test_environment": {
+            "DB_URL": "jdbc:postgresql://unreachable-phase6.invalid:5432/romanlms_phase6"
+          },
           "unhealthy_test_timeout_seconds": 90,
           "health_path": "/lms/actuator/health",
           "route_health_url": "http://127.0.0.1:18081/lms/actuator/health",
@@ -133,37 +239,96 @@
         "frontend": {
           "image_namespace": "ghcr.io/romanysrael-cmd/romanlms-phase6-frontend",
           "route_prefix": "/",
-          "slot_ips": {"blue": "172.30.66.31", "green": "172.30.66.32", "test": "172.30.66.42"},
+          "slot_ips": {
+            "blue": "172.30.66.31",
+            "green": "172.30.66.32",
+            "test": "172.30.66.42"
+          },
           "container_port": 3000,
           "container_memory": "256m",
           "container_cpus": 0.5,
           "pids_limit": 64,
-          "container_tmpfs": ["/tmp:rw,nosuid,nodev,noexec,size=8m,mode=1777", "/var/cache/nginx:rw,nosuid,nodev,noexec,size=32m,mode=0777", "/var/run:rw,nosuid,nodev,noexec,size=8m,mode=0777", "/etc/nginx/conf.d:rw,nosuid,nodev,noexec,size=1m,mode=0777"],
+          "container_tmpfs": [
+            "/tmp:rw,nosuid,nodev,noexec,size=8m,mode=1777",
+            "/var/cache/nginx:rw,nosuid,nodev,noexec,size=32m,mode=0777",
+            "/var/run:rw,nosuid,nodev,noexec,size=8m,mode=0777",
+            "/etc/nginx/conf.d:rw,nosuid,nodev,noexec,size=1m,mode=0777"
+          ],
           "container_environment_by_slot": {
-            "blue": {"FRONTEND_BIND_ADDRESS": "0.0.0.0", "FRONTEND_PORT": "3000"},
-            "green": {"FRONTEND_BIND_ADDRESS": "0.0.0.0", "FRONTEND_PORT": "3000"}
+            "blue": {
+              "FRONTEND_BIND_ADDRESS": "0.0.0.0",
+              "FRONTEND_PORT": "3000"
+            },
+            "green": {
+              "FRONTEND_BIND_ADDRESS": "0.0.0.0",
+              "FRONTEND_PORT": "3000"
+            }
           },
-          "unhealthy_test_environment": {"FRONTEND_BIND_ADDRESS": "0.0.0.0", "FRONTEND_PORT": "3999"},
+          "unhealthy_test_environment": {
+            "FRONTEND_BIND_ADDRESS": "0.0.0.0",
+            "FRONTEND_PORT": "3999"
+          },
           "unhealthy_test_timeout_seconds": 30,
           "health_path": "/",
           "route_health_url": "http://127.0.0.1:18081/",
           "expected_health_text": "<!doctype html>",
           "readiness_timeout_seconds": 30
         }
+      },
+      "confirmation_phrases": {
+        "deploy-stack": "DEPLOY PRIVATE ROMANLMS",
+        "rollback-stack": "ROLLBACK PRIVATE ROMANLMS",
+        "test-stack": "TEST PRIVATE STACK FAILURE",
+        "verify-stack": "VERIFY PRIVATE ROMANLMS"
       }
     },
     "romanlms-production": {
       "app_id": "romanlms-production",
+      "deployment_profile": "full-stack",
+      "resources": {
+        "cpu_cores": 3,
+        "memory_mb": 2560,
+        "pids_limit": 512
+      },
+      "database": {
+        "engine": "postgresql",
+        "migration_adapter": "flyway",
+        "backup_adapter": "pgbackrest"
+      },
       "repository": "RomanYsrael-cmd/roman-lms",
       "workflow_repository": "RomanYsrael-cmd/roman-lms",
       "workflow_path": ".github/workflows/romanlms-production-deploy.yml",
-      "reusable_workflow_path": "RomanYsrael-cmd/roman-infrastructure/.github/workflows/romanlms-private-deploy.yml",
+      "reusable_workflow_path": "RomanYsrael-cmd/roman-infrastructure/.github/workflows/deploy-application.yml",
       "required_ci_workflow_file": "ci.yml",
-      "authorized_actors": ["RomanYsrael-cmd"],
-      "allowed_platform_shas": ["f14001afa20e54681826394dd06a485dafbdcdac", "d5a4b3589c1c5057b94f7355f4f4e5f89a646ea6", "03ccb655ad7102decea52b1d3dbd67a53b7933d0", "0a6f8563dbb5e8c0d98c7a245c3792d80457f1b7", "6dd7bbb99ba15d801ce5de34dcda9fe4670657a1", "63b54022e990c0d010cd6ac65902afbb3e1d07d5", "eff9b117a741fa17722d85511e24878cb2651707", "df2711da492189c5e092338c92548c40011d1926", "dbe279fc2f67b3f5dbddd8b7e1eac8fffcd1a3ab", "55b1664f281fbc6a3530f54ac073a7ebc6de445c", "6b4a259d625b8a27aebbbc864c3c66926900aec8", "db3150973746fad8497becd39dfb9bbb3f701556", "cf74c8031de7e46fce8fd49f401be973820bfa50", "7daa21f7b9ba3f0ee74f58b3e9c74ab2a7ecb87b", "fcebbbaa87a2823d66a0b01503f07a6254eeb352"],
+      "authorized_actors": [
+        "RomanYsrael-cmd"
+      ],
+      "allowed_platform_shas": [
+        "cc58db3a4ac802249992e60ef498205f5d48e1bb",
+        "f14001afa20e54681826394dd06a485dafbdcdac",
+        "d5a4b3589c1c5057b94f7355f4f4e5f89a646ea6",
+        "03ccb655ad7102decea52b1d3dbd67a53b7933d0",
+        "0a6f8563dbb5e8c0d98c7a245c3792d80457f1b7",
+        "6dd7bbb99ba15d801ce5de34dcda9fe4670657a1",
+        "63b54022e990c0d010cd6ac65902afbb3e1d07d5",
+        "eff9b117a741fa17722d85511e24878cb2651707",
+        "df2711da492189c5e092338c92548c40011d1926",
+        "dbe279fc2f67b3f5dbddd8b7e1eac8fffcd1a3ab",
+        "55b1664f281fbc6a3530f54ac073a7ebc6de445c",
+        "6b4a259d625b8a27aebbbc864c3c66926900aec8",
+        "db3150973746fad8497becd39dfb9bbb3f701556",
+        "cf74c8031de7e46fce8fd49f401be973820bfa50",
+        "7daa21f7b9ba3f0ee74f58b3e9c74ab2a7ecb87b",
+        "fcebbbaa87a2823d66a0b01503f07a6254eeb352"
+      ],
       "workflow_event": "workflow_dispatch",
       "automatic_workflow_event": "workflow_run",
       "automatic_release_enabled": true,
+      "automatic_operations": [
+        "deploy-stack"
+      ],
+      "automatic_confirmation_phrase": "AUTOMATIC VERIFIED RELEASE",
+      "ci_authorization": "romanlms-production",
       "required_ci_workflow_blob_sha": "32b39d87e8949601c162cd3a8b8eac076bc6684b",
       "production_branch": "main",
       "environment": "production",
@@ -174,22 +339,44 @@
       "image_revision_mode": "caller",
       "image_package_repository": "RomanYsrael-cmd/roman-lms",
       "image_source_repository": "RomanYsrael-cmd/roman-infrastructure",
+      "provenance_mode": "github-oidc",
+      "build": {
+        "components": {
+          "backend": {
+            "context": "backend",
+            "dockerfile": "backend/Dockerfile"
+          },
+          "frontend": {
+            "context": "frontend",
+            "dockerfile": "frontend/Dockerfile"
+          }
+        },
+        "migrator": {
+          "context": ".",
+          "dockerfile": "ops/deploy/migration/Dockerfile",
+          "build_args": {
+            "FLYWAY_CLI_VERSION": "11.14.1"
+          }
+        }
+      },
       "migration_image_namespace": "ghcr.io/romanysrael-cmd/romanlms-prod-migrator",
       "database_env_file": "/etc/roman-platform/romanlms-production/database.env",
       "migration_database_env_file": "/etc/roman-platform/romanlms-production/migration.env",
       "migration_database_username": "romanlms_migrator",
-      "allowed_database_urls": ["jdbc:postgresql://127.0.0.1:5432/romanlms_prod"],
+      "allowed_database_urls": [
+        "jdbc:postgresql://127.0.0.1:5432/romanlms_prod"
+      ],
       "flyway_cli_version": "11.14.1",
       "flyway_schema": "roman_lms",
-      "expected_schema_version": "133",
       "schema_migration": {
-        "source_version": "132",
-        "target_version": "133",
-        "description": "tesda lamr report settings",
-        "script": "V133__tesda_lamr_report_settings.sql",
-        "checksum": 850684505,
+        "adapter": "flyway",
         "execution_role": "romanlms_app",
-        "previous_release_compatible": true
+        "max_pending": 32,
+        "writer_usernames": [
+          "romanlms_app"
+        ],
+        "rollback_after_migration": "forward-only",
+        "allow_initial_schema": false
       },
       "production_backup": {
         "config_file": "/etc/pgbackrest/pgbackrest.conf",
@@ -198,18 +385,40 @@
         "timeout_seconds": 1200
       },
       "flyway_history_exceptions": [
-        {"state": "Deleted", "category": "Repeatable", "type": "SQL", "version": "", "description": "seed dev data", "filepath": ""},
-        {"state": "Missing", "category": "Repeatable", "type": "SQL", "version": "", "description": "seed dev data", "filepath": ""}
+        {
+          "state": "Deleted",
+          "category": "Repeatable",
+          "type": "SQL",
+          "version": "",
+          "description": "seed dev data",
+          "filepath": ""
+        },
+        {
+          "state": "Missing",
+          "category": "Repeatable",
+          "type": "SQL",
+          "version": "",
+          "description": "seed dev data",
+          "filepath": ""
+        }
       ],
       "migration_memory": "512m",
       "migration_timeout_seconds": 180,
-      "required_mounts": ["/srv/apps", "/srv/databases"],
+      "required_mounts": [
+        "/srv/apps",
+        "/srv/databases"
+      ],
       "docker_root_prefix": "/srv/apps",
       "storage_root": "/srv/apps/romanlms-production",
       "minimum_free_gib": 10,
       "minimum_cpu_cores": 6,
       "minimum_available_memory_mb": 3072,
-      "required_services": ["docker.service", "nginx.service", "postgresql@18-main.service", "cloudflared.service"],
+      "required_services": [
+        "docker.service",
+        "nginx.service",
+        "postgresql@18-main.service",
+        "cloudflared.service"
+      ],
       "container_network": "host",
       "container_network_mode": "host",
       "allow_host_network": true,
@@ -228,7 +437,10 @@
         "backend": {
           "image_namespace": "ghcr.io/romanysrael-cmd/romanlms-prod-backend",
           "route_prefix": "/lms/",
-          "slot_ports": {"blue": 18100, "green": 18102},
+          "slot_ports": {
+            "blue": 18100,
+            "green": 18102
+          },
           "container_port": 8080,
           "container_memory": "1024m",
           "container_cpus": 1.0,
@@ -242,7 +454,9 @@
               "mode": "0440"
             }
           ],
-          "container_tmpfs": ["/tmp:rw,nosuid,nodev,noexec,size=128m,mode=1777"],
+          "container_tmpfs": [
+            "/tmp:rw,nosuid,nodev,noexec,size=128m,mode=1777"
+          ],
           "revision_environment_variable": "APP_DEPLOYMENT_SHA",
           "host_network_bind_environment_variable": "SERVER_ADDRESS",
           "host_network_port_environment_variable": "PORT",
@@ -292,7 +506,10 @@
         "frontend": {
           "image_namespace": "ghcr.io/romanysrael-cmd/romanlms-prod-frontend",
           "route_prefix": "/",
-          "slot_ports": {"blue": 18101, "green": 18103},
+          "slot_ports": {
+            "blue": 18101,
+            "green": 18103
+          },
           "container_port": 3000,
           "container_memory": "128m",
           "container_cpus": 0.5,
@@ -306,8 +523,14 @@
           "host_network_bind_environment_variable": "FRONTEND_BIND_ADDRESS",
           "host_network_port_environment_variable": "FRONTEND_PORT",
           "container_environment_by_slot": {
-            "blue": {"FRONTEND_BIND_ADDRESS": "127.0.0.1", "FRONTEND_PORT": "18101"},
-            "green": {"FRONTEND_BIND_ADDRESS": "127.0.0.1", "FRONTEND_PORT": "18103"}
+            "blue": {
+              "FRONTEND_BIND_ADDRESS": "127.0.0.1",
+              "FRONTEND_PORT": "18101"
+            },
+            "green": {
+              "FRONTEND_BIND_ADDRESS": "127.0.0.1",
+              "FRONTEND_PORT": "18103"
+            }
           },
           "forwarded_proto_variable": "$http_x_forwarded_proto",
           "proxy_read_timeout_seconds": 300,
@@ -316,6 +539,12 @@
           "expected_health_text": "<!doctype html>",
           "readiness_timeout_seconds": 30
         }
+      },
+      "confirmation_phrases": {
+        "deploy-stack": "DEPLOY ROMANLMS PRODUCTION",
+        "rollback-stack": "ROLLBACK ROMANLMS PRODUCTION",
+        "refresh-stack": "REFRESH ROMANLMS RUNTIME CONFIGURATION",
+        "verify-stack": "VERIFY ROMANLMS PRODUCTION"
       }
     }
   }

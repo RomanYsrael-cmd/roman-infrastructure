@@ -1,4 +1,6 @@
-# Deployment runbook
+# Historical RomanLMS deployment notes
+
+> This file records the RomanLMS smoke and private-staging procedure as verified in November 2026 before the universal workflow changes in PR #26. Workflow SHA values and the “latest verified” release below are historical snapshots. Check [current platform status](status.md) and use the [universal deployment runbook](universal-deployment-runbook.md) for current operations.
 
 ## Current smoke state
 

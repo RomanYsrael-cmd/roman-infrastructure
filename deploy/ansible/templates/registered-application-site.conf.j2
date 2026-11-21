@@ -1,0 +1,21 @@
+# Managed by Roman Infrastructure application registry; do not edit.
+{% set app = registered_route_app.value %}
+{% for domain, domain_routes in app.routes | groupby('domain') %}
+server {
+    listen {{ app.nginx_site.listen_address }}:{{ app.nginx_site.listen_port }};
+    server_name {{ domain }};
+    server_tokens off;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-Frame-Options "SAMEORIGIN" always;
+    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+{% if app.deployment_profile in ['full-stack', 'multi-container'] %}
+    include {{ app.route_file }};
+{% else %}
+{% for route in domain_routes %}
+    location {{ route.path }} {
+        include {{ app.route_file }};
+    }
+{% endfor %}
+{% endif %}
+}
+{% endfor %}
