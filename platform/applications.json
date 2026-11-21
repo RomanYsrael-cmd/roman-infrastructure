@@ -711,7 +711,15 @@
         "verify-stack": "VERIFY SCHEDULEASE STAGING",
         "rollback-stack": "ROLLBACK SCHEDULEASE STAGING",
         "validate-database": "VALIDATE SCHEDULEASE STAGING DATABASE"
-      }
+      },
+      "required_mounts": [
+        "/srv/apps",
+        "/srv/databases"
+      ],
+      "docker_root_prefix": "/srv/apps",
+      "storage_root": "/srv/apps/schedulease-staging",
+      "minimum_free_gib": 10,
+      "minimum_cpu_cores": 2
     },
     "schedulease-production": {
       "app_id": "schedulease-production",
@@ -874,7 +882,15 @@
         "verify-stack": "VERIFY SCHEDULEASE PRODUCTION",
         "rollback-stack": "ROLLBACK SCHEDULEASE PRODUCTION",
         "validate-database": "VALIDATE SCHEDULEASE PRODUCTION DATABASE"
-      }
+      },
+      "required_mounts": [
+        "/srv/apps",
+        "/srv/databases"
+      ],
+      "docker_root_prefix": "/srv/apps",
+      "storage_root": "/srv/apps/schedulease-production",
+      "minimum_free_gib": 10,
+      "minimum_cpu_cores": 2
     }
   }
 }
