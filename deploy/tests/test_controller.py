@@ -1820,7 +1820,7 @@ class RomanLmsProductionPolicyTests(unittest.TestCase):
         ])
         self.assertEqual(
             self.app["required_ci_workflow_blob_sha"],
-            "32b39d87e8949601c162cd3a8b8eac076bc6684b",
+            "61b2ff50c7e0917fd27d23f452f389efcfc88315",
         )
         self.assertEqual(self.app["allowed_database_urls"], ["jdbc:postgresql://127.0.0.1:5432/romanlms_prod"])
         self.assertNotIn("expected_schema_version", self.app)
