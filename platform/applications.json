@@ -332,7 +332,7 @@
       ],
       "automatic_confirmation_phrase": "AUTOMATIC VERIFIED RELEASE",
       "ci_authorization": "romanlms-production",
-      "required_ci_workflow_blob_sha": "32b39d87e8949601c162cd3a8b8eac076bc6684b",
+      "required_ci_workflow_blob_sha": "61b2ff50c7e0917fd27d23f452f389efcfc88315",
       "production_branch": "main",
       "environment": "production",
       "strategy": "blue-green",
