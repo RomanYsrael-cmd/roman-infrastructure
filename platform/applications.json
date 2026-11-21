@@ -19,7 +19,8 @@
       ],
       "allowed_platform_shas": [
         "cc58db3a4ac802249992e60ef498205f5d48e1bb",
-        "d95b276cf3d257a685fe7bb7464197c44f4b4ea8"
+        "d95b276cf3d257a685fe7bb7464197c44f4b4ea8",
+        "e386312fdccd56670c029a6ff3066e6d03c932dd"
       ],
       "workflow_event": "workflow_dispatch",
       "production_branch": "main",
