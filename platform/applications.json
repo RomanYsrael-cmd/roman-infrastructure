@@ -18,6 +18,7 @@
         "RomanYsrael-cmd"
       ],
       "allowed_platform_shas": [
+        "cc58db3a4ac802249992e60ef498205f5d48e1bb",
         "d95b276cf3d257a685fe7bb7464197c44f4b4ea8"
       ],
       "workflow_event": "workflow_dispatch",
@@ -110,6 +111,7 @@
         "RomanYsrael-cmd"
       ],
       "allowed_platform_shas": [
+        "cc58db3a4ac802249992e60ef498205f5d48e1bb",
         "a9153164e3ecc2a10f24f2d36c2f32a99a433ff2",
         "60c74abfec435dd3eb20ea71b9246d7de476615e"
       ],
@@ -302,6 +304,7 @@
         "RomanYsrael-cmd"
       ],
       "allowed_platform_shas": [
+        "cc58db3a4ac802249992e60ef498205f5d48e1bb",
         "f14001afa20e54681826394dd06a485dafbdcdac",
         "d5a4b3589c1c5057b94f7355f4f4e5f89a646ea6",
         "03ccb655ad7102decea52b1d3dbd67a53b7933d0",
