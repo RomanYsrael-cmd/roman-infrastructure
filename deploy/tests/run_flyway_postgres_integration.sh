@@ -87,6 +87,12 @@ run_flyway() {
 
 run_flyway "$baseline_image" -target=133 migrate
 initial_info="$(run_flyway "$single_image" info -outputType=json)"
+printf '%s' "$initial_info" | python3 -c '
+import json, sys
+report = json.load(sys.stdin)
+fields = ("version", "state", "category", "type", "checksum", "filepath", "script", "description")
+print("Flyway plan diagnostic:", json.dumps([{key: row.get(key) for key in fields} for row in report.get("migrations", [])], sort_keys=True))
+' >&2
 single_plan_target="$(printf '%s' "$initial_info" | PYTHONPATH=deploy/controller python3 -c '
 import json, sys
 from forward_migration_plan import validate_forward_plan
