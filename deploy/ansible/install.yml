@@ -10,6 +10,8 @@
     node_exporter_textfile_dir: /srv/apps/monitoring/textfile_collector
     deploy_source_tailscale_ip: 100.104.209.82
     platform_repo_root: "{{ playbook_dir }}/../.."
+    platform_application_registry: "{{ lookup('ansible.builtin.file', platform_repo_root + '/platform/applications.json') | from_json }}"
+    platform_registered_route_apps: "{{ platform_application_registry.applications | dict2items | selectattr('value.nginx_site', 'defined') | list }}"
     nginx_site_file: /etc/nginx/conf.d/roman-platform-smoke.conf
     nginx_route_file: /etc/roman-platform/nginx/active-smoke.conf
     romanlms_phase6_root: /srv/apps/romanlms-phase6
@@ -500,6 +502,36 @@
         backup: true
       tags: [romanlms-recovery-controller]
 
+    - name: Install the universal application registry validator
+      ansible.builtin.copy:
+        src: "{{ platform_repo_root }}/deploy/controller/application_registry.py"
+        dest: "{{ platform_root }}/controller/application_registry.py"
+        owner: root
+        group: root
+        mode: "0644"
+        backup: true
+      tags: [romanlms-recovery-controller]
+
+    - name: Install the release-scoped Flyway migration planner
+      ansible.builtin.copy:
+        src: "{{ platform_repo_root }}/deploy/controller/forward_migration_plan.py"
+        dest: "{{ platform_root }}/controller/forward_migration_plan.py"
+        owner: root
+        group: root
+        mode: "0644"
+        backup: true
+      tags: [romanlms-recovery-controller]
+
+    - name: Install GitHub OIDC release provenance verifier
+      ansible.builtin.copy:
+        src: "{{ platform_repo_root }}/deploy/controller/oidc_provenance.py"
+        dest: "{{ platform_root }}/controller/oidc_provenance.py"
+        owner: root
+        group: root
+        mode: "0644"
+        backup: true
+      tags: [romanlms-recovery-controller]
+
     - name: Install the RomanLMS CI release verifier
       ansible.builtin.copy:
         src: "{{ platform_repo_root }}/deploy/controller/romanlms_ci_gate.py"
@@ -600,6 +632,12 @@
       notify: Reload systemd manager
       when: install_romanlms_phase6 | bool
 
+    - name: Validate existing files and listeners for registered application routes
+      ansible.builtin.include_tasks: tasks/validate-registered-route.yml
+      loop: "{{ platform_registered_route_apps }}"
+      loop_control:
+        loop_var: registered_route_app
+
     - name: Install the server allowlist
       ansible.builtin.copy:
         src: "{{ platform_repo_root }}/platform/applications.json"
@@ -609,6 +647,32 @@
         mode: "0644"
         backup: true
       tags: [romanlms-recovery-controller]
+
+    - name: Create a closed include for each registered application route
+      ansible.builtin.copy:
+        dest: "{{ item.value.route_file }}"
+        content: "return 503;\n"
+        owner: root
+        group: root
+        mode: "0644"
+        force: false
+      loop: "{{ platform_registered_route_apps }}"
+      loop_control:
+        label: "{{ item.key }}"
+
+    - name: Install Nginx virtual hosts for registered application routes
+      ansible.builtin.template:
+        src: templates/registered-application-site.conf.j2
+        dest: "{{ item.value.nginx_site.site_file }}"
+        owner: root
+        group: root
+        mode: "0644"
+      loop: "{{ platform_registered_route_apps }}"
+      loop_control:
+        label: "{{ item.key }}"
+      vars:
+        registered_route_app: "{{ item }}"
+      notify: Reload Roman platform Nginx
 
     - name: Create the restricted deployment account
       ansible.builtin.user:

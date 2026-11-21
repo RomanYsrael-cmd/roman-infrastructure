@@ -1,18 +1,18 @@
 # Rollback runbook
 
-The v1 controller preserves the currently active container as the previous release. Rollback checks that the previous container still exists and answers the configured health endpoint, changes only the private route include, validates Nginx, and then records the new active/previous pointer. If route validation fails, it restores the prior Nginx include.
+The controller preserves the active release as the previous release in app-scoped root-owned state. HTTP rollback checks the retained container and configured health endpoint, changes only the app's managed route include, validates Nginx, and records the new active/previous pointer. Coordinated stacks validate all retained components before switching their route together. If route validation fails, the controller restores the prior route and state.
 
 The controller's rollback operation requires the same approved application ID, main-branch workflow run, pinned reusable workflow, current main commit, and server lock as a deploy request. It does not accept an image or arbitrary target release from the caller; it selects only the retained previous release from root-owned server state.
 
 The caller example includes a separate ROLLBACK SMOKE choice. It uses the same pinned reusable workflow, manual main-branch dispatch, SSH identity, workflow-origin check, and server lock. It selects only the controller's retained previous release.
 
-Application rollback never reverses database migrations. The smoke service has no database. Any future database-backed application requires a backup and forward-compatible migration policy before production rollout.
+Application rollback never reverses database migrations. A database-backed application can return to a retained application image only if that app's recorded schema is compatible with the live, observed schema. New registered databases require a supported backup and migration adapter before production rollout.
 
 ## RomanLMS production schema migration recovery
 
-The V132-to-V133 production migration is additive and the retained V132 application is approved to run against either the verified V132 source schema or the verified V133 target schema. The release controller records the pgBackRest backup-set label and migration outcome in the production deployment audit.
+The migration controller derives source and target versions from the live Flyway history and the exact release artifact. It records the planned files and checksums, plan fingerprint, backup identity, execution result and postflight schema in the deployment audit. Compatibility is checked for the actual observed schema, not a fixed V132/V133 pair.
 
-If the controller cannot establish whether Flyway finished, leave the backend stopped and keep the existing route and release state in place. Do not retry the migration, run `flyway repair`, or edit `flyway_schema_history` while the outcome is uncertain. Use the audited backup-set label and pgBackRest's repository verification to establish the recovery point, restore to an isolated recovery database, and validate its schema and application data before any production restore or route change. Any recovery that would replace or restore the live database must use the separately approved database incident procedure; application rollback alone is not database recovery.
+If the controller cannot establish whether Flyway finished, leave the affected writer stopped and keep the existing route and last verified release state in place. Do not retry, run `flyway repair`, or edit `flyway_schema_history` while the outcome is uncertain. Use the audited backup identity and the selected adapter's verification to establish the recovery point, restore to an isolated recovery database, and validate its schema and data before any live database restoration or route change. Any recovery that would replace or restore a live database must follow the database incident procedure; application rollback alone is not database recovery.
 
 ## RomanLMS private staging rollback
 

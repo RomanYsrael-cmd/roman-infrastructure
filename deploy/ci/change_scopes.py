@@ -32,11 +32,13 @@ def classify_paths(paths: list[str]) -> dict[str, object]:
         if path == "*":
             result.update({scope: True for scope in SCOPES if scope != "docs"})
             continue
-        if path.startswith(".github/workflows/"):
+        if path.startswith(".github/workflows/") or path.startswith("examples/workflows/"):
             result["workflow"] = True
+        elif path.startswith("examples/"):
+            result["configuration"] = True
         elif path.startswith("deploy/ci/") or path.startswith("deploy/tests/test_ci_"):
             result["ci_policy"] = True
-        elif path in {"deploy/tests/test_controller.py", "deploy/tests/test_romanlms_ci_gate.py", "deploy/tests/test_forward_migration_plan.py"} or path.startswith("deploy/controller/"):
+        elif path.startswith("deploy/tests/") or path.startswith("deploy/controller/") or path.startswith("deploy/scripts/"):
             result["controller"] = True
         elif path.startswith("deploy/ansible/"):
             result["ansible"] = True

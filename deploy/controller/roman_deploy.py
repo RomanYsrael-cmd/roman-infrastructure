@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import contextlib
 import base64
+import hashlib
 import ipaddress
 import json
 import os
@@ -13,14 +14,23 @@ import shutil
 import stat
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
+from application_registry import RegistryError, validate_registry
+from forward_migration_plan import (
+    ForwardMigrationPlan,
+    MigrationPlanError,
+    validate_forward_plan,
+    validate_migration_result,
+)
+from oidc_provenance import ProvenanceError, verify_release_provenance
 from romanlms_ci_gate import CiGateError, github_api, verify_ci_release
 
 
@@ -29,6 +39,10 @@ MAX_REQUEST_BYTES = 32 * 1024
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 APP_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,47}$")
+PROVENANCE_OPERATIONS = frozenset({
+    "deploy", "deploy-service", "unhealthy-test", "validate-database",
+    "deploy-stack", "test-stack",
+})
 
 
 def _validate_romanlms_capacity_policy(app: dict[str, Any]) -> None:
@@ -66,6 +80,29 @@ def _text(value: Any, name: str, limit: int = 160) -> str:
     return value
 
 
+def _canonical_json_sha256(value: Any) -> str:
+    try:
+        payload = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("ascii")
+    except (TypeError, ValueError, UnicodeEncodeError) as exc:
+        raise DeploymentError("The registered build specification is invalid.") from exc
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _provenance_image_map(request: dict[str, Any]) -> dict[str, str]:
+    operation = request["operation"]
+    if operation == "deploy-stack":
+        images = dict(request["images"])
+    elif operation == "test-stack":
+        images = {request["component"]: request["image"]}
+    elif operation in {"validate-database", "refresh-stack"}:
+        images = {"migrator": request["migration_image"]}
+    else:
+        images = {"main": request["image"]}
+    if operation in {"deploy-stack", "validate-database"} and request.get("migration_image"):
+        images["migrator"] = request["migration_image"]
+    return images
+
+
 def _secret(value: Any, name: str) -> str:
     if not isinstance(value, str) or not 20 <= len(value) <= 8192 or "\n" in value or "\r" in value:
         raise DeploymentError(f"Missing or invalid {name}.")
@@ -83,11 +120,13 @@ def validate_request(request: Any, config: dict[str, Any]) -> tuple[dict[str, An
     }
     operation_fields = {
         "deploy": {"image", "strategy", "registry_token"},
+        "deploy-service": {"image", "strategy", "registry_token"},
+        "rollback-service": set(),
         "unhealthy-test": {"image", "registry_token"},
         "validate-database": {"migration_image", "registry_token"},
-        "deploy-stack": {"images", "strategy", "migration_image", "registry_token"},
+        "deploy-stack": {"images", "strategy", "registry_token"},
         "refresh-stack": set(),
-        "rollback-stack": {"migration_image", "registry_token"},
+        "rollback-stack": set(),
         "test-stack": {"image", "component", "registry_token"},
         "verify-stack": set(),
         "verify": set(),
@@ -95,7 +134,9 @@ def validate_request(request: Any, config: dict[str, Any]) -> tuple[dict[str, An
     }
     if operation not in operation_fields:
         raise DeploymentError("Request contains unsupported fields or operation.")
-    allowed = common | operation_fields[operation]
+    optional_fields = {"migration_image"} if operation == "deploy-stack" else set()
+    provenance_fields = {"build_spec_sha256", "provenance_token"} if operation in PROVENANCE_OPERATIONS else set()
+    allowed = common | operation_fields[operation] | optional_fields | provenance_fields
     if set(request) - allowed:
         raise DeploymentError("Request contains unsupported fields or operation.")
     required = common | operation_fields[operation]
@@ -147,13 +188,14 @@ def validate_request(request: Any, config: dict[str, Any]) -> tuple[dict[str, An
     if release_mode not in {"manual", "automatic"}:
         raise DeploymentError("Invalid release mode.")
     if release_mode == "automatic":
+        automatic_operations = app.get("automatic_operations", [])
         if (
-            app_id != "romanlms-production"
-            or app.get("automatic_release_enabled") is not True
-            or operation != "deploy-stack"
+            app.get("automatic_release_enabled") is not True
+            or not isinstance(automatic_operations, list)
+            or operation not in automatic_operations
             or not automatic_release_fields.issubset(release)
         ):
-            raise DeploymentError("Automatic production release is not enabled for this request.")
+            raise DeploymentError("Automatic release is not enabled for this application and operation.")
         for key in ("trigger_run_id", "trigger_run_attempt"):
             if not isinstance(release[key], str) or not release[key].isdigit() or len(release[key]) > 20:
                 raise DeploymentError("Invalid triggering CI run metadata.")
@@ -161,17 +203,40 @@ def validate_request(request: Any, config: dict[str, Any]) -> tuple[dict[str, An
         raise DeploymentError("Manual releases cannot include automatic CI trigger metadata.")
     _secret(request["github_token"], "GitHub token")
 
-    if operation in {"deploy", "unhealthy-test"}:
+    if operation in PROVENANCE_OPERATIONS and app.get("provenance_mode") == "github-oidc":
+        if provenance_fields - set(request):
+            raise DeploymentError("Request is missing its signed build provenance.")
+        registered_build = app.get("build")
+        build_hash = _text(request.get("build_spec_sha256"), "build specification SHA256", 64)
+        if not re.fullmatch(r"[0-9a-f]{64}", build_hash) or not isinstance(registered_build, dict):
+            raise DeploymentError("The root-registered build specification is unavailable or invalid.")
+        if build_hash != _canonical_json_sha256(registered_build):
+            raise DeploymentError("The release build specification differs from the root application registry.")
+        token = _text(request.get("provenance_token"), "GitHub OIDC provenance token", 12_000)
+        if not re.fullmatch(r"[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+", token):
+            raise DeploymentError("GitHub OIDC provenance token is malformed.")
+
+    requires_flyway_image = operation in {"validate-database", "deploy-stack"} and app.get("database", {}).get("migration_adapter") == "flyway"
+    if requires_flyway_image and "migration_image" not in request:
+        raise DeploymentError("A verified Flyway image is required to inspect this application's database history.")
+    if operation in {"deploy", "deploy-service", "unhealthy-test"}:
+        if operation == "deploy-service" and app.get("deployment_profile") not in {"worker", "scheduled-job", "stateful-service", "game-server"}:
+            raise DeploymentError("The application profile has no approved service deployment adapter.")
         if operation == "unhealthy-test" and not app.get("unhealthy_test_enabled"):
             raise DeploymentError("Unhealthy-candidate testing is not enabled for this application.")
-        if operation == "deploy" and request.get("strategy") != app["strategy"]:
+        if operation in {"deploy", "deploy-service"} and request.get("strategy") != app["strategy"]:
             raise DeploymentError("Deployment strategy does not match server policy.")
         image = _text(request["image"], "image digest reference", 300)
         image_namespace = re.escape(app["image_namespace"])
         if not re.fullmatch(image_namespace + r"@sha256:[0-9a-f]{64}", image):
             raise DeploymentError("Image must use the allowlisted GHCR package and immutable digest.")
         _secret(request["registry_token"], "registry token")
-    elif operation in {"validate-database", "deploy-stack", "rollback-stack"}:
+    elif operation == "rollback-service":
+        if app.get("deployment_profile") not in {"worker", "scheduled-job", "stateful-service", "game-server"}:
+            raise DeploymentError("The application profile has no approved service rollback adapter.")
+    elif operation in {"validate-database", "deploy-stack"} and (
+        operation == "validate-database" or "migration_image" in request
+    ):
         namespace = app.get("migration_image_namespace")
         if not isinstance(namespace, str) or not namespace:
             raise DeploymentError("Database validation is not configured for this application.")
@@ -246,8 +311,12 @@ def verify_release_origin(request: dict[str, Any], app: dict[str, Any]) -> None:
     expected_path = app["workflow_path"]
     release_mode = request["release"].get("mode", "manual")
     if release_mode == "automatic":
-        if app.get("automatic_release_enabled") is not True or app.get("automatic_workflow_event") != "workflow_run":
-            raise DeploymentError("Automatic production release is not enabled by the server policy.")
+        if (
+            app.get("automatic_release_enabled") is not True
+            or app.get("automatic_workflow_event") != "workflow_run"
+            or request.get("operation") not in app.get("automatic_operations", [])
+        ):
+            raise DeploymentError("Automatic release is not enabled by the server policy.")
         expected_event = app["automatic_workflow_event"]
     else:
         expected_event = app["workflow_event"]
@@ -275,7 +344,7 @@ def verify_release_origin(request: dict[str, Any], app: dict[str, Any]) -> None:
         raise DeploymentError("Workflow run is not an authorized in-progress production release.")
 
     if release_mode == "automatic" and (
-        request["operation"] != "deploy-stack"
+        request["operation"] not in app.get("automatic_operations", [])
         or request["release"].get("actor") not in app.get("authorized_actors", [])
         or not request["release"].get("trigger_run_id")
         or not request["release"].get("trigger_run_attempt")
@@ -299,15 +368,26 @@ def verify_release_origin(request: dict[str, Any], app: dict[str, Any]) -> None:
     commit_info = github_json(repo, f"commits/{request['commit_sha']}", request["github_token"])
     if commit_info.get("sha") != request["commit_sha"]:
         raise DeploymentError("GitHub did not confirm the requested commit.")
-    if request["operation"] in {"deploy-stack", "rollback-stack", "test-stack", "verify-stack", "refresh-stack"}:
+    if request["operation"] in {"deploy", "deploy-service", "deploy-stack", "rollback-stack", "test-stack", "verify-stack", "refresh-stack"}:
         verify_required_ci(request, app)
+    if request["operation"] in PROVENANCE_OPERATIONS and app.get("provenance_mode") == "github-oidc":
+        try:
+            verify_release_provenance(
+                request["provenance_token"],
+                request,
+                app,
+                _provenance_image_map(request),
+                request["build_spec_sha256"],
+            )
+        except ProvenanceError as exc:
+            raise DeploymentError(f"Image provenance verification failed: {exc}.") from exc
 
 
 def verify_required_ci(request: dict[str, Any], app: dict[str, Any]) -> None:
     workflow = app.get("required_ci_workflow_file")
     if not isinstance(workflow, str) or not re.fullmatch(r"[A-Za-z0-9_.-]+\.ya?ml", workflow):
         raise DeploymentError("The required CI workflow is not configured.")
-    if app.get("app_id") == "romanlms-production":
+    if app.get("ci_authorization") == "romanlms-production":
         expected_blob_sha = app.get("required_ci_workflow_blob_sha")
         if not isinstance(expected_blob_sha, str) or not SHA_RE.fullmatch(expected_blob_sha):
             raise DeploymentError("The root-approved RomanLMS CI workflow identity is not configured.")
@@ -436,9 +516,9 @@ def _migration_database_env(app: dict[str, Any], runtime_values: dict[str, str])
         or any(not values.get(key, "").strip() for key in required)
         or not isinstance(configured_user, str)
         or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,62}", configured_user)
-        or configured_user != "romanlms_migrator"
         or values.get("DB_USERNAME") != configured_user
         or configured_user == runtime_user
+        or configured_user.lower() in {"postgres", "root", "admin"}
         or not re.fullmatch(r"jdbc:postgresql://[^\s/]+/[A-Za-z0-9_]+", values.get("DB_URL", ""))
         or values.get("DB_URL") != expected_url
         or not isinstance(allowed_urls, list)
@@ -549,7 +629,7 @@ def preflight(app: dict[str, Any], *, capacity_checks: bool = True, memory_check
                 evidence = json.loads(path.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError) as exc:
                 raise DeploymentError("The staging restore evidence is invalid.") from exc
-            if not isinstance(evidence, dict) or evidence.get("source_sha256") != app["backup_marker_expected_source_sha256"] or evidence.get("schema_version") != str(app["expected_schema_version"]):
+            if not isinstance(evidence, dict) or evidence.get("source_sha256") != app["backup_marker_expected_source_sha256"] or evidence.get("schema_version") != str(app["restore_expected_schema_version"]):
                 raise DeploymentError("The staging restore evidence does not match the approved backup and schema.")
 
 
@@ -758,7 +838,7 @@ def verify_image_labels(
     if labels.get("io.roman.deployment.package-repository") != expected_package_repository:
         raise DeploymentError("Image package-repository label does not match the authorized GHCR package repository.")
     if labels.get("io.roman.deployment.caller-revision") != caller_revision:
-        raise DeploymentError("Image caller-revision label does not match the authorized RomanLMS commit.")
+        raise DeploymentError("Image caller-revision label does not match the authorized source commit.")
 
 
 def _atomic_write(path: str | Path, content: str, mode: int = 0o640) -> None:
@@ -1274,36 +1354,594 @@ def _deploy(request: dict[str, Any], app: dict[str, Any]) -> dict[str, Any]:
         raise exc
 
 
-def _verify_flyway_info(output: str, expected_version: str, allowed_exceptions: list[dict[str, str]] | None = None, *, flyway_version: str | None = None, schema_name: str | None = None) -> None:
+def _service_network(app: dict[str, Any]) -> None:
+    runtime = app["runtime"]
+    network = runtime["network"]
+    inspected = run_command(
+        ["docker", "network", "inspect", "--format", '{{json .Labels}}', network],
+        timeout=15,
+        check=False,
+    )
+    if inspected.returncode == 0:
+        try:
+            labels = json.loads(inspected.stdout.strip())
+        except json.JSONDecodeError as exc:
+            raise DeploymentError("The application network labels could not be verified.") from exc
+        if not isinstance(labels, dict) or labels.get("roman.platform.app") != app["app_id"]:
+            raise DeploymentError("The configured application network is not owned by this application.")
+        return
+    if "no such network" not in (inspected.stderr + inspected.stdout).lower():
+        raise DeploymentError("The configured application network could not be inspected.")
+    run_command([
+        "docker", "network", "create", "--driver", "bridge",
+        "--label", f"roman.platform.app={app['app_id']}",
+        "--label", "roman.platform.managed-by=roman-infrastructure",
+        network,
+    ], timeout=30)
+
+
+def _service_container_name(app: dict[str, Any], commit_sha: str) -> str:
+    return f"roman-platform-{app['app_id']}-{commit_sha[:12]}"
+
+
+def _service_runtime_env_file(app: dict[str, Any]) -> Path | None:
+    runtime = app["runtime"]
+    value = runtime.get("env_file")
+    if value is None:
+        return None
+    if value not in app.get("secret_refs", []):
+        raise DeploymentError("The service environment file is not in the app-scoped secret allowlist.")
+    path = _secure_env_file(value)
+    _env_file_values(path)
+    return path
+
+
+def _service_container_args(
+    app: dict[str, Any],
+    request: dict[str, Any],
+    image: str,
+    container_name: str,
+    *,
+    scheduled: bool = False,
+) -> list[str]:
+    runtime = app["runtime"]
+    resources = app["resources"]
+    memory = f"{resources['memory_mb']}m"
+    args = ["docker", "run"]
+    args.extend(["--rm"] if scheduled else ["--detach"])
+    args.extend([
+        "--name", container_name,
+        "--read-only",
+        "--tmpfs", "/tmp:rw,nosuid,nodev,noexec,size=64m,mode=1777",
+        "--cap-drop", "ALL",
+        "--security-opt", "no-new-privileges:true",
+        "--pids-limit", str(resources["pids_limit"]),
+        "--memory", memory,
+        "--cpus", str(resources["cpu_cores"]),
+        "--log-driver", "local",
+        "--log-opt", "max-size=10m",
+        "--log-opt", "max-file=3",
+        "--network", runtime["network"],
+        "--user", f"{runtime['uid']}:{runtime['gid']}",
+        "--label", f"roman.platform.app={app['app_id']}",
+        "--label", f"roman.platform.profile={app['deployment_profile']}",
+        "--label", f"io.roman.deployment.caller-revision={request['commit_sha']}",
+    ])
+    if not scheduled:
+        args.extend(["--restart", "unless-stopped"])
+    if app["deployment_profile"] in {"stateful-service", "game-server"}:
+        data_root = _service_data_root(app)
+        if data_root.parent.is_symlink() or data_root.is_symlink():
+            raise DeploymentError("Application persistent storage cannot follow symlinks.")
+        data_root.mkdir(parents=True, exist_ok=True, mode=0o750)
+        os.chown(data_root, 0, runtime["gid"])
+        data_root.chmod(0o770)
+        args.extend(["--mount", f"type=bind,src={data_root},dst={runtime.get('storage_container_path', '/data')}"])
+    for item in runtime.get("ports", []):
+        args.extend(["--publish", f"{item['bind_address']}:{item['host_port']}:{item['container_port']}/{item['protocol']}"])
+    env_file = _service_runtime_env_file(app)
+    if env_file is not None:
+        args.extend(["--env-file", str(env_file)])
+    environment = runtime.get("environment", {})
+    for key, value in sorted(environment.items()):
+        args.extend(["--env", f"{key}={value}"])
+    args.append(image)
+    return args
+
+
+def _wait_service_container(container_name: str, timeout: int) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        result = run_command(
+            ["docker", "inspect", "--format", '{{if .State.Health}}{{.State.Health.Status}}{{else}}missing{{end}}|{{.State.Status}}', container_name],
+            timeout=15,
+            check=False,
+        )
+        status = result.stdout.strip().split("|", 1) if result.returncode == 0 else []
+        if status and status[0] == "healthy" and status[1] == "running":
+            return
+        if status and (status[0] == "unhealthy" or status[1] in {"exited", "dead"}):
+            raise DeploymentError("The application container failed its configured Docker health check.")
+        time.sleep(min(2, max(0, deadline - time.monotonic())))
+    raise DeploymentError("The application container did not become healthy before the readiness deadline.")
+
+
+def _service_container_available(app: dict[str, Any], release: dict[str, Any]) -> bool:
+    commit_sha = release.get("commit_sha")
+    image = release.get("image")
+    name = release.get("container")
+    if (
+        not isinstance(commit_sha, str)
+        or not SHA_RE.fullmatch(commit_sha)
+        or name != _service_container_name(app, commit_sha)
+        or not isinstance(image, str)
+        or not re.fullmatch(re.escape(app["image_namespace"]) + r"@sha256:[0-9a-f]{64}", image)
+    ):
+        return False
+    result = run_command(
+        ["docker", "inspect", "--format", '{{.Name}}|{{index .Config.Labels "roman.platform.app"}}|{{.Config.Image}}|{{index .Config.Labels "io.roman.deployment.caller-revision"}}', name],
+        timeout=15,
+        check=False,
+    )
+    return result.returncode == 0 and result.stdout.strip() == f"/{name}|{app['app_id']}|{image}|{commit_sha}"
+
+
+def _service_data_root(app: dict[str, Any]) -> Path:
+    runtime = app["runtime"]
+    root = Path(runtime["storage_root"])
+    if str(root) != f"/srv/apps/{app['app_id']}":
+        raise DeploymentError("The application persistent storage path is not isolated.")
+    return root / "data"
+
+
+def _volume_digest(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _verify_volume_archive(path: Path) -> None:
+    if path.is_symlink() or not path.is_file():
+        raise DeploymentError("The application volume backup is not a regular file.")
     try:
-        info = json.loads(output)
-    except (TypeError, json.JSONDecodeError) as exc:
-        raise DeploymentError("Flyway did not return a valid database compatibility report.") from exc
-    if not isinstance(info, dict) or str(info.get("schemaVersion")) != expected_version:
-        raise DeploymentError("Database schema version does not match the approved release.")
-    if flyway_version and info.get("flywayVersion") != flyway_version:
-        raise DeploymentError("Flyway version does not match the approved release.")
-    if schema_name and info.get("schemaName") != schema_name:
-        raise DeploymentError("Flyway selected an unapproved database schema.")
-    if info.get("warnings") not in (None, []):
-        raise DeploymentError("Flyway reported warnings requiring review.")
-    migrations = info.get("migrations")
-    if not isinstance(migrations, list) or not migrations:
-        raise DeploymentError("Flyway migration history is unavailable.")
-    remaining = list(allowed_exceptions or [])
-    fields = {"state", "category", "type", "version", "description", "filepath"}
-    if any(not isinstance(rule, dict) or set(rule) != fields or any(not isinstance(value, str) for value in rule.values()) for rule in remaining):
-        raise DeploymentError("The approved migration history exceptions are invalid.")
-    for item in migrations:
-        if not isinstance(item, dict) or not isinstance(item.get("state"), str):
-            raise DeploymentError("Flyway migration history is invalid.")
-        if item["state"] != "Success":
-            match = next((rule for rule in remaining if all(item.get(key) == value for key, value in rule.items())), None)
-            if match is None:
-                raise DeploymentError("Database migration history is not compatible with the approved release.")
-            remaining.remove(match)
-    if remaining:
-        raise DeploymentError("Approved migration history exceptions are missing.")
+        with tarfile.open(path, "r:gz") as archive:
+            members = archive.getmembers()
+    except (OSError, tarfile.TarError) as exc:
+        raise DeploymentError("The application volume backup cannot be read.") from exc
+    if len(members) > 250_000 or any(
+        member.issym()
+        or member.islnk()
+        or not (member.isdir() or member.isfile())
+        or PurePosixPath(member.name).is_absolute()
+        or ".." in PurePosixPath(member.name).parts
+        or member.size > 10 * 1024**3
+        for member in members
+    ):
+        raise DeploymentError("The application volume backup contains an unsafe archive entry.")
+
+
+def _create_service_volume_backup(app: dict[str, Any], commit_sha: str) -> dict[str, str]:
+    if app["runtime"].get("backup_adapter") != "verified-volume-archive":
+        raise DeploymentError("The application persistent data has no supported backup adapter.")
+    data_root = _service_data_root(app)
+    if data_root.parent.is_symlink() or data_root.is_symlink():
+        raise DeploymentError("Application persistent storage cannot follow symlinks.")
+    data_root.mkdir(parents=True, exist_ok=True, mode=0o750)
+    for current, directories, files in os.walk(data_root, followlinks=False):
+        for name in directories + files:
+            item = Path(current) / name
+            metadata = item.lstat()
+            if not (stat.S_ISDIR(metadata.st_mode) or stat.S_ISREG(metadata.st_mode)):
+                raise DeploymentError("Persistent application data contains a symlink or special file; backup was not started.")
+    size_result = run_command(["du", "-sb", str(data_root)], timeout=30)
+    try:
+        bytes_required = int(size_result.stdout.split()[0])
+    except (ValueError, IndexError) as exc:
+        raise DeploymentError("Persistent application data size could not be verified.") from exc
+    backup_dir = data_root.parent / "backups"
+    if backup_dir.is_symlink():
+        raise DeploymentError("The application backup directory cannot be a symlink.")
+    backup_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if shutil.disk_usage(backup_dir).free < bytes_required + 512 * 1024**2:
+        raise DeploymentError("There is not enough free storage for a verified application volume backup.")
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    archive_path = backup_dir / f"{stamp}-{commit_sha[:12]}.tar.gz"
+    result = run_command(["tar", "--numeric-owner", "--create", "--gzip", "--file", str(archive_path), "--directory", str(data_root), "."], timeout=1800, check=False)
+    if result.returncode != 0:
+        archive_path.unlink(missing_ok=True)
+        raise DeploymentError("The consistent application volume backup failed.")
+    try:
+        _verify_volume_archive(archive_path)
+        digest = _volume_digest(archive_path)
+        manifest = {
+            "app_id": app["app_id"],
+            "commit_sha": commit_sha,
+            "archive": archive_path.name,
+            "sha256": digest,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        _atomic_write(archive_path.with_suffix(".json"), json.dumps(manifest, sort_keys=True) + "\n", 0o600)
+        os.chmod(archive_path, 0o600)
+        return {"path": str(archive_path), "sha256": digest}
+    except Exception:
+        archive_path.unlink(missing_ok=True)
+        raise
+
+
+def _restore_service_volume_backup(app: dict[str, Any], backup: Any) -> None:
+    if not isinstance(backup, dict) or not isinstance(backup.get("path"), str) or not re.fullmatch(r"[0-9a-f]{64}", str(backup.get("sha256", ""))):
+        raise DeploymentError("A verified application volume backup is not recorded.")
+    data_root = _service_data_root(app)
+    archive_path = Path(backup["path"])
+    if archive_path.parent != data_root.parent / "backups" or archive_path.is_symlink() or os.path.realpath(archive_path) != str(archive_path):
+        raise DeploymentError("The recorded application volume backup is outside the app-scoped backup directory.")
+    manifest_path = archive_path.with_suffix(".json")
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise DeploymentError("The application volume backup recovery metadata is unavailable.") from exc
+    archive_stat = archive_path.lstat()
+    manifest_stat = manifest_path.lstat()
+    if (
+        archive_stat.st_uid != 0
+        or stat.S_IMODE(archive_stat.st_mode) != 0o600
+        or manifest_stat.st_uid != 0
+        or stat.S_IMODE(manifest_stat.st_mode) != 0o600
+        or manifest.get("app_id") != app["app_id"]
+        or manifest.get("archive") != archive_path.name
+        or manifest.get("sha256") != backup["sha256"]
+        or _volume_digest(archive_path) != backup["sha256"]
+    ):
+        raise DeploymentError("The application volume backup checksum or identity is invalid.")
+    _verify_volume_archive(archive_path)
+    restore_dir = Path(tempfile.mkdtemp(prefix=".restore-", dir=data_root.parent))
+    displaced = data_root.parent / f"data.failed-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
+    try:
+        with tarfile.open(archive_path, "r:gz") as archive:
+            archive.extractall(restore_dir)
+        if data_root.exists():
+            data_root.replace(displaced)
+        restore_dir.replace(data_root)
+        os.chown(data_root, 0, app["runtime"]["gid"])
+    except (OSError, tarfile.TarError) as exc:
+        if not data_root.exists() and displaced.exists():
+            displaced.replace(data_root)
+        raise DeploymentError("The application volume restore failed; the old application remains stopped.") from exc
+    finally:
+        if restore_dir.exists():
+            shutil.rmtree(restore_dir, ignore_errors=True)
+
+
+def _scheduled_unit_content(app: dict[str, Any], request: dict[str, Any], image: str) -> tuple[str, str]:
+    runtime = app["runtime"]
+    name = f"roman-platform-{app['app_id']}"
+    args = _service_container_args(app, request, image, f"{name}-job", scheduled=True)
+    command = " ".join(args[1:])
+    service = (
+        "[Unit]\nDescription=Roman Platform scheduled job " + app["app_id"] + "\n"
+        "# Roman Platform managed unit\n[Service]\nType=oneshot\n"
+        f"ExecStart=/usr/bin/docker {command}\nTimeoutStartSec=1800\n"
+    )
+    timer = (
+        "[Unit]\nDescription=Roman Platform schedule for " + app["app_id"] + "\n"
+        "# Roman Platform managed unit\n[Timer]\n"
+        f"OnCalendar={runtime['systemd_calendar']}\nPersistent=true\nUnit={name}.service\n"
+        "[Install]\nWantedBy=timers.target\n"
+    )
+    return service, timer
+
+
+def _install_scheduled_service(app: dict[str, Any], service: str, timer: str) -> None:
+    name = f"roman-platform-{app['app_id']}"
+    service_path = Path("/etc/systemd/system") / f"{name}.service"
+    timer_path = Path("/etc/systemd/system") / f"{name}.timer"
+    for path in (service_path, timer_path):
+        if path.exists() and "# Roman Platform managed unit" not in path.read_text(encoding="utf-8"):
+            raise DeploymentError("A systemd unit with the application name already exists outside Roman Platform management.")
+    _atomic_write(service_path, service, 0o644)
+    _atomic_write(timer_path, timer, 0o644)
+    run_command(["systemctl", "daemon-reload"], timeout=20)
+    run_command(["systemctl", "enable", "--now", f"{name}.timer"], timeout=30)
+    run_command(["systemctl", "restart", f"{name}.timer"], timeout=30)
+    status = run_command(["systemctl", "is-active", "--quiet", f"{name}.timer"], timeout=15, check=False)
+    if status.returncode != 0:
+        raise DeploymentError("The scheduled job timer did not become active.")
+
+
+def _verify_service_release_image(app: dict[str, Any], release: dict[str, Any]) -> None:
+    image = release.get("image")
+    commit_sha = release.get("commit_sha")
+    platform_sha = release.get("platform_sha")
+    if (
+        not isinstance(image, str)
+        or not re.fullmatch(re.escape(app["image_namespace"]) + r"@sha256:[0-9a-f]{64}", image)
+        or not isinstance(commit_sha, str)
+        or not SHA_RE.fullmatch(commit_sha)
+        or platform_sha not in app.get("allowed_platform_shas", [])
+    ):
+        raise DeploymentError("The retained application release identity is invalid.")
+    digest = run_command(["docker", "image", "inspect", "--format", "{{json .RepoDigests}}", image], timeout=15)
+    try:
+        values = json.loads(digest.stdout.strip())
+    except json.JSONDecodeError as exc:
+        raise DeploymentError("The retained application image digest could not be verified.") from exc
+    if not isinstance(values, list) or image not in values:
+        raise DeploymentError("The retained application image no longer matches its immutable registry digest.")
+    verify_image_labels(
+        image,
+        commit_sha if app.get("image_revision_mode", "platform") == "caller" else platform_sha,
+        commit_sha,
+        platform_sha,
+        app["image_package_repository"],
+        app["image_source_repository"],
+        os.environ.copy(),
+    )
+
+
+def _deploy_service(request: dict[str, Any], app: dict[str, Any]) -> dict[str, Any]:
+    started = time.time()
+    runtime = app["runtime"]
+    profile = app["deployment_profile"]
+    state_path = Path(app["state_file"])
+    state = _read_state(str(state_path))
+    active = state.get("active")
+    if active and (active.get("app_id") != app["app_id"] or active.get("profile") != profile):
+        raise DeploymentError("Active service state belongs to a different application profile.")
+    image = request["image"]
+    with registry_session(app, request) as env:
+        run_command(["docker", "pull", image], env=env, timeout=600)
+        _verify_image(image, request, app, env)
+    _service_network(app)
+    if profile in {"stateful-service", "game-server"}:
+        require_storage_mounts(app)
+    if profile == "scheduled-job":
+        service, timer = _scheduled_unit_content(app, request, image)
+        name = f"roman-platform-{app['app_id']}"
+        service_path = Path("/etc/systemd/system") / f"{name}.service"
+        timer_path = Path("/etc/systemd/system") / f"{name}.timer"
+        prior_service = service_path.read_text(encoding="utf-8") if service_path.exists() else None
+        prior_timer = timer_path.read_text(encoding="utf-8") if timer_path.exists() else None
+        try:
+            _install_scheduled_service(app, service, timer)
+            verify_release_origin(request, app)
+            timestamp = datetime.now(timezone.utc).isoformat()
+            release = {
+                "app_id": app["app_id"], "profile": profile, "commit_sha": request["commit_sha"],
+                "platform_sha": request["platform_sha"], "image": image, "deployed_at": timestamp,
+            }
+            new_state = {"active": release, "previous": active, "updated_at": timestamp}
+            _atomic_write(state_path, json.dumps(new_state, sort_keys=True, indent=2) + "\n")
+        except Exception:
+            if prior_service is not None and prior_timer is not None:
+                _atomic_write(service_path, prior_service, 0o644)
+                _atomic_write(timer_path, prior_timer, 0o644)
+                run_command(["systemctl", "daemon-reload"], timeout=20, check=False)
+                run_command(["systemctl", "restart", f"{name}.timer"], timeout=30, check=False)
+            else:
+                run_command(["systemctl", "disable", "--now", f"{name}.timer"], timeout=30, check=False)
+                service_path.unlink(missing_ok=True)
+                timer_path.unlink(missing_ok=True)
+                run_command(["systemctl", "daemon-reload"], timeout=20, check=False)
+            raise
+    else:
+        if active and active.get("commit_sha") == request["commit_sha"] and active.get("image") == image:
+            container = active.get("container")
+            if _service_container_available(app, active):
+                _wait_service_container(container, int(runtime.get("readiness_timeout_seconds", 180)))
+                return {"outcome": "success", "app_id": app["app_id"], "commit_sha": request["commit_sha"], "image": image, "container": container, "already_active": True}
+        rolling = profile == "worker" and app["strategy"] == "rolling"
+        old_stopped = False
+        if active:
+            if not _service_container_available(app, active):
+                raise DeploymentError("The active service container identity could not be verified.")
+        volume_backup = None
+        candidate = _service_container_name(app, request["commit_sha"])
+        existing = run_command(["docker", "inspect", candidate], timeout=15, check=False)
+        if existing.returncode == 0:
+            raise DeploymentError("A candidate service container with this release identity already exists; inspect it before retrying.")
+        if not any(text in (existing.stderr + existing.stdout).lower() for text in ("no such object", "no such container")):
+            raise DeploymentError("The candidate service container state could not be verified.")
+        candidate_started = False
+        try:
+            if active and not rolling:
+                run_command(["docker", "stop", "--time", "30", active["container"]], timeout=45)
+                old_stopped = True
+            if profile in {"stateful-service", "game-server"}:
+                volume_backup = _create_service_volume_backup(app, active["commit_sha"] if active else request["commit_sha"])
+            candidate_started = True
+            run_command(_service_container_args(app, request, image, candidate), timeout=60)
+            _wait_service_container(candidate, int(runtime.get("readiness_timeout_seconds", 180)))
+            verify_release_origin(request, app)
+            if active and rolling:
+                run_command(["docker", "stop", "--time", "30", active["container"]], timeout=45)
+                old_stopped = True
+            timestamp = datetime.now(timezone.utc).isoformat()
+            previous = ({**active, "volume_backup": volume_backup} if active else None)
+            release = {
+                "app_id": app["app_id"], "profile": profile, "commit_sha": request["commit_sha"],
+                "platform_sha": request["platform_sha"], "image": image, "container": candidate,
+                "deployed_at": timestamp,
+            }
+            new_state = {"active": release, "previous": previous, "updated_at": timestamp}
+            _atomic_write(state_path, json.dumps(new_state, sort_keys=True, indent=2) + "\n")
+        except Exception as exc:
+            if candidate_started:
+                run_command(["docker", "rm", "-f", candidate], timeout=30, check=False)
+            if profile in {"stateful-service", "game-server"} and volume_backup is not None:
+                _restore_service_volume_backup(app, volume_backup)
+            if active and old_stopped:
+                run_command(["docker", "start", active["container"]], timeout=30, check=False)
+                _wait_service_container(active["container"], int(runtime.get("readiness_timeout_seconds", 180)))
+            raise exc
+        old_previous = state.get("previous")
+        if old_previous and old_previous.get("container") and old_previous.get("container") != (active or {}).get("container"):
+            with contextlib.suppress(DeploymentError, OSError):
+                _remove_service_container(app, old_previous)
+    timestamp = new_state["updated_at"]
+    _append_audit(app, {
+        "operation": "deploy-service", "outcome": "success", "profile": profile,
+        "commit_sha": request["commit_sha"], "image": image,
+        "workflow_run_id": request["release"]["run_id"], "actor": request["release"]["actor"],
+        "timestamp": timestamp,
+    })
+    metrics_warning = False
+    try:
+        _write_metrics(app, new_state, "success", "deploy-service", time.time() - started, request["release"]["run_id"], request["commit_sha"])
+    except OSError:
+        metrics_warning = True
+    return {"outcome": "success", "app_id": app["app_id"], "profile": profile, "commit_sha": request["commit_sha"], "image": image, "metrics_warning": metrics_warning}
+
+
+def _remove_service_container(app: dict[str, Any], release: dict[str, Any]) -> None:
+    if _service_container_available(app, release):
+        run_command(["docker", "rm", "-f", release["container"]], timeout=30, check=False)
+
+
+def _rollback_service(request: dict[str, Any], app: dict[str, Any]) -> dict[str, Any]:
+    started = time.time()
+    state_path = Path(app["state_file"])
+    state = _read_state(str(state_path))
+    active, previous = state.get("active"), state.get("previous")
+    if not active or not previous or active.get("profile") != app["deployment_profile"] or previous.get("profile") != app["deployment_profile"]:
+        raise DeploymentError("No retained compatible service release is available for rollback.")
+    profile = app["deployment_profile"]
+    runtime = app["runtime"]
+    if profile == "scheduled-job":
+        name = f"roman-platform-{app['app_id']}"
+        service_path = Path("/etc/systemd/system") / f"{name}.service"
+        timer_path = Path("/etc/systemd/system") / f"{name}.timer"
+        running = run_command(["systemctl", "is-active", "--quiet", f"{name}.service"], timeout=15, check=False)
+        if running.returncode == 0:
+            raise DeploymentError("The scheduled job is running; rollback waits until the current job finishes.")
+        _verify_service_release_image(app, previous)
+        old_service = service_path.read_text(encoding="utf-8") if service_path.exists() else None
+        old_timer = timer_path.read_text(encoding="utf-8") if timer_path.exists() else None
+        prior_request = {**request, "commit_sha": previous["commit_sha"], "platform_sha": previous["platform_sha"]}
+        service, timer = _scheduled_unit_content(app, prior_request, previous["image"])
+        try:
+            _install_scheduled_service(app, service, timer)
+            verify_release_origin(request, app)
+            timestamp = datetime.now(timezone.utc).isoformat()
+            new_state = {"active": previous, "previous": active, "updated_at": timestamp}
+            _atomic_write(state_path, json.dumps(new_state, sort_keys=True, indent=2) + "\n")
+        except Exception:
+            if old_service is not None and old_timer is not None:
+                _atomic_write(service_path, old_service, 0o644)
+                _atomic_write(timer_path, old_timer, 0o644)
+                run_command(["systemctl", "daemon-reload"], timeout=20, check=False)
+                run_command(["systemctl", "restart", f"{name}.timer"], timeout=30, check=False)
+            raise
+        _append_audit(app, {"operation": "rollback-service", "outcome": "success", "from_commit_sha": active["commit_sha"], "to_commit_sha": previous["commit_sha"], "workflow_run_id": request["release"]["run_id"], "actor": request["release"]["actor"], "timestamp": timestamp})
+        metrics_warning = False
+        try:
+            _write_metrics(app, new_state, "success", "rollback-service", time.time() - started, request["release"]["run_id"], request["commit_sha"])
+        except OSError:
+            metrics_warning = True
+        return {"outcome": "success", "app_id": app["app_id"], "commit_sha": previous["commit_sha"], "operation": "rollback-service", "metrics_warning": metrics_warning}
+    _verify_service_release_image(app, previous)
+    if not _service_container_available(app, active) or not _service_container_available(app, previous):
+        raise DeploymentError("The active or retained service container identity could not be verified.")
+    current_backup = None
+    run_command(["docker", "stop", "--time", "30", active["container"]], timeout=45)
+    try:
+        if profile in {"stateful-service", "game-server"}:
+            current_backup = _create_service_volume_backup(app, active["commit_sha"])
+            _restore_service_volume_backup(app, previous.get("volume_backup"))
+        run_command(["docker", "start", previous["container"]], timeout=30)
+        _wait_service_container(previous["container"], int(runtime.get("readiness_timeout_seconds", 180)))
+        verify_release_origin(request, app)
+        timestamp = datetime.now(timezone.utc).isoformat()
+        new_state = {"active": previous, "previous": {**active, "volume_backup": current_backup}, "updated_at": timestamp}
+        _atomic_write(state_path, json.dumps(new_state, sort_keys=True, indent=2) + "\n")
+    except Exception:
+        if profile in {"stateful-service", "game-server"} and current_backup is not None:
+            _restore_service_volume_backup(app, current_backup)
+        run_command(["docker", "start", active["container"]], timeout=30, check=False)
+        _wait_service_container(active["container"], int(runtime.get("readiness_timeout_seconds", 180)))
+        raise
+    _append_audit(app, {"operation": "rollback-service", "outcome": "success", "from_commit_sha": active["commit_sha"], "to_commit_sha": previous["commit_sha"], "workflow_run_id": request["release"]["run_id"], "actor": request["release"]["actor"], "timestamp": timestamp})
+    metrics_warning = False
+    try:
+        _write_metrics(app, new_state, "success", "rollback-service", time.time() - started, request["release"]["run_id"], request["commit_sha"])
+    except OSError:
+        metrics_warning = True
+    return {"outcome": "success", "app_id": app["app_id"], "commit_sha": previous["commit_sha"], "operation": "rollback-service", "metrics_warning": metrics_warning}
+
+
+def _verify_flyway_info(
+    output: str,
+    expected_version: str | None = None,
+    allowed_exceptions: list[dict[str, str]] | None = None,
+    *,
+    flyway_version: str | None = None,
+    schema_name: str | None = None,
+    max_pending: int = 32,
+    allow_initial_schema: bool = False,
+) -> ForwardMigrationPlan:
+    try:
+        plan = validate_forward_plan(
+            output,
+            max_pending=max_pending,
+            allowed_exceptions=allowed_exceptions,
+            expected_flyway_version=flyway_version,
+            expected_schema_name=schema_name,
+            allow_initial_schema=allow_initial_schema,
+        )
+    except MigrationPlanError as exc:
+        raise DeploymentError(f"Flyway migration history is invalid: {exc}") from exc
+    if expected_version is not None and plan.source_version != expected_version:
+        raise DeploymentError("Database schema version does not match the requested observed version.")
+    return plan
+
+
+def _migration_plan_data(plan: ForwardMigrationPlan) -> dict[str, Any]:
+    return {
+        "source_version": plan.source_version,
+        "target_version": plan.target_version,
+        "pending": [list(row) for row in plan.pending],
+        "fingerprint": plan.fingerprint,
+    }
+
+
+def _empty_database_status() -> dict[str, Any]:
+    fingerprint = hashlib.sha256(b"roman-platform-no-flyway-database").hexdigest()
+    plan = ForwardMigrationPlan(None, None, (), fingerprint)
+    return {
+        "schema_version": None,
+        "migration_target_version": None,
+        "migration_pending": False,
+        "migration_plan": _migration_plan_data(plan),
+    }
+
+
+def _migration_plan_from_data(value: Any) -> ForwardMigrationPlan:
+    if (
+        not isinstance(value, dict)
+        or not isinstance(value.get("pending"), list)
+        or not isinstance(value.get("fingerprint"), str)
+        or not re.fullmatch(r"[0-9a-f]{64}", value["fingerprint"])
+    ):
+        raise DeploymentError("The validated Flyway plan is unavailable.")
+    rows: list[tuple[str, str, str, int]] = []
+    for row in value["pending"]:
+        if (
+            not isinstance(row, list)
+            or len(row) != 4
+            or not all(isinstance(item, str) for item in row[:3])
+            or isinstance(row[3], bool)
+            or not isinstance(row[3], int)
+        ):
+            raise DeploymentError("The validated Flyway plan is malformed.")
+        rows.append((row[0], row[1], row[2], row[3]))
+    source = value.get("source_version")
+    target = value.get("target_version")
+    if source is not None and not isinstance(source, str):
+        raise DeploymentError("The validated Flyway source version is malformed.")
+    if target is not None and not isinstance(target, str):
+        raise DeploymentError("The validated Flyway target version is malformed.")
+    return ForwardMigrationPlan(source, target, tuple(rows), value["fingerprint"])
 
 
 def _schema_migration_policy(app: dict[str, Any]) -> dict[str, Any] | None:
@@ -1311,40 +1949,60 @@ def _schema_migration_policy(app: dict[str, Any]) -> dict[str, Any] | None:
     if policy is None:
         return None
     fields = {
-        "source_version", "target_version", "description", "script", "checksum",
-        "execution_role", "previous_release_compatible",
+        "adapter", "execution_role", "max_pending", "writer_usernames",
+        "rollback_after_migration", "allow_initial_schema",
     }
     if (
         not isinstance(policy, dict)
         or set(policy) != fields
-        or not all(isinstance(policy.get(key), str) for key in ("source_version", "target_version", "description", "script"))
-        or not re.fullmatch(r"(?:0|[1-9][0-9]{0,8})", policy["source_version"])
-        or not re.fullmatch(r"(?:0|[1-9][0-9]{0,8})", policy["target_version"])
-        or int(policy["source_version"]) >= int(policy["target_version"])
-        or policy["target_version"] != str(app.get("expected_schema_version"))
-        or not re.fullmatch(r"V[1-9][0-9]{0,8}__[a-z0-9_]+\.sql", policy["script"])
-        or policy["script"].split("__", 1)[0][1:] != policy["target_version"]
+        or policy.get("adapter") != "flyway"
+        or not isinstance(policy.get("execution_role"), str)
         or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,62}", policy["execution_role"])
-        or policy["execution_role"] != "romanlms_app"
-        or not policy["description"].strip()
-        or isinstance(policy["checksum"], bool)
-        or not isinstance(policy["checksum"], int)
-        or policy["previous_release_compatible"] is not True
+        or isinstance(policy["max_pending"], bool)
+        or not isinstance(policy["max_pending"], int)
+        or not 1 <= policy["max_pending"] <= 100
+        or not isinstance(policy["writer_usernames"], list)
+        or not policy["writer_usernames"]
+        or any(not isinstance(name, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,62}", name) for name in policy["writer_usernames"])
+        or policy["rollback_after_migration"] != "forward-only"
+        or not isinstance(policy["allow_initial_schema"], bool)
     ):
         raise DeploymentError("The production schema migration policy is invalid.")
-    backup = app.get("production_backup")
-    if (
-        not isinstance(backup, dict)
-        or set(backup) != {"config_file", "stanza", "repository", "timeout_seconds"}
-        or backup.get("config_file") != "/etc/pgbackrest/pgbackrest.conf"
-        or backup.get("stanza") != "roman-platform"
-        or isinstance(backup.get("repository"), bool)
-        or backup.get("repository") != 1
-        or isinstance(backup.get("timeout_seconds"), bool)
-        or not isinstance(backup.get("timeout_seconds"), int)
-        or not 60 <= backup["timeout_seconds"] <= 1800
-    ):
-        raise DeploymentError("The production database backup policy is invalid.")
+    database = app.get("database")
+    backup_adapter = database.get("backup_adapter") if isinstance(database, dict) else None
+    if backup_adapter == "pgbackrest":
+        backup = app.get("production_backup")
+        if (
+            not isinstance(backup, dict)
+            or set(backup) != {"config_file", "stanza", "repository", "timeout_seconds"}
+            or backup.get("config_file") != "/etc/pgbackrest/pgbackrest.conf"
+            or backup.get("stanza") != "roman-platform"
+            or isinstance(backup.get("repository"), bool)
+            or backup.get("repository") != 1
+            or isinstance(backup.get("timeout_seconds"), bool)
+            or not isinstance(backup.get("timeout_seconds"), int)
+            or not 60 <= backup["timeout_seconds"] <= 1800
+        ):
+            raise DeploymentError("The configured pgBackRest database backup policy is invalid.")
+    elif backup_adapter == "verified-dump":
+        backup = app.get("database_backup")
+        if (
+            not isinstance(backup, dict)
+            or set(backup) != {"adapter", "env_file", "directory", "timeout_seconds", "keep_last"}
+            or backup.get("adapter") != "verified-dump"
+            or backup.get("env_file") != f"/etc/roman-platform/{app.get('app_id')}/backup.env"
+            or backup.get("directory") != f"/srv/apps/{app.get('app_id')}/backups"
+            or backup.get("env_file") not in app.get("secret_refs", [])
+            or isinstance(backup.get("timeout_seconds"), bool)
+            or not isinstance(backup.get("timeout_seconds"), int)
+            or not 60 <= backup["timeout_seconds"] <= 7200
+            or isinstance(backup.get("keep_last"), bool)
+            or not isinstance(backup.get("keep_last"), int)
+            or not 2 <= backup["keep_last"] <= 50
+        ):
+            raise DeploymentError("The configured verified-dump backup policy is invalid.")
+    else:
+        raise DeploymentError("A supported database backup adapter is required before migration.")
     return policy
 
 
@@ -1355,58 +2013,18 @@ def _verify_flyway_migration_plan(
     *,
     flyway_version: str | None = None,
     schema_name: str | None = None,
-) -> None:
+) -> ForwardMigrationPlan:
     policy = _schema_migration_policy(app)
     if policy is None:
         raise DeploymentError("No production migration is approved for this application.")
-    try:
-        info = json.loads(output)
-    except (TypeError, json.JSONDecodeError) as exc:
-        raise DeploymentError("Flyway did not return a valid migration plan.") from exc
-    if not isinstance(info, dict) or str(info.get("schemaVersion")) != policy["source_version"]:
-        raise DeploymentError("The live database is not at the approved migration source version.")
-    if flyway_version and info.get("flywayVersion") != flyway_version:
-        raise DeploymentError("Flyway version does not match the approved release.")
-    if schema_name and info.get("schemaName") != schema_name:
-        raise DeploymentError("Flyway selected an unapproved database schema.")
-    if info.get("warnings") not in (None, []):
-        raise DeploymentError("Flyway reported warnings requiring review.")
-    migrations = info.get("migrations")
-    if not isinstance(migrations, list) or not migrations:
-        raise DeploymentError("Flyway migration history is unavailable.")
-
-    target = {
-        "state": "Pending",
-        "category": "Versioned",
-        "type": "SQL",
-        "version": policy["target_version"],
-        "description": policy["description"],
-        "filepath": f"/flyway/sql/{policy['script']}",
-    }
-    exceptions = list(allowed_exceptions or [])
-    fields = {"state", "category", "type", "version", "description", "filepath"}
-    if any(not isinstance(rule, dict) or set(rule) != fields or any(not isinstance(value, str) for value in rule.values()) for rule in exceptions):
-        raise DeploymentError("The approved migration history exceptions are invalid.")
-    target_count = 0
-    remaining = list(exceptions)
-    for item in migrations:
-        if not isinstance(item, dict) or not isinstance(item.get("state"), str):
-            raise DeploymentError("Flyway migration history is invalid.")
-        if item["state"] == "Pending":
-            if any(item.get(key) != value for key, value in target.items()):
-                raise DeploymentError("Flyway's pending migration differs from the approved release.")
-            if item.get("checksum") is not None and str(item["checksum"]) != str(policy["checksum"]):
-                raise DeploymentError("Flyway's pending migration checksum differs from the approved release.")
-            target_count += 1
-            continue
-        if item["state"] == "Success":
-            continue
-        match = next((rule for rule in remaining if all(item.get(key) == value for key, value in rule.items())), None)
-        if match is None:
-            raise DeploymentError("Flyway history contains an unapproved non-success migration state.")
-        remaining.remove(match)
-    if target_count != 1 or remaining:
-        raise DeploymentError("Flyway's pending migration set does not match the approved release.")
+    return _verify_flyway_info(
+        output,
+        allowed_exceptions=allowed_exceptions,
+        flyway_version=flyway_version,
+        schema_name=schema_name,
+        max_pending=policy["max_pending"],
+        allow_initial_schema=policy["allow_initial_schema"],
+    )
 
 
 def _flyway_container_args(
@@ -1416,11 +2034,20 @@ def _flyway_container_args(
     command: str,
     *,
     container_name: str | None = None,
+    migration_plan: ForwardMigrationPlan | None = None,
 ) -> list[str]:
     if command not in {"validate", "migrate", "info"}:
         raise DeploymentError("The requested Flyway command is not approved.")
-    if container_name is not None and not re.fullmatch(r"romanlms-flyway-[0-9]{1,20}-[0-9]{1,20}", container_name):
+    expected_container = re.compile(
+        rf"roman-platform-migration-{re.escape(app['app_id'])}-[0-9]{{1,20}}-[0-9]{{1,20}}"
+    )
+    if container_name is not None and not expected_container.fullmatch(container_name):
         raise DeploymentError("The Flyway migration container identity is invalid.")
+    policy = None
+    if command == "migrate":
+        policy = _schema_migration_policy(app)
+        if policy is None or migration_plan is None or not migration_plan.needs_migration or migration_plan.target_version is None:
+            raise DeploymentError("No validated pending migration plan is available for execution.")
     args = [
         "docker", "run", "--rm", "--read-only",
         "--network", app["container_network"],
@@ -1431,18 +2058,23 @@ def _flyway_container_args(
         "--cpus", "1",
         "--tmpfs", "/tmp:rw,nosuid,nodev,noexec,size=16m,mode=1777",
         "--env-file", str(env_file),
-        "--env", f"EXPECTED_TARGET_VERSION={app['expected_schema_version']}",
         "--env", f"FLYWAY_CLI_VERSION={app['flyway_cli_version']}",
+        "--env", f"FLYWAY_SCHEMA={app['flyway_schema']}",
     ]
+    if command == "migrate":
+        args.extend([
+            "--env", f"MIGRATION_TARGET_VERSION={migration_plan.target_version}",
+            "--env", f"MIGRATION_EXECUTION_ROLE={policy['execution_role']}",
+        ])
     if container_name is not None:
         args.extend(["--name", container_name])
     args.append(request["migration_image"])
-    args.extend(["info", "-outputType=json"] if command == "info" else [command])
     if command == "migrate":
-        policy = _schema_migration_policy(app)
-        if policy is None:
-            raise DeploymentError("No production migration is approved for this application.")
-        args[-1:-1] = [f'-initSql=SET ROLE "{policy["execution_role"]}"']
+        args.append("migrate")
+    elif command == "info":
+        args.extend(["info", "-outputType=json"])
+    else:
+        args.append(command)
     return args
 
 
@@ -1525,10 +2157,219 @@ def _verify_production_backup_integrity(app: dict[str, Any], label: str) -> None
         raise DeploymentError("Fresh full production backup integrity verification failed; the migration was not started.")
 
 
-def _create_verified_production_backup(app: dict[str, Any], request: dict[str, Any]) -> str:
+def _pg_connection_uri(jdbc_url: str) -> str:
+    if not isinstance(jdbc_url, str) or not re.fullmatch(
+        r"jdbc:postgresql://[A-Za-z0-9_.:-]+/[A-Za-z0-9_]+(?:\?[A-Za-z0-9_.=&%-]+)?",
+        jdbc_url,
+    ):
+        raise DeploymentError("The PostgreSQL backup destination URL is invalid.")
+    return jdbc_url.removeprefix("jdbc:")
+
+
+def _database_backup_credentials(app: dict[str, Any], runtime_values: dict[str, str]) -> tuple[dict[str, str], dict[str, str]]:
+    policy = app.get("database_backup")
+    if not isinstance(policy, dict):
+        raise DeploymentError("The verified-dump backup credentials are not configured.")
+    path = _secure_env_file(policy["env_file"])
+    values = _env_file_values(path)
+    required = {"DB_URL", "DB_USERNAME", "DB_PASSWORD"}
+    username = values.get("DB_USERNAME", "")
+    if (
+        set(values) != required
+        or any(not values.get(key, "").strip() for key in required)
+        or values.get("DB_URL") != runtime_values.get("DB_URL")
+        or values.get("DB_URL") not in app.get("allowed_database_urls", [])
+        or username == runtime_values.get("DB_USERNAME")
+        or username.lower() in {"postgres", "root", "admin"}
+        or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,62}", username)
+    ):
+        raise DeploymentError("The verified-dump backup credentials are invalid or target a different database.")
+    environment = os.environ.copy()
+    environment["PGPASSWORD"] = values["DB_PASSWORD"]
+    return values, environment
+
+
+def _verify_dump_backup(app: dict[str, Any], archive_path: Path, manifest: dict[str, Any]) -> str:
+    try:
+        metadata = archive_path.lstat()
+        manifest_path = archive_path.with_suffix(".json")
+        manifest_info = manifest_path.lstat()
+    except OSError as exc:
+        raise DeploymentError("The PostgreSQL dump backup or its recovery metadata is unavailable.") from exc
+    if (
+        archive_path.is_symlink()
+        or manifest_path.is_symlink()
+        or not stat.S_ISREG(metadata.st_mode)
+        or not stat.S_ISREG(manifest_info.st_mode)
+        or metadata.st_uid != 0
+        or manifest_info.st_uid != 0
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+        or stat.S_IMODE(manifest_info.st_mode) != 0o600
+        or manifest.get("app_id") != app["app_id"]
+        or manifest.get("archive") != archive_path.name
+        or manifest.get("adapter") != "verified-dump"
+    ):
+        raise DeploymentError("The PostgreSQL dump backup identity or permissions are invalid.")
+    digest = _volume_digest(archive_path)
+    if manifest.get("sha256") != digest:
+        raise DeploymentError("The PostgreSQL dump backup checksum is invalid.")
+    listing = run_command(["/usr/bin/pg_restore", "--list", str(archive_path)], timeout=120, check=False)
+    if listing.returncode != 0 or not listing.stdout.startswith("; Archive created at"):
+        raise DeploymentError("The PostgreSQL dump failed archive integrity verification.")
+    return digest
+
+
+def _prune_verified_dump_backups(app: dict[str, Any], keep_last: int) -> None:
+    backup_dir = Path(app["database_backup"]["directory"])
+    archives: list[tuple[float, Path]] = []
+    for path in backup_dir.glob("*.dump"):
+        manifest_path = path.with_suffix(".json")
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            info = path.lstat()
+        except (OSError, json.JSONDecodeError):
+            continue
+        if (
+            path.is_symlink()
+            or info.st_uid != 0
+            or stat.S_IMODE(info.st_mode) != 0o600
+            or manifest.get("app_id") != app["app_id"]
+            or manifest.get("adapter") != "verified-dump"
+            or manifest.get("archive") != path.name
+            or not re.fullmatch(r"[0-9a-f]{64}", str(manifest.get("sha256", "")))
+        ):
+            continue
+        archives.append((info.st_mtime, path))
+    for _, stale in sorted(archives, reverse=True)[keep_last:]:
+        manifest_path = stale.with_suffix(".json")
+        try:
+            manifest_path.unlink()
+            stale.unlink()
+        except OSError:
+            # Retain anything that cannot be pruned cleanly; it does not affect
+            # the verified newest backup or the migration gate.
+            continue
+
+
+def _create_verified_dump_backup(
+    app: dict[str, Any],
+    request: dict[str, Any],
+    plan: ForwardMigrationPlan,
+    runtime_values: dict[str, str],
+) -> str:
+    policy = app["database_backup"]
+    backup_dir = Path(policy["directory"])
+    if backup_dir.is_symlink() or str(backup_dir) != f"/srv/apps/{app['app_id']}/backups":
+        raise DeploymentError("The verified-dump backup directory is not isolated under the application storage root.")
+    backup_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    directory_info = backup_dir.lstat()
+    if (
+        not stat.S_ISDIR(directory_info.st_mode)
+        or directory_info.st_uid != 0
+        or stat.S_IMODE(directory_info.st_mode) & 0o077
+        or os.path.realpath(backup_dir) != str(backup_dir)
+    ):
+        raise DeploymentError("The verified-dump backup directory is not root-owned and private.")
+    values, env = _database_backup_credentials(app, runtime_values)
+    database_uri = _pg_connection_uri(values["DB_URL"])
+    query = run_command(
+        ["/usr/bin/psql", "--dbname", database_uri, "--username", values["DB_USERNAME"], "-At", "-v", "ON_ERROR_STOP=1", "-c", "SELECT pg_database_size(current_database())"],
+        env=env,
+        timeout=60,
+        check=False,
+        redactions=(values["DB_PASSWORD"], values["DB_URL"], values["DB_USERNAME"]),
+    )
+    try:
+        database_size = int(query.stdout.strip())
+    except ValueError as exc:
+        raise DeploymentError("The database backup size could not be measured safely.") from exc
+    if query.returncode != 0 or database_size <= 0:
+        raise DeploymentError("The database backup size could not be measured safely.")
+    if shutil.disk_usage(backup_dir).free < database_size + 2 * 1024**3:
+        raise DeploymentError("There is not enough free storage for the verified PostgreSQL dump and recovery reserve.")
+
+    run_id = str(request["release"]["run_id"])
+    attempt = str(request["release"]["run_attempt"])
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    archive_name = f"{stamp}-{run_id}-{attempt}.dump"
+    archive_path = backup_dir / archive_name
+    if archive_path.exists() or archive_path.is_symlink():
+        raise DeploymentError("A PostgreSQL backup with this release identity already exists.")
+    fd, temp_name = tempfile.mkstemp(prefix=".database-backup-", suffix=".dump", dir=backup_dir)
+    os.close(fd)
+    temp_path = Path(temp_name)
+    os.chmod(temp_path, 0o600)
+    try:
+        dump = run_command(
+            [
+                "/usr/bin/pg_dump", "--format=custom", "--no-owner", "--no-privileges",
+                "--file", str(temp_path), "--dbname", database_uri, "--username", values["DB_USERNAME"],
+            ],
+            env=env,
+            timeout=policy["timeout_seconds"],
+            check=False,
+            redactions=(values["DB_PASSWORD"], values["DB_URL"], values["DB_USERNAME"]),
+        )
+        if dump.returncode != 0 or not temp_path.is_file() or temp_path.stat().st_size == 0:
+            raise DeploymentError("The consistent PostgreSQL dump failed; the migration was not started.")
+        listing = run_command(["/usr/bin/pg_restore", "--list", str(temp_path)], timeout=120, check=False)
+        if listing.returncode != 0 or not listing.stdout.startswith("; Archive created at"):
+            raise DeploymentError("The PostgreSQL dump failed archive integrity verification; the migration was not started.")
+        digest = _volume_digest(temp_path)
+        os.replace(temp_path, archive_path)
+        manifest = {
+            "adapter": "verified-dump",
+            "app_id": app["app_id"],
+            "archive": archive_name,
+            "sha256": digest,
+            "database_url_sha256": hashlib.sha256(values["DB_URL"].encode("utf-8")).hexdigest(),
+            "schema_source_version": plan.source_version,
+            "schema_target_version": plan.target_version,
+            "migration_plan_fingerprint": plan.fingerprint,
+            "pending_migrations": [list(row) for row in plan.pending],
+            "commit_sha": request["commit_sha"],
+            "workflow_run_id": run_id,
+            "workflow_run_attempt": attempt,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        _atomic_write(archive_path.with_suffix(".json"), json.dumps(manifest, sort_keys=True) + "\n", 0o600)
+        _verify_dump_backup(app, archive_path, manifest)
+        _prune_verified_dump_backups(app, policy["keep_last"])
+    except Exception:
+        temp_path.unlink(missing_ok=True)
+        if archive_path.exists() and not archive_path.with_suffix(".json").exists():
+            archive_path.unlink(missing_ok=True)
+        raise
+    _append_audit(app, {
+        "operation": "database-backup",
+        "outcome": "success",
+        "backup_adapter": "verified-dump",
+        "backup_label": archive_name,
+        "backup_sha256": digest,
+        "schema_source_version": plan.source_version,
+        "schema_target_version": plan.target_version,
+        "migration_plan_fingerprint": plan.fingerprint,
+        "pending_migrations": [row[0] for row in plan.pending],
+        "commit_sha": request["commit_sha"],
+        "workflow_run_id": request["release"]["run_id"],
+        "actor": request["release"]["actor"],
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    })
+    return archive_name
+
+
+def _create_verified_production_backup(
+    app: dict[str, Any],
+    request: dict[str, Any],
+    plan: ForwardMigrationPlan,
+) -> str:
     policy = _schema_migration_policy(app)
-    if policy is None:
+    if policy is None or not plan.needs_migration:
         raise DeploymentError("No production migration is approved for this application.")
+    if app.get("database", {}).get("backup_adapter") == "verified-dump":
+        env_file = _secure_env_file(app.get("database_env_file"))
+        runtime_values = _env_file_values(env_file)
+        return _create_verified_dump_backup(app, request, plan, runtime_values)
     backup_policy = app["production_backup"]
     config = _secure_pgbackrest_config(backup_policy["config_file"])
     started = time.time()
@@ -1575,8 +2416,10 @@ def _create_verified_production_backup(app: dict[str, Any], request: dict[str, A
         "outcome": "success",
         "backup_label": label,
         "backup_type": "full",
-        "schema_source_version": policy["source_version"],
-        "schema_target_version": policy["target_version"],
+        "schema_source_version": plan.source_version,
+        "schema_target_version": plan.target_version,
+        "migration_plan_fingerprint": plan.fingerprint,
+        "pending_migrations": [row[0] for row in plan.pending],
         "commit_sha": request["commit_sha"],
         "workflow_run_id": request["release"]["run_id"],
         "actor": request["release"]["actor"],
@@ -1586,35 +2429,82 @@ def _create_verified_production_backup(app: dict[str, Any], request: dict[str, A
 
 
 def _assert_no_application_writers(app: dict[str, Any], env_values: dict[str, str]) -> None:
-    match = re.fullmatch(r"jdbc:postgresql://[^/]+/([A-Za-z0-9_]+)", env_values.get("DB_URL", ""))
-    username = env_values.get("DB_USERNAME", "")
-    if not match or not re.fullmatch(r"[A-Za-z0-9_]+", username):
+    policy = _schema_migration_policy(app)
+    configured = policy.get("writer_usernames") if policy else None
+    usernames = configured if isinstance(configured, list) else [env_values.get("DB_USERNAME", "")]
+    url = env_values.get("DB_URL", "")
+    match = re.fullmatch(r"jdbc:postgresql://([^/]+)/([A-Za-z0-9_]+)(?:\?.*)?", url)
+    if not match or not usernames or any(not isinstance(name, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,62}", name) for name in usernames):
         raise DeploymentError("The production database identity is invalid for writer quiescence checks.")
-    # username is constrained to alphanumeric/underscore characters above, so it
-    # can be embedded as a SQL literal without psql variable interpolation. psql
-    # does not expand :'var' inside a -c command string on all supported versions.
+    # Every role is constrained to alphanumeric/underscore characters before it
+    # is embedded in SQL. psql does not expand :'var' inside -c on all versions.
+    role_list = ",".join(f"'{name}'" for name in usernames)
     query = (
         "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() "
-        f"AND usename = '{username}' AND pid <> pg_backend_pid()"
+        f"AND usename IN ({role_list}) AND pid <> pg_backend_pid()"
     )
-    result = run_command(
-        [
-            "/usr/sbin/runuser", "-u", "postgres", "--", "/usr/bin/psql",
-            "-d", match.group(1), "-At", "-v", "ON_ERROR_STOP=1", "-c", query,
-        ],
-        timeout=15,
-    )
+    host = match.group(1).split(":", 1)[0].strip("[]").lower()
+    observer_file = app.get("writer_observer_database_env_file")
+    if host in {"localhost", "127.0.0.1", "::1"} and observer_file is None:
+        result = run_command(
+            [
+                "/usr/sbin/runuser", "-u", "postgres", "--", "/usr/bin/psql",
+                "-d", match.group(2), "-At", "-v", "ON_ERROR_STOP=1", "-c", query,
+            ],
+            timeout=15,
+        )
+    else:
+        if (
+            not isinstance(observer_file, str)
+            or observer_file not in app.get("secret_refs", [])
+            or observer_file != f"/etc/roman-platform/{app['app_id']}/writer-observer.env"
+        ):
+            raise DeploymentError("A dedicated read-only PostgreSQL session observer is required for this database host.")
+        observer_path = _secure_env_file(observer_file)
+        observer_values = _env_file_values(observer_path)
+        if (
+            set(observer_values) != {"DB_URL", "DB_USERNAME", "DB_PASSWORD"}
+            or observer_values.get("DB_URL") != url
+            or observer_values.get("DB_USERNAME", "").lower() in {"postgres", "root", "admin"}
+            or observer_values.get("DB_USERNAME") == env_values.get("DB_USERNAME")
+            or not observer_values.get("DB_PASSWORD", "").strip()
+        ):
+            raise DeploymentError("The dedicated PostgreSQL session observer credentials are invalid.")
+        observer_env = os.environ.copy()
+        observer_env["PGPASSWORD"] = observer_values["DB_PASSWORD"]
+        dsn = _pg_connection_uri(url)
+        privileges = run_command(
+            ["/usr/bin/psql", "--dbname", dsn, "--username", observer_values["DB_USERNAME"], "-At", "-v", "ON_ERROR_STOP=1", "-c", "SELECT pg_has_role(current_user, 'pg_read_all_stats', 'MEMBER')"],
+            env=observer_env,
+            timeout=15,
+            check=False,
+            redactions=(observer_values["DB_PASSWORD"], url, observer_values["DB_USERNAME"]),
+        )
+        if privileges.returncode != 0 or privileges.stdout.strip().lower() != "t":
+            raise DeploymentError("The PostgreSQL session observer lacks the required pg_read_all_stats role.")
+        result = run_command(
+            ["/usr/bin/psql", "--dbname", dsn, "--username", observer_values["DB_USERNAME"], "-At", "-v", "ON_ERROR_STOP=1", "-c", query],
+            env=observer_env,
+            timeout=15,
+            redactions=(observer_values["DB_PASSWORD"], url, observer_values["DB_USERNAME"]),
+        )
     try:
         writer_count = int(result.stdout.strip())
     except ValueError as exc:
         raise DeploymentError("The production database writer state could not be verified.") from exc
     if writer_count != 0:
-        raise DeploymentError("RomanLMS database writers remain active; the migration was not started.")
+        raise DeploymentError("Application database writers remain active; the migration was not started.")
 
 
-def _run_approved_migration(request: dict[str, Any], app: dict[str, Any], env_file: Path, env_values: dict[str, str]) -> None:
+def _run_approved_migration(
+    request: dict[str, Any],
+    app: dict[str, Any],
+    env_file: Path,
+    env_values: dict[str, str],
+    plan: ForwardMigrationPlan,
+) -> None:
     policy = _schema_migration_policy(app)
-    if policy is None:
+    if policy is None or not plan.needs_migration:
         raise DeploymentError("No production migration is approved for this application.")
     release = request.get("release")
     if not isinstance(release, dict):
@@ -1629,13 +2519,16 @@ def _run_approved_migration(request: dict[str, Any], app: dict[str, Any], env_fi
         or len(run_attempt) > 20
     ):
         raise DeploymentError("Approved migration release identity is invalid.")
-    container_name = f"romanlms-flyway-{run_id}-{run_attempt}"
+    container_name = f"roman-platform-migration-{app['app_id']}-{run_id}-{run_attempt}"
     audit_event = {
         "operation": "database-migration",
-        "schema_source_version": policy["source_version"],
-        "schema_target_version": policy["target_version"],
-        "migration_script": policy["script"],
-        "migration_checksum": policy["checksum"],
+        "schema_source_version": plan.source_version,
+        "schema_target_version": plan.target_version,
+        "pending_migrations": [
+            {"version": version, "script": filename, "description": description, "checksum": checksum}
+            for version, filename, description, checksum in plan.pending
+        ],
+        "migration_plan_fingerprint": plan.fingerprint,
         "commit_sha": request["commit_sha"],
         "migration_image": request["migration_image"],
         "workflow_run_id": run_id,
@@ -1658,23 +2551,22 @@ def _run_approved_migration(request: dict[str, Any], app: dict[str, Any], env_fi
     _append_audit(app, {**audit_event, "outcome": "started", "timestamp": datetime.now(timezone.utc).isoformat()})
     try:
         result = run_command(
-            _flyway_container_args(request, app, env_file, "migrate", container_name=container_name),
+            _flyway_container_args(
+                request, app, env_file, "migrate", container_name=container_name,
+                migration_plan=plan,
+            ),
             timeout=int(app.get("migration_timeout_seconds", 180)),
             check=False,
             redactions=(env_values["DB_URL"], env_values["DB_USERNAME"], env_values["DB_PASSWORD"]),
         )
     except DeploymentError as exc:
-        if not _ensure_flyway_container_stopped(container_name):
-            _append_audit(app, {**audit_event, "outcome": "unknown", "timestamp": datetime.now(timezone.utc).isoformat()})
-            raise MigrationOutcomeUnknown("The migration outcome is unknown and its container could not be confirmed stopped.") from exc
-        _append_audit(app, {**audit_event, "outcome": "failed", "timestamp": datetime.now(timezone.utc).isoformat()})
-        raise
+        _ensure_flyway_container_stopped(container_name)
+        _append_audit(app, {**audit_event, "outcome": "unknown", "timestamp": datetime.now(timezone.utc).isoformat()})
+        raise MigrationOutcomeUnknown("The Flyway command outcome is unknown; the retained backend remains stopped for recovery.") from exc
     if result.returncode != 0:
-        if not _ensure_flyway_container_stopped(container_name):
-            _append_audit(app, {**audit_event, "outcome": "unknown", "timestamp": datetime.now(timezone.utc).isoformat()})
-            raise MigrationOutcomeUnknown("The migration outcome is unknown and its container could not be confirmed stopped.")
-        _append_audit(app, {**audit_event, "outcome": "failed", "timestamp": datetime.now(timezone.utc).isoformat()})
-        raise DeploymentError("The approved Flyway migration failed; no repair or history edit was attempted.")
+        _ensure_flyway_container_stopped(container_name)
+        _append_audit(app, {**audit_event, "outcome": "unknown", "timestamp": datetime.now(timezone.utc).isoformat()})
+        raise MigrationOutcomeUnknown("Flyway reported a migration failure; the schema outcome requires read-only recovery verification.")
     _append_audit(app, {
         **audit_event,
         "outcome": "success",
@@ -1682,7 +2574,34 @@ def _run_approved_migration(request: dict[str, Any], app: dict[str, Any], env_fi
     })
 
 
-def _validate_database(request: dict[str, Any], app: dict[str, Any], *, allow_pending_migration: bool = False) -> dict[str, Any]:
+def _validate_database(
+    request: dict[str, Any],
+    app: dict[str, Any],
+    *,
+    allow_pending_migration: bool = False,
+    expected_plan: ForwardMigrationPlan | None = None,
+) -> dict[str, Any]:
+    local_release_image = False
+    if "migration_image" not in request:
+        database = app.get("database")
+        has_flyway = app.get("schema_migration") is not None or (
+            isinstance(database, dict) and database.get("migration_adapter") == "flyway"
+        )
+        if has_flyway:
+            if request.get("operation") not in {"verify-stack", "rollback-stack", "refresh-stack"}:
+                raise DeploymentError("A verified Flyway image is required to inspect this application's database history.")
+            active = _read_state(app["state_file"]).get("active")
+            if not isinstance(active, dict) or not isinstance(active.get("migration_image"), str):
+                raise DeploymentError("The active release has no retained migration image for schema verification.")
+            request = {
+                **request,
+                "migration_image": active["migration_image"],
+                "commit_sha": active["commit_sha"],
+                "platform_sha": active["platform_sha"],
+            }
+            local_release_image = True
+        else:
+            return _empty_database_status()
     env_file = _secure_env_file(app.get("database_env_file"))
     env_values = _env_file_values(env_file)
     required = {"DB_URL", "DB_USERNAME", "DB_PASSWORD"}
@@ -1691,15 +2610,25 @@ def _validate_database(request: dict[str, Any], app: dict[str, Any], *, allow_pe
     if not re.fullmatch(r"jdbc:postgresql://[^\s/]+/[^\s]+", env_values["DB_URL"]):
         raise DeploymentError("The staging database connection URL is invalid.")
     allowed_urls = app.get("allowed_database_urls")
-    if request.get("operation") in {"deploy-stack", "rollback-stack"} and (not isinstance(allowed_urls, list) or not allowed_urls):
+    if request.get("operation") in {"deploy-stack", "rollback-stack", "verify-stack", "refresh-stack"} and (not isinstance(allowed_urls, list) or not allowed_urls):
         raise DeploymentError("The isolated database destination is not allowlisted.")
     if allowed_urls is not None and (not isinstance(allowed_urls, list) or env_values["DB_URL"] not in allowed_urls):
         raise DeploymentError("The database destination is not allowlisted.")
     image = request["migration_image"]
     migration_policy = _schema_migration_policy(app)
     started = time.time()
-    with registry_session(app, request) as env:
-        run_command(["docker", "pull", image], env=env, timeout=600)
+    session = contextlib.nullcontext(os.environ.copy()) if local_release_image else registry_session(app, request)
+    with session as env:
+        if local_release_image:
+            local_digests = run_command(["docker", "image", "inspect", "--format", "{{json .RepoDigests}}", image], env=env, timeout=15)
+            try:
+                available_digests = json.loads(local_digests.stdout.strip())
+            except json.JSONDecodeError as exc:
+                raise DeploymentError("The retained migration image digest could not be verified locally.") from exc
+            if local_digests.returncode != 0 or not isinstance(available_digests, list) or image not in available_digests:
+                raise DeploymentError("The retained migration image is not available at its immutable registry digest.")
+        else:
+            run_command(["docker", "pull", image], env=env, timeout=600)
         _verify_image(image, request, app, env)
         args = _flyway_container_args(request, app, env_file, "validate")
         run_command(
@@ -1715,27 +2644,33 @@ def _validate_database(request: dict[str, Any], app: dict[str, Any], *, allow_pe
             timeout=int(app.get("migration_timeout_seconds", 180)),
             redactions=(env_values["DB_URL"], env_values["DB_USERNAME"], env_values["DB_PASSWORD"]),
         )
-        migration_pending = False
-        try:
-            info = json.loads(result.stdout)
-        except json.JSONDecodeError:
-            info = None
-        if (
-            allow_pending_migration
-            and migration_policy is not None
-            and isinstance(info, dict)
-            and str(info.get("schemaVersion")) == migration_policy["source_version"]
-        ):
-            _verify_flyway_migration_plan(
+        max_pending = migration_policy["max_pending"] if migration_policy else 32
+        allow_initial = migration_policy["allow_initial_schema"] if migration_policy else False
+        if expected_plan is not None:
+            try:
+                plan = validate_migration_result(
+                    result.stdout,
+                    expected_plan,
+                    allowed_exceptions=app.get("flyway_history_exceptions"),
+                    expected_flyway_version=app["flyway_cli_version"],
+                    expected_schema_name=app.get("flyway_schema"),
+                )
+            except MigrationPlanError as exc:
+                raise DeploymentError(f"Flyway postflight did not match the approved migration plan: {exc}") from exc
+        else:
+            plan = _verify_flyway_info(
                 result.stdout,
-                app,
-                app.get("flyway_history_exceptions"),
+                allowed_exceptions=app.get("flyway_history_exceptions"),
                 flyway_version=app["flyway_cli_version"],
                 schema_name=app.get("flyway_schema"),
+                max_pending=max_pending,
+                allow_initial_schema=allow_initial,
             )
-            migration_pending = True
-        else:
-            _verify_flyway_info(result.stdout, str(app["expected_schema_version"]), app.get("flyway_history_exceptions"), flyway_version=app["flyway_cli_version"], schema_name=app.get("flyway_schema"))
+        migration_pending = plan.needs_migration
+        if migration_pending and migration_policy is None:
+            raise DeploymentError("Pending migrations exist but this application has no approved migration and backup adapters.")
+        if migration_pending and not allow_pending_migration:
+            raise DeploymentError("Pending migrations require an authorized forward deployment.")
         if migration_pending:
             _migration_database_env(app, env_values)
     duration = round(time.time() - started, 3)
@@ -1745,7 +2680,10 @@ def _validate_database(request: dict[str, Any], app: dict[str, Any], *, allow_pe
         "outcome": "success",
         "commit_sha": request["commit_sha"],
         "migration_image": image,
-        "expected_schema_version": str(app["expected_schema_version"]),
+        "schema_source_version": plan.source_version,
+        "schema_target_version": plan.target_version,
+        "pending_migrations": [row[0] for row in plan.pending],
+        "migration_plan_fingerprint": plan.fingerprint,
         "workflow_run_id": request["release"]["run_id"],
         "actor": request["release"]["actor"],
         "duration_seconds": duration,
@@ -1768,9 +2706,11 @@ def _validate_database(request: dict[str, Any], app: dict[str, Any], *, allow_pe
         "outcome": "success",
         "app_id": app["app_id"],
         "operation": "validate-database",
-        "expected_schema_version": str(app["expected_schema_version"]),
+        "schema_version": plan.source_version,
+        "migration_target_version": plan.target_version,
         "migration_image": image,
         "migration_pending": migration_pending,
+        "migration_plan": _migration_plan_data(plan),
         "metrics_warning": metrics_warning,
     }
 
@@ -2091,6 +3031,9 @@ def _verify_stack_active(request: dict[str, Any], app: dict[str, Any]) -> dict[s
     active = state.get("active")
     if not isinstance(active, dict):
         raise DeploymentError("There is no active application release to verify.")
+    database_status = _validate_database(request, app)
+    if active.get("schema_version") != database_status["schema_version"]:
+        raise DeploymentError("The active application release does not match the observed database schema.")
     _stack_release_healthy(app, active)
     _stack_route_healthy(app)
     _append_audit(app, {"operation": "verify-stack", "outcome": "success", "commit_sha": active["commit_sha"], "workflow_run_id": request["release"]["run_id"], "actor": request["release"]["actor"], "timestamp": datetime.now(timezone.utc).isoformat()})
@@ -2173,6 +3116,7 @@ def _switch_stack_route(app: dict[str, Any], slot: str) -> None:
 def _deploy_stack(request: dict[str, Any], app: dict[str, Any]) -> dict[str, Any]:
     started = time.time()
     database_status = _validate_database(request, app, allow_pending_migration=True)
+    validated_plan = _migration_plan_from_data(database_status["migration_plan"])
     state_path = Path(app["state_file"])
     state = _read_state(str(state_path))
     active = state.get("active")
@@ -2219,33 +3163,45 @@ def _deploy_stack(request: dict[str, Any], app: dict[str, Any]) -> dict[str, Any
     records: dict[str, Any] = {}
     migration_started = False
     try:
-        if database_status["migration_pending"]:
+        if validated_plan.needs_migration:
             if app.get("single_backend_maintenance") is not True:
                 raise DeploymentError("Production migration requires the approved single-backend maintenance policy.")
             migration_policy = _schema_migration_policy(app)
             if migration_policy is None:
-                raise DeploymentError("No production migration is approved for this application.")
-            if active and active.get("schema_version") != migration_policy["source_version"]:
-                raise DeploymentError("The retained application release is not on the approved migration source schema.")
-            backup_label = _create_verified_production_backup(app, request)
+                raise DeploymentError("No production migration and backup adapters are approved for this application.")
+            if active and active.get("schema_version") != validated_plan.source_version:
+                raise DeploymentError("The retained application release does not match the observed migration source schema.")
+            backup_label = _create_verified_production_backup(app, request, validated_plan)
             if active:
                 _stop_stack_backend(app, active)
             env_file = _secure_env_file(app.get("database_env_file"))
             env_values = _env_file_values(env_file)
             _assert_no_application_writers(app, env_values)
-            # Re-read the exact pending plan after backup and writer quiescence.
-            # The initial preflight may be stale by the time migration can start.
-            migration_started = True
+            # Re-read the release-scoped plan after backup and writer quiescence.
+            # A concurrent migration invalidates this attempt before Flyway runs.
             latest_database_status = _validate_database(request, app, allow_pending_migration=True)
-            if latest_database_status["migration_pending"]:
-                migration_env_file, migration_env_values = _migration_database_env(app, env_values)
-                _run_approved_migration(request, app, migration_env_file, migration_env_values)
-            _validate_database(request, app)
+            latest_plan = _migration_plan_from_data(latest_database_status["migration_plan"])
+            if latest_plan.fingerprint != validated_plan.fingerprint:
+                raise DeploymentError("Database migration history changed after backup; no migration was run.")
+            migration_started = True
+            migration_env_file, migration_env_values = _migration_database_env(app, env_values)
+            _run_approved_migration(request, app, migration_env_file, migration_env_values, validated_plan)
+            database_status = _validate_database(
+                request,
+                app,
+                allow_pending_migration=True,
+                expected_plan=validated_plan,
+            )
+            if database_status["migration_pending"] or database_status["schema_version"] != validated_plan.target_version:
+                raise DeploymentError("The verified database schema did not reach the migration plan target.")
             _append_audit(app, {
                 "operation": "database-migration",
                 "outcome": "verified",
                 "backup_label": backup_label,
-                "schema_version": str(app["expected_schema_version"]),
+                "schema_source_version": validated_plan.source_version,
+                "schema_target_version": validated_plan.target_version,
+                "migration_plan_fingerprint": validated_plan.fingerprint,
+                "pending_migrations": [row[0] for row in validated_plan.pending],
                 "commit_sha": request["commit_sha"],
                 "workflow_run_id": request["release"]["run_id"],
                 "actor": request["release"]["actor"],
@@ -2262,7 +3218,7 @@ def _deploy_stack(request: dict[str, Any], app: dict[str, Any]) -> dict[str, Any
         if app.get("single_backend_maintenance") is True:
             component_order.sort(key=lambda name: (name == "backend", name))
         for name in component_order:
-            if name == "backend" and backend_maintenance:
+            if name == "backend" and backend_maintenance and not validated_plan.needs_migration:
                 _stop_stack_backend(app, active)
             if name == "backend" and app.get("single_backend_maintenance") is True:
                 _check_backend_start_memory(app)
@@ -2275,12 +3231,26 @@ def _deploy_stack(request: dict[str, Any], app: dict[str, Any]) -> dict[str, Any
             started_names.append(container)
             run_command(_container_run_args(component_app, request["images"][name], container, slot, int(component_app["container_port"]), request["commit_sha"]), timeout=60)
             records[name] = {"slot": slot, "commit_sha": request["commit_sha"], "container": container, "image": request["images"][name]}
-        release = {"app_id": app["app_id"], "slot": slot, "commit_sha": request["commit_sha"], "platform_sha": request["platform_sha"], "schema_version": str(app["expected_schema_version"]), "components": records, "deployed_at": datetime.now(timezone.utc).isoformat()}
+        release = {
+            "app_id": app["app_id"],
+            "slot": slot,
+            "commit_sha": request["commit_sha"],
+            "platform_sha": request["platform_sha"],
+            "schema_version": database_status["schema_version"],
+            "migration_image": request.get("migration_image"),
+            "components": records,
+            "deployed_at": datetime.now(timezone.utc).isoformat(),
+        }
         _stack_release_healthy(app, release)
         verify_release_origin(request, app)
         _switch_stack_route(app, slot)
         route_switched = True
-        new_state = {"active": release, "previous": active, "updated_at": release["deployed_at"]}
+        previous_release = active
+        if migration_started or (active and active.get("schema_version") != database_status["schema_version"]):
+            # SQL is forward-only. Never advertise an application from a different
+            # observed schema as a safe rollback target.
+            previous_release = None
+        new_state = {"active": release, "previous": previous_release, "updated_at": release["deployed_at"]}
         require_storage_mounts(app)
         _atomic_write(state_path, json.dumps(new_state, indent=2, sort_keys=True) + "\n")
         _append_audit(app, {"operation": "deploy-stack", "outcome": "success", "commit_sha": request["commit_sha"], "images": request["images"], "platform_sha": request["platform_sha"], "slot": slot, "workflow_run_id": request["release"]["run_id"], "actor": request["release"]["actor"], "timestamp": release["deployed_at"]})
@@ -2300,15 +3270,15 @@ def _deploy_stack(request: dict[str, Any], app: dict[str, Any]) -> dict[str, Any
                 if migration_started:
                     if isinstance(deployment_exc, MigrationOutcomeUnknown):
                         raise DeploymentError("The migration outcome could not be verified; the retained backend remains stopped for safe recovery.") from deployment_exc
-                    # Restart the retained release only when Flyway proves either
-                    # the exact pending source plan or the approved additive target.
-                    _validate_database(request, app, allow_pending_migration=True)
-                    policy = _schema_migration_policy(app)
-                    if policy is None or policy["previous_release_compatible"] is not True:
-                        raise DeploymentError("The retained application is not approved for the migrated schema.")
+                    raise DeploymentError("The database was migrated forward; the retained release stays stopped until a compatible fix-forward release or approved restore is available.") from deployment_exc
                 _restart_stack_backend(app, active)
             except Exception as recovery_exc:
-                message = "The migration outcome could not be verified; the retained backend remains stopped for safe recovery." if migration_started else "The candidate failed and the retained backend could not be restored automatically."
+                if isinstance(deployment_exc, MigrationOutcomeUnknown):
+                    message = "The migration outcome could not be verified; the retained backend remains stopped for safe recovery."
+                elif migration_started:
+                    message = "The database migrated forward; the retained backend remains stopped until a compatible fix-forward release or approved restore is available."
+                else:
+                    message = "The candidate failed and the retained backend could not be restored automatically."
                 raise DeploymentError(message) from recovery_exc
         raise
     metrics_warning = False
@@ -2370,13 +3340,14 @@ def _verify_retained_stack_images(app: dict[str, Any], release: dict[str, Any]) 
 
 def _refresh_stack(request: dict[str, Any], app: dict[str, Any]) -> dict[str, Any]:
     started = time.time()
+    database_status = _validate_database(request, app)
     _stack_validate_network(app)
     state_path = Path(app["state_file"])
     state = _read_state(str(state_path))
     active = state.get("active")
     if (
         not isinstance(active, dict)
-        or active.get("schema_version") != str(app["expected_schema_version"])
+        or active.get("schema_version") != database_status["schema_version"]
         or active.get("slot") not in {"blue", "green"}
     ):
         raise DeploymentError("A current active release is required before runtime-only refresh.")
@@ -2527,11 +3498,17 @@ def _start_retained_stack(app: dict[str, Any], release: dict[str, Any]) -> list[
 
 def _rollback_stack(request: dict[str, Any], app: dict[str, Any]) -> dict[str, Any]:
     started = time.time()
-    _validate_database(request, app)
+    database_status = _validate_database(request, app)
     state_path = Path(app["state_file"])
     state = _read_state(str(state_path))
     active, previous = state.get("active"), state.get("previous")
-    if not active or not previous or previous.get("schema_version") != str(app["expected_schema_version"]) or active.get("slot") == previous.get("slot"):
+    if (
+        not active
+        or not previous
+        or active.get("schema_version") != database_status["schema_version"]
+        or previous.get("schema_version") != database_status["schema_version"]
+        or active.get("slot") == previous.get("slot")
+    ):
         raise DeploymentError("No retained application release matches the current schema policy.")
     _stack_validate_network(app)
     _append_audit(app, {"operation": "rollback-stack", "outcome": "started", "from_commit_sha": active["commit_sha"], "to_commit_sha": previous["commit_sha"], "workflow_run_id": request["release"]["run_id"], "actor": request["release"]["actor"], "timestamp": datetime.now(timezone.utc).isoformat()})
@@ -2655,6 +3632,10 @@ def execute(request: Any, config: dict[str, Any]) -> dict[str, Any]:
             verify_release_origin(request, app)
             if request["operation"] == "deploy":
                 return _deploy(request, app)
+            if request["operation"] == "deploy-service":
+                return _deploy_service(request, app)
+            if request["operation"] == "rollback-service":
+                return _rollback_service(request, app)
             if request["operation"] == "rollback":
                 return _rollback(request, app)
             if request["operation"] == "validate-database":
@@ -2709,8 +3690,10 @@ def load_config() -> dict[str, Any]:
         config = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise DeploymentError("Server deployment policy is unavailable or invalid.") from exc
-    if not isinstance(config, dict) or not isinstance(config.get("applications"), dict):
-        raise DeploymentError("Server deployment policy is invalid.")
+    try:
+        validate_registry(config)
+    except RegistryError as exc:
+        raise DeploymentError(f"Server application registry is invalid: {exc}") from exc
     return config
 
 

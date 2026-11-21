@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "controller"))
-from forward_migration_plan import MigrationPlanError, validate_forward_plan
+from forward_migration_plan import MigrationPlanError, validate_forward_plan, validate_migration_result
 
 
 def example():
@@ -16,7 +16,8 @@ def example():
         "schemaName": "roman_lms",
         "migrations": [
             {"version": "133", "state": "Success", "category": "Versioned",
-             "type": "SQL", "description": "existing migration"},
+             "type": "SQL", "description": "existing migration",
+             "filepath": "/flyway/sql/V133__existing_migration.sql", "checksum": 231},
             {"version": "134", "state": "Pending", "category": "Versioned",
              "type": "SQL", "description": "add attendance metadata",
              "filepath": "/flyway/sql/V134__add_attendance_metadata.sql", "checksum": -321},
@@ -113,6 +114,12 @@ class ForwardMigrationPlanTests(unittest.TestCase):
         report = example()
         report["migrations"][2]["checksum"] = 999
         self.assertNotEqual(first.fingerprint, check(report).fingerprint)
+
+    def test_plan_fingerprint_binds_applied_history_checksums(self):
+        first = check(example())
+        report = example()
+        report["migrations"][0]["checksum"] += 1
+        self.assertNotEqual(first.fingerprint, check(report).fingerprint)
         report = example()
         report["migrations"][2]["filepath"] = "/flyway/sql/V135__new_approved_feature.sql"
         self.assertNotEqual(first.fingerprint, check(report).fingerprint)
@@ -141,6 +148,46 @@ class ForwardMigrationPlanTests(unittest.TestCase):
         plan = validate_forward_plan(json.dumps(report), allow_initial_schema=True)
         self.assertIsNone(plan.source_version)
         self.assertEqual(plan.target_version, "1")
+
+    def test_applied_versioned_history_requires_checksum_and_cannot_be_ahead(self):
+        report = example()
+        report["migrations"][0]["checksum"] = None
+        with self.assertRaises(MigrationPlanError):
+            check(report)
+        report = example()
+        report["migrations"][0]["version"] = "134"
+        with self.assertRaises(MigrationPlanError):
+            check(report)
+
+    def test_postflight_requires_all_planned_checksums_and_no_remaining_pending(self):
+        planned = check(example())
+        report = example()
+        report["schemaVersion"] = "136"
+        report["migrations"] = [
+            {"version": "133", "state": "Success", "category": "Versioned",
+             "type": "SQL", "description": "existing migration",
+             "filepath": "/flyway/sql/V133__existing_migration.sql", "checksum": 231},
+            *[
+                {"version": version, "state": "Success", "category": "Versioned",
+                 "type": "SQL", "description": description,
+                 "filepath": f"/flyway/sql/{filename}", "checksum": checksum}
+                for version, filename, description, checksum in planned.pending
+            ],
+        ]
+        validated = validate_migration_result(
+            json.dumps(report), planned,
+            expected_flyway_version="11.14.1",
+            expected_schema_name="roman_lms",
+        )
+        self.assertEqual(validated.source_version, "136")
+        self.assertFalse(validated.needs_migration)
+
+        report["migrations"][-1]["checksum"] += 1
+        with self.assertRaises(MigrationPlanError):
+            validate_migration_result(json.dumps(report), planned)
+        report["migrations"][-1]["state"] = "Pending"
+        with self.assertRaises(MigrationPlanError):
+            validate_migration_result(json.dumps(report), planned)
 
 
 if __name__ == "__main__":

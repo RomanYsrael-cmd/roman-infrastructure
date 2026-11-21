@@ -1,5 +1,7 @@
 # RomanLMS Production Hardening Report — 2026-11-09
 
+> Historical point-in-time report. The restricted host became available for read-only inspection on 2026-11-20; see [current platform status](status.md) for the later production observation. “Not installed” and “unavailable” statements below describe only the 2026-11-09 snapshot.
+
 This report separates verified live observations from local changes awaiting review and installation. Source changes in the hardening branches are not active in production.
 
 ## Acceptance status

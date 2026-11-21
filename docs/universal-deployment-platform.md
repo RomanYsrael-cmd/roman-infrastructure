@@ -1,99 +1,65 @@
-# Universal deployment platform — implementation contract
+# Universal deployment platform
 
-Status: **design and isolated migration-plan foundation only**. This is not a claim that production or any other repository has been migrated to the new controller. Existing production policies stay active until an explicitly tested cutover.
+Status: **implementation is under review in Roman Infrastructure PR #26 and the coordinated RomanLMS branch.** The local code now contains the version-agnostic migration path, registered application profiles, reusable deployment workflow, OIDC-bound image provenance, and a build-only artifact workflow. These changes are not production-installed until the PRs pass CI and the matching controller and RomanLMS migrator revisions are installed together.
 
-## Outcome
+The main branch remains unprotected. Existing direct pushes to `main`, RomanLMS SHORT CI authorization, and RomanLMS pull-request LONG CI authorization remain supported.
 
-Roman Infrastructure will deploy independently registered applications from any repository that the owner explicitly authorizes. An app may have no database. For apps with databases, the deployment controller must no longer carry a hardcoded version pair, a single-file SQL checksum, or a one-pending-migration limit.
+## Architecture
 
-**This does not mean automatically deploying every repository, running arbitrary shell commands on the host, or granting every project's CI access to production credentials.** Each project must be registered once with an owner-approved, server-side policy.
+`platform/applications.json` is the root-owned registry used by CI, the release workflow, and the server controller. Each registered application has a unique ID and GitHub repository, production branch, workflow identity, approved reusable-workflow revision, CI policy, confirmation phrases, resource budget, network and port policy, health checks, route include, secret references, persistence policy, and rollout strategy. The registry validator rejects malformed registrations, duplicate host ports, overlapping route domains or paths, overlapping Docker subnets, shared application networks, unsafe mounts, resource overcommit, and unsupported adapters.
 
-## Deployment profiles
+The controller accepts a bounded JSON request through the forced-command SSH interface. It does not accept caller-provided shell commands, Compose files, arbitrary Docker flags, or host paths. Root-owned registry policy selects the deployment adapter. Deployment histories, release state, metrics, and storage are scoped by application ID.
 
-| Profile | Workload | Migration hook |
+The reusable container workflow checks the exact caller repository, branch, source commit, CI run, actor, current workflow run, and full reusable-workflow SHA. It checks out the helper code at that authorized workflow SHA and the application registry from a separately pinned registry snapshot. This separates the workflow version from the registry version and avoids a self-referential commit pin. GitHub Actions builds immutable GHCR images from the registered build specification. The server verifies image digests, labels, package/source identity, build specification hash, and a signed GitHub OIDC token whose audience binds the requested images and source commit. Package-write permission is limited to the build job; the server handoff receives package-read and short-lived GitHub API credentials only.
+
+Build-only projects use `build-application.yml`. That workflow has no SSH key, production token, package-write permission, or server job. It runs one of the root-registered Gradle Android, Gradle JVM, Maven wrapper, npm lockfile, or Python package presets, runs that preset's tests, and uploads a source-bound archive with a SHA-256 manifest.
+
+## Supported profiles
+
+| Profile | Current controller behavior | Rollout and persistence |
 | --- | --- | --- |
-| static-web | Immutable web image served by Nginx | None |
-| http-service | API/server with health probes and blue/green | Optional |
-| multi-service | Explicit named container set (e.g. UI/API/worker) | Optional |
-| worker | Persistent background process; process/heartbeat health | Optional |
-| scheduled-job | Bounded execution with isolated permissions | Optional |
-| game-server | Long-lived network service with configured TCP/UDP ports and persistent data | Optional, normally none |
-| stateful-service | A vetted persistent service with dedicated volume and backup policy | Service-specific |
+| `static-web` | Single HTTP container behind an app-specific Nginx include | Blue/green, readiness-checked route switch |
+| `backend-api` | Single HTTP API with bounded health checks and resource limits | Blue/green, rolling, or recreate according to registered policy |
+| `full-stack` | Named components, isolated network, per-component readiness, coordinated route file | Blue/green or maintenance; components switch together |
+| `multi-container` | Named service set with explicit ports, health paths, and resource budget | Blue/green, rolling, recreate, or maintenance |
+| `worker` | Private, non-root container with Docker health; duplicate processing must be declared safe for rolling | Rolling or recreate |
+| `scheduled-job` | Non-root image invoked by a root-managed systemd timer using a validated UTC calendar | Scheduled image replacement; each run is bounded and isolated |
+| `stateful-service` | Non-root container, app-owned persistent directory, isolated network and verified volume archive | Recreate or maintenance, with application-specific backup/restore policy |
+| `game-server` | Stateful service with explicit TCP/UDP bindings, persistent data, health check, and resource caps | Recreate or maintenance; never assumes HTTP routing |
+| `build-only` | Build and test artifact; no server deployment operation is authorized | Immutable Actions artifact plus checksums; signing remains a project-specific release step |
 
-A profile describes validated inputs and safe behavior; project repositories cannot supply unrestricted Docker options, privileged mode, host paths or shell commands through a release request.
+The installed database adapter currently supports PostgreSQL with Flyway and either verified `pgBackRest` or verified dump backups. Other engines and migration tools are not enabled yet; adding one requires an adapter implementation and integration tests, not a per-version controller exception.
 
-## Project registry and onboarding
+Examples for all profiles are in [application-profiles.json](../examples/application-profiles.json). The checked-in applications registry contains the current smoke and RomanLMS registrations; candidate repositories are not automatically deployed when added to GitHub.
 
-The approved registry is a declarative per-app server-side policy, not a copy of RomanLMS constants. Each entry declares:
+## Migration lifecycle
 
-- Unique app ID and GitHub owner/repository, allowed source branch(es), actors and workflow identity.
-- Approved build recipe and immutable GHCR image namespaces, with the CI-success/commit provenance gate.
-- Profile, components, dependency order, health/readiness behavior, resource limits and rollout strategy.
-- Network, private listeners, domain/routing, TLS, Nginx/Cloudflare integration and port ownership.
-- Required storage mounts, persistent volumes, restore expectations and backup type.
-- Secrets by root-owned references only; no secrets in the registry, workflow inputs or image labels.
-- Optional PostgreSQL/Flyway, MySQL/Liquibase, or explicitly reviewed migration adapter.
-- Explicit rollback and backward-compatibility policy, including behavior after schema expansion.
+For a database-backed release, the controller validates the exact immutable migrator image, obtains Flyway `info` and `validate` output, and constructs a plan from the observed schema version, applied history, pending migration filenames, and checksums. It rejects failed or unknown history, modified applied migrations, duplicate or out-of-order versions, unrelated pending changes, and a plan whose database/schema identity does not match the registered application. The target is the last version in that release's validated pending list; no V133 target is encoded in controller logic.
 
-Onboarding should be a CLI/CI-backed operation:
-1. Analyze the repository and request profile, builds, ports, storage, database and domains.
-2. Produce a generated manifest and CI/workflow templates for review.
-3. Validate policy schemas; reject duplicate domains/ports, mount escapes, overcommit and unauthorized repositories.
-4. Run isolated build/image verification and a staging deployment with smoke/negative tests.
-5. Install reviewed root-owned manifest and immutable controller revision on the server, then deploy.
-6. Record app ownership, versions, deployment events and exact backup/restore evidence.
+The plan fingerprint binds the source version, target version, migration names/checksums, Flyway version, database and schema identity, image digest, and source commit. A no-migration plan skips backup, writer quiescence, and migration execution. When migrations are pending, the registered backup adapter must produce and verify a fresh recoverable backup before the controller quiesces configured writers, re-reads the plan, and compares the fingerprint. The controller then invokes the migrator image using dedicated migration credentials and the registered execution role. Postflight must show the exact target and planned checksums before a candidate application may become active.
 
-Releases remain isolated per app. There must be no need to edit and redeploy controller source for ordinary application releases or forward migrations.
+Migration execution is forward-only. The controller never runs `repair`, changes Flyway history, or blindly rolls back SQL. A known unchanged source plan can restore the old app; a verified new target can continue only when the candidate passes health. An unknown migration outcome leaves the affected writer stopped and traffic on the last verified route until an operator follows the backup recovery procedure. App rollback is allowed only when the retained app's recorded schema matches the live observed schema.
 
-## Version-agnostic SQL migration design
+`max_pending` is an application policy between 1 and 100 (RomanLMS currently sets 32). It bounds an operational batch; it does not require one migration per release. Clean application releases and databases with no pending migrations do not incur a full database backup.
 
-The opt-in planner in deploy/controller/forward_migration_plan.py is a pure parser. It currently has no runtime authority and must not be treated as an operational migration switch. Controller integration is a separate change.
+See [the migration lifecycle and recovery guide](database-migration-lifecycle.md) for the preflight, backup, audit, failure and restoration details.
 
-Migration execution contract:
+## CI and release authorization
 
-1. Require an authorized source commit and successful exact-source CI, immutable migrator image digest, correct DB and schema identities and a dedicated migration account.
-2. Run Flyway validation and info against that immutable image with **latest** target semantics (not a repository-global V133 target).
-3. Determine current applied version and all pending SQL migrations. Require strictly increasing unique canonical versions, approved migration directory, valid checksums, no unknown/failed history, bounded pending count (e.g. 32).
-4. Create a canonical, cryptographic fingerprint of source/target/pending file names and checksums. Bind it to the release attempt/image digest in deployment audit/state.
-5. Check backward compatibility for the retained application with explicit release-scoped evidence. A user acknowledgement alone is not proof; integration tests should exercise old and new apps against the expanded schema.
-6. If no pending migrations: **skip migration, backup and writer-quiescence steps**. Still validate DB state when DB is configured.
-7. If pending: make a fresh consistent backup using a project-specific supported backup adapter, verify it, quiesce relevant writers, and **re-read and compare the exact same plan fingerprint**. Do not treat a changed plan as equivalent.
-8. Run only the planned forward migrations with the dedicated database role; disable Flyway clean/repair/baseline. Validate actual postflight schema, checksum and history state before starting and routing the candidate.
-9. If the result is unknown, do not restart applications into an unverified schema. If the candidate fails after verified migration, restart the old release only with verified compatibility evidence.
-10. Never infer that rollback of SQL is safe; use forward repair or a separately reviewed point-in-time restore procedure.
+`deploy-application.yml` is the common container deployment entry point. Each caller pins the reusable workflow commit in `uses:` and passes that same SHA as `platform_ref`; the root-owned `allowed_platform_shas` list must include it. At authorization start, the workflow resolves root `main` once and records that exact registry commit. Authorization and image building both use that recorded registry snapshot. A registration selects automatic release behavior explicitly; otherwise the owner dispatches a workflow with a root-registered confirmation phrase. Pull requests do not receive deployment secrets or a server release path.
 
-Do not use migration filename heuristics to *prove* a DDL operation is additive. Explicit CI validation, compatibility testing, and policy gates are still required.
+RomanLMS keeps the existing release gate: direct owner pushes to `main` use exact-commit SHORT CI, while a merged pull request requires the successful LONG CI evidence for the merged tree. Automatic production release also requires the root and GitHub freeze switches, exact successful SHORT run, owner identity, and a positive production-change classification. Manual verify, deploy, rollback, and runtime refresh remain explicit owner-dispatched operations. No branch protection is added.
 
-## Remaining code changes before production activation
+New application builds execute on GitHub-hosted runners. Only the final restricted SSH handoff runs on the registered Windows laptop runner. The server remains the authority for application allowlisting, the current main commit, workflow SHA, image provenance, capacity, health, migration state, audit logging, and route switching.
 
-1. Replace fixed schema_migration source/target/script/checksum in the live controller with an opt-in, release-scoped dynamic plan; remove the one-pending constraint. Maintain migration audit and planner fingerprint.
-2. Update RomanLMS ops/deploy/migration/entrypoint.sh so Flyway target is derived from the verified release plan (and supports an initial info without a preselected version). Update its release metadata and tests. The current image hardcodes EXPECTED_TARGET_VERSION and is not yet compatible with this behavior.
-3. Refactor _validate_database, _deploy_stack, backup audit, release state schema_version, _refresh_stack and rollback checks to use observed source/target versions. Preserve staged cutover and failure recovery.
-4. Make database role, schema, Flyway container identity and backup settings per-application rather than romanlms-specific constants.
-5. Implement typed project registry and profile-specific deploy/rollback logic. Keep deployment inputs structured and pinned; do **not** accept arbitrary Compose files from a workflow.
-6. Add app-specific CI adapters (container build, static frontend, worker, game server), staging tests, negative authorization tests, backup restoration tests, and resource contention tests.
-7. Perform read-only shadow validation against the live RomanLMS database and a restored staging copy. Only then approve installation and enablement; do not deploy framework changes automatically on merge.
+## Onboarding
 
-## Acceptance tests
+Use the steps in [Application onboarding](application-onboarding.md). A new project is a registry entry plus its own CI caller, secret files, ports, storage, routes, resource limits, and rollout decision. Normal app releases and new sequential SQL migrations do not require controller-source edits. A new runtime type, database engine, migration executor, or backup adapter does.
 
-- Upgrade from V133 with 3 ordered pending SQL migrations in one release; postflight schema equals latest and all checksums match.
-- A release with zero pending migrations succeeds without full backup or writer downtime.
-- Invalid/out-of-order/repeated version, failed history, different database URL, mismatched image digest, modified file checksum, changed plan after backup, unsafe retained-app compatibility, and failed backup all fail closed.
-- A failed/unknown migration cannot switch traffic or silently repair Flyway history.
-- A static site, an HTTP API, a worker, and a multi-service application can be registered independently using the same controller, with per-project credentials and domain isolation.
-- Repositories outside the explicit trusted registry cannot deploy, even if they can reference a reusable GitHub Action.
-- Existing RomanLMS main direct-push, SHORT-CI and PR/LONG-CI behaviors remain unchanged; main remains intentionally unprotected.
-- Active production routing, data, secrets and mount layout are preserved during migration to the new framework.
+The registry is intentionally an allowlist. Candidate repositories such as `schedulease-server`, `roman-search`, `battle-of-bluffs`, `mailforge`, and `minecraft-server` require individual stack, data, network, and production-use assessment before registration. Their existence is not approval to replace an existing deployment.
 
-## Initial candidate repositories
+## Monitoring and operations
 
-Potential onboardees after individual assessment: RomanYsrael-cmd/roman-lms, schedulease-server, roman-search, battle-of-bluffs, mailforge, and other owner-controlled projects. A GitHub repository being present is **not** evidence that it is a deployable server workload.
+The controller writes app-ID-labelled deployment metrics to the existing Node Exporter textfile collector, and writes bounded deployment events to each app's root-owned audit file. The existing Prometheus, Grafana, and Telegram alert path remains in use. Per-app health and release state are visible in the dashboard and in the `roman_platform_*` metrics. The monitoring guide is in [the deployment runbook](universal-deployment-runbook.md).
 
-## Rollout sequence
-
-A. Land tested *pure planner* foundation (this branch).
-B. Integrate generic migration policy and opt-in dry-run with RomanLMS, while leaving the V133 production controller installed.
-C. Prove matching Flyway validation, backup, multi-migration and rollback behavior in restored staging.
-D. Install the reviewed new controller and explicitly switch RomanLMS to the generic policy.
-E. Introduce project profiles, registration CLI and onboard one simple stateless app before stateful services.
-F. Expand to other project types only after their individual health, persistence, networking and recovery checks pass.
+The repository still requires a staged rollout: validate source and CI, confirm a recoverable backup, verify that the controller and caller use compatible revisions, install the root-owned registry/controller, exercise the private smoke and RomanLMS gates, then perform only a non-destructive production release. The production controller and RomanLMS image must never be upgraded independently across an incompatible request or migrator contract.

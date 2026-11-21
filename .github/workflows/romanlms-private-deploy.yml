@@ -1,4 +1,4 @@
-name: Reusable private application deployment
+name: RomanLMS compatibility adapter to registered deployment
 
 on:
   workflow_call:
@@ -59,13 +59,14 @@ permissions:
   actions: read
   pull-requests: read
   packages: write
+  id-token: write
 
 concurrency:
   group: roman-platform-production
   cancel-in-progress: false
 
 jobs:
-  publish-images:
+  delegate-registered-release:
     if: >-
       github.repository == 'RomanYsrael-cmd/roman-lms' &&
       github.actor == 'RomanYsrael-cmd' &&
@@ -94,263 +95,23 @@ jobs:
         inputs.source_sha == github.event.workflow_run.head_sha &&
         inputs.trigger_run_id == format('{0}', github.event.workflow_run.id) &&
         inputs.trigger_run_attempt == format('{0}', github.event.workflow_run.run_attempt)))
-    runs-on: [self-hosted, Windows, X64, roman-laptop]
-    timeout-minutes: 120
-    outputs:
-      backend: ${{ steps.images.outputs.backend }}
-      frontend: ${{ steps.images.outputs.frontend }}
-      migrator: ${{ steps.images.outputs.migrator }}
     permissions:
       contents: read
       actions: read
       pull-requests: read
       packages: write
-    defaults:
-      run:
-        shell: pwsh
-    env:
-      PLATFORM_REF: ${{ inputs.platform_ref }}
-      OPERATION: ${{ inputs.operation }}
-      TEST_COMPONENT: ${{ inputs.test_component }}
-      APP_ID: ${{ inputs.app_id }}
-      DEPLOYMENT_ENVIRONMENT: ${{ inputs.deployment_environment }}
-      CALLER_WORKFLOW_PATH: ${{ inputs.caller_workflow_path }}
-      IMAGE_PREFIX: ${{ inputs.image_prefix }}
-      CONFIRMATION: ${{ inputs.confirmation }}
-      SOURCE_SHA: ${{ inputs.source_sha || github.sha }}
-      RELEASE_MODE: ${{ inputs.release_mode }}
-      TRIGGER_RUN_ID: ${{ inputs.trigger_run_id }}
-      TRIGGER_RUN_ATTEMPT: ${{ inputs.trigger_run_attempt }}
-      CALLER_EVENT: ${{ github.event_name }}
-      GH_TOKEN: ${{ github.token }}
-    steps:
-      - name: Verify current owner-controlled main and its successful CI
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $profiles = @{
-            'romanlms-phase6' = @{ Workflow='.github/workflows/romanlms-phase6-staging.yml'; Environment='phase6-staging'; ImagePrefix='romanlms-phase6' }
-            'romanlms-production' = @{ Workflow='.github/workflows/romanlms-production-deploy.yml'; Environment='production'; ImagePrefix='romanlms-prod' }
-          }
-          $profile = $profiles[$env:APP_ID]
-          if (-not $profile -or $env:CALLER_WORKFLOW_PATH -ne $profile.Workflow -or
-              $env:DEPLOYMENT_ENVIRONMENT -ne $profile.Environment -or $env:IMAGE_PREFIX -ne $profile.ImagePrefix) {
-            throw 'The application deployment profile does not match its server-side policy.'
-          }
-          if ($env:PLATFORM_REF -notmatch '^[0-9a-f]{40}$' -or $env:SOURCE_SHA -notmatch '^[0-9a-f]{40}$') { throw 'Full source and infrastructure SHAs are required.' }
-          if ($env:RELEASE_MODE -notin @('manual', 'automatic')) { throw 'The release mode is invalid.' }
-          $currentRun = & gh api "repos/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID" | ConvertFrom-Json
-          if ($LASTEXITCODE -ne 0 -or $currentRun.path -ne $profile.Workflow -or
-              $currentRun.head_sha -ne $env:GITHUB_SHA -or $currentRun.event -ne $env:CALLER_EVENT -or
-              $currentRun.actor.login -ne 'RomanYsrael-cmd') { throw 'The caller workflow is not authorized.' }
-          if (($env:RELEASE_MODE -eq 'manual' -and $env:CALLER_EVENT -ne 'workflow_dispatch') -or
-              ($env:RELEASE_MODE -eq 'automatic' -and ($env:APP_ID -ne 'romanlms-production' -or $env:OPERATION -ne 'deploy-stack' -or $env:CALLER_EVENT -ne 'workflow_run'))) {
-            throw 'The requested release mode is not authorized for this application operation.'
-          }
-          $expectedWorkflow = 'RomanYsrael-cmd/roman-infrastructure/.github/workflows/romanlms-private-deploy.yml@' + $env:PLATFORM_REF
-          $referenced = @($currentRun.referenced_workflows | Where-Object { $_.path -eq $expectedWorkflow -and $_.sha -eq $env:PLATFORM_REF })
-          if ($referenced.Count -ne 1) { throw 'The executing reusable workflow does not match the supplied infrastructure pin.' }
-          $branch = & gh api "repos/$env:GITHUB_REPOSITORY/branches/main" | ConvertFrom-Json
-          if ($LASTEXITCODE -ne 0 -or $branch.commit.sha -ne $env:SOURCE_SHA) { throw 'The requested source commit is not current main.' }
-          if ($env:APP_ID -ne 'romanlms-production') {
-            $runs = & gh api "repos/$env:GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$env:SOURCE_SHA&event=push&per_page=100" | ConvertFrom-Json
-            if ($LASTEXITCODE -ne 0) { throw 'Could not verify required CI.' }
-            $matching = @($runs.workflow_runs | Where-Object {
-              $_.head_sha -eq $env:SOURCE_SHA -and $_.head_branch -eq 'main' -and $_.event -eq 'push'
-            })
-            $latest = $matching | Sort-Object id -Descending | Select-Object -First 1
-            if (-not $latest -or $latest.status -ne 'completed' -or $latest.conclusion -ne 'success' -or $latest.actor.login -ne 'RomanYsrael-cmd') {
-              throw 'The latest required CI run for this exact source commit must pass under the owner account.'
-            }
-          }
-          $os = (& docker info --format '{{.OSType}}' 2>$null).Trim()
-          if ($LASTEXITCODE -ne 0 -or $os -ne 'linux') { throw 'Docker Desktop Linux engine is unavailable.' }
-          $tailscale = 'C:\Program Files\Tailscale\tailscale.exe'
-          if (-not (Test-Path -LiteralPath $tailscale)) { throw 'Tailscale is unavailable.' }
-          $status = (& $tailscale status --json | ConvertFrom-Json)
-          $server = $status.Peer.PSObject.Properties.Value | Where-Object { $_.HostName -eq 'roman-server' -and $_.Online -and $_.TailscaleIPs -contains '100.67.102.11' }
-          if ($status.BackendState -ne 'Running' -or -not $server) { throw 'The approved server is not online on Tailscale.' }
-
-      - name: Check out the verified source
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
-        with:
-          ref: ${{ inputs.source_sha || github.sha }}
-          path: roman-lms
-          persist-credentials: false
-
-      - name: Check out the pinned controller
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
-        with:
-          repository: RomanYsrael-cmd/roman-infrastructure
-          ref: ${{ inputs.platform_ref }}
-          path: platform
-          token: ${{ github.token }}
-          persist-credentials: false
-
-      - name: Run controller policy tests
-        run: |
-          Push-Location platform/deploy/tests
-          try {
-              python -m unittest test_romanlms_ci_gate test_controller.WorkflowContractTests test_controller.RequestValidationTests test_controller.RomanLmsContainerPolicyTests test_controller.StackDeploymentTests test_controller.RomanLmsProductionPolicyTests test_controller.WorkflowOriginTests test_controller.ImageProvenanceTests -v
-          } finally { Pop-Location }
-          if ($LASTEXITCODE -ne 0) { throw 'Controller policy tests failed.' }
-
-      - name: Verify exact RomanLMS CI authorization before image publication
-        if: ${{ inputs.app_id == 'romanlms-production' }}
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $appConfig = Get-Content -LiteralPath 'platform/platform/applications.json' -Raw | ConvertFrom-Json
-          $productionPolicy = $appConfig.applications.'romanlms-production'
-          $expectedWorkflowBlob = [string]$productionPolicy.required_ci_workflow_blob_sha
-          if ($expectedWorkflowBlob -notmatch '^[0-9a-f]{40}$') { throw 'The pinned controller has no approved CI workflow content identity.' }
-          $gateArguments = @(
-            'platform/deploy/controller/romanlms_ci_gate.py',
-            '--source-sha', $env:SOURCE_SHA,
-            '--expected-workflow-blob-sha', $expectedWorkflowBlob
-          )
-          if ($env:RELEASE_MODE -eq 'automatic') {
-            if ($env:TRIGGER_RUN_ID -notmatch '^\d+$' -or $env:TRIGGER_RUN_ATTEMPT -notmatch '^\d+$') { throw 'The automatic source CI run identity is malformed.' }
-            $gateArguments += @('--short-run-id', $env:TRIGGER_RUN_ID, '--short-run-attempt', $env:TRIGGER_RUN_ATTEMPT)
-          }
-          $proofText = & python @gateArguments
-          if ($LASTEXITCODE -ne 0) { throw 'Exact source CI authorization failed before image builds.' }
-          $proof = $proofText | ConvertFrom-Json
-          if ($env:RELEASE_MODE -eq 'automatic' -and $proof.productionChange -ne $true) { throw 'No production application change is eligible for automatic image publication.' }
-          if ($proof.authorizationPath -eq 'validated-pr-merge') {
-            $releaseEvidence = 'Validated PR merge: LONG run ' + $proof.longRunId + ' and exact-main SHORT run ' + $proof.shortRunId + '.'
-          } elseif ($proof.authorizationPath -eq 'authorized-direct-main-push') {
-            $releaseEvidence = 'Authorized direct-main push: exact-main SHORT run ' + $proof.shortRunId + ' only; this path intentionally has reduced test coverage.'
-          } else {
-            throw 'The controller returned an unknown RomanLMS release authorization path.'
-          }
-          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value ('Verified RomanLMS release proof. ' + $releaseEvidence + ' Source tree ' + $proof.sourceTreeSha + '; production change ' + $proof.productionChange + '.')
-
-      - name: Build and publish immutable images
-        id: images
-        if: ${{ inputs.operation == 'deploy-stack' || inputs.operation == 'rollback-stack' || inputs.operation == 'test-stack' }}
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $dockerConfig = Join-Path $env:RUNNER_TEMP ('roman-private-docker-' + $env:GITHUB_RUN_ID)
-          New-Item -ItemType Directory -Path $dockerConfig -Force | Out-Null
-          $env:DOCKER_CONFIG = $dockerConfig
-          try {
-            $env:GH_TOKEN | & docker login ghcr.io --username $env:GITHUB_ACTOR --password-stdin
-            if ($LASTEXITCODE -ne 0) { throw 'Registry login failed.' }
-            $metadata = Get-Content -LiteralPath 'roman-lms/ops/deploy/release-metadata.env'
-            $versionLine = @($metadata | Where-Object { $_ -match '^FLYWAY_CLI_VERSION=[0-9]+(\.[0-9]+)+$' })
-            if ($versionLine.Count -ne 1) { throw 'The pinned Flyway version is missing or ambiguous.' }
-            $flywayVersion = ($versionLine[0] -split '=', 2)[1]
-            $specs = @(@{ Name='migrator'; Dockerfile='roman-lms/ops/deploy/migration/Dockerfile'; Context='roman-lms' })
-            if ($env:OPERATION -eq 'deploy-stack' -or $env:OPERATION -eq 'test-stack') {
-              $specs += @{ Name='backend'; Dockerfile='roman-lms/backend/Dockerfile'; Context='roman-lms/backend' }
-              $specs += @{ Name='frontend'; Dockerfile='roman-lms/frontend/Dockerfile'; Context='roman-lms/frontend' }
-            }
-            foreach ($spec in $specs) {
-              $image = 'ghcr.io/romanysrael-cmd/' + $env:IMAGE_PREFIX + '-' + $spec.Name
-              $tag = $image + ':sha-' + $env:SOURCE_SHA + '-run-' + $env:GITHUB_RUN_ID + '-' + $env:GITHUB_RUN_ATTEMPT
-              $metadataPath = Join-Path $env:RUNNER_TEMP ('roman-image-' + $env:GITHUB_RUN_ID + '-' + $env:GITHUB_RUN_ATTEMPT + '-' + $spec.Name + '.json')
-              $buildArgs = @('buildx','build','--push','--metadata-file',$metadataPath,'--file',$spec.Dockerfile,'--tag',$tag,
-                '--build-arg',"OCI_REVISION=$env:SOURCE_SHA",'--build-arg',"FLYWAY_CLI_VERSION=$flywayVersion",
-                '--label','org.opencontainers.image.source=https://github.com/RomanYsrael-cmd/roman-lms',
-                '--label',"org.opencontainers.image.revision=$env:SOURCE_SHA",
-                '--label','io.roman.platform.source-repository=https://github.com/RomanYsrael-cmd/roman-infrastructure',
-                '--label',"io.roman.platform.source-revision=$env:PLATFORM_REF",
-                '--label','io.roman.deployment.package-repository=https://github.com/RomanYsrael-cmd/roman-lms',
-                '--label',"io.roman.deployment.caller-revision=$env:SOURCE_SHA",$spec.Context)
-              & docker @buildArgs
-              if ($LASTEXITCODE -ne 0) { throw "Image build or registry push failed: $($spec.Name)." }
-              if (-not (Test-Path -LiteralPath $metadataPath -PathType Leaf)) { throw 'BuildKit did not return image metadata.' }
-              $publishMetadata = Get-Content -LiteralPath $metadataPath -Raw | ConvertFrom-Json
-              $digest = [string]$publishMetadata.'containerimage.digest'
-              if ($digest -notmatch '^sha256:[0-9a-f]{64}$') { throw 'BuildKit did not return an immutable image digest.' }
-              $digestReference = $image + '@' + $digest
-              & docker pull $digestReference
-              if ($LASTEXITCODE -ne 0) { throw "Published image pull failed: $($spec.Name)." }
-              $repoDigestJson = & docker image inspect --format '{{json .RepoDigests}}' $digestReference
-              if ($LASTEXITCODE -ne 0) { throw 'Could not inspect the pulled registry image.' }
-              $repoDigests = @($repoDigestJson | ConvertFrom-Json)
-              if ($repoDigests -notcontains $digestReference) { throw 'The pulled registry image did not match the BuildKit digest.' }
-              Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value ($spec.Name + '=' + $digestReference)
-              Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value ('Published ' + $digestReference)
-              Remove-Item -LiteralPath $metadataPath -Force -ErrorAction SilentlyContinue
-            }
-          } finally {
-            & docker logout ghcr.io 2>$null | Out-Null
-            if ($metadataPath) { Remove-Item -LiteralPath $metadataPath -Force -ErrorAction SilentlyContinue }
-            Remove-Item -LiteralPath $dockerConfig -Recurse -Force -ErrorAction SilentlyContinue
-          }
-
-
-  send-release:
-    needs: [publish-images]
-    if: ${{ needs.publish-images.result == 'success' }}
-    runs-on: [self-hosted, Windows, X64, roman-laptop]
-    timeout-minutes: 30
-    permissions:
-      contents: read
-      actions: read
-      pull-requests: read
-      packages: read
-    defaults:
-      run:
-        shell: pwsh
-    env:
-      PLATFORM_REF: ${{ inputs.platform_ref }}
-      OPERATION: ${{ inputs.operation }}
-      TEST_COMPONENT: ${{ inputs.test_component }}
-      APP_ID: ${{ inputs.app_id }}
-      DEPLOYMENT_ENVIRONMENT: ${{ inputs.deployment_environment }}
-      SOURCE_SHA: ${{ inputs.source_sha || github.sha }}
-      RELEASE_MODE: ${{ inputs.release_mode }}
-      TRIGGER_RUN_ID: ${{ inputs.trigger_run_id }}
-      TRIGGER_RUN_ATTEMPT: ${{ inputs.trigger_run_attempt }}
-      BACKEND_IMAGE: ${{ needs.publish-images.outputs.backend }}
-      FRONTEND_IMAGE: ${{ needs.publish-images.outputs.frontend }}
-      MIGRATION_IMAGE: ${{ needs.publish-images.outputs.migrator }}
-      PLATFORM_SSH_PRIVATE_KEY: ${{ secrets.ROMAN_PLATFORM_SSH_PRIVATE_KEY }}
-      PLATFORM_SSH_KNOWN_HOSTS: ${{ secrets.ROMAN_PLATFORM_SSH_KNOWN_HOSTS }}
-      GH_TOKEN: ${{ github.token }}
-    steps:
-      - name: Send the verified release through restricted Tailscale SSH
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $knownHosts = Join-Path $env:RUNNER_TEMP ('roman-private-known-hosts-' + $env:GITHUB_RUN_ID)
-          $key = Join-Path $env:RUNNER_TEMP ('roman-private-key-' + $env:GITHUB_RUN_ID)
-          try {
-            $utf8 = [Text.UTF8Encoding]::new($false)
-            [IO.File]::WriteAllText($knownHosts, $env:PLATFORM_SSH_KNOWN_HOSTS.Trim() + [Environment]::NewLine, $utf8)
-            [IO.File]::WriteAllText($key, $env:PLATFORM_SSH_PRIVATE_KEY.Trim() + [Environment]::NewLine, $utf8)
-            & icacls.exe $key /inheritance:r /grant:r "$($env:USERNAME):(F)" | Out-Null
-            if ($LASTEXITCODE -ne 0) { throw 'Could not secure the temporary deployment key.' }
-            & ssh-keygen.exe -F '100.67.102.11' -f $knownHosts | Out-Null
-            if ($LASTEXITCODE -ne 0) { throw 'The approved server host key is missing.' }
-            $request = @{
-              operation=$env:OPERATION; app_id=$env:APP_ID; repository=$env:GITHUB_REPOSITORY;
-              branch='main'; commit_sha=$env:SOURCE_SHA; workflow_sha=$env:GITHUB_SHA;
-              platform_sha=$env:PLATFORM_REF; environment=$env:DEPLOYMENT_ENVIRONMENT;
-              github_token=$env:GH_TOKEN;
-              release=@{run_id=$env:GITHUB_RUN_ID; run_attempt=$env:GITHUB_RUN_ATTEMPT; actor=$env:GITHUB_ACTOR; mode=$env:RELEASE_MODE}
-            }
-            if ($env:RELEASE_MODE -eq 'automatic') {
-              $request.release.trigger_run_id=$env:TRIGGER_RUN_ID
-              $request.release.trigger_run_attempt=$env:TRIGGER_RUN_ATTEMPT
-            }
-            if ($env:OPERATION -eq 'deploy-stack' -or $env:OPERATION -eq 'rollback-stack') {
-              $request.migration_image=$env:MIGRATION_IMAGE
-              $request.registry_token=$env:GH_TOKEN
-            }
-            if ($env:OPERATION -eq 'deploy-stack') {
-              $request.strategy='blue-green'
-              $request.images=@{backend=$env:BACKEND_IMAGE; frontend=$env:FRONTEND_IMAGE}
-            }
-            if ($env:OPERATION -eq 'test-stack') {
-              $request.component=$env:TEST_COMPONENT
-              $request.registry_token=$env:GH_TOKEN
-              $testImage = if ($env:TEST_COMPONENT -eq 'backend') { $env:BACKEND_IMAGE } else { $env:FRONTEND_IMAGE }
-              $request.image=$testImage
-            }
-            $json = $request | ConvertTo-Json -Depth 6 -Compress
-            $json | & ssh.exe -i $key -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o "UserKnownHostsFile=$knownHosts" roman-deploy@100.67.102.11
-            if ($LASTEXITCODE -ne 0) { throw 'The restricted controller rejected the release.' }
-          } finally {
-            Remove-Item -LiteralPath $key, $knownHosts -Force -ErrorAction SilentlyContinue
-          }
+      id-token: write
+    uses: ./.github/workflows/deploy-application.yml
+    with:
+      app_id: ${{ inputs.app_id }}
+      confirmation: ${{ inputs.confirmation }}
+      operation: ${{ inputs.operation }}
+      component: ${{ inputs.test_component }}
+      platform_ref: ${{ inputs.platform_ref }}
+      source_sha: ${{ inputs.source_sha }}
+      release_mode: ${{ inputs.release_mode }}
+      trigger_run_id: ${{ inputs.trigger_run_id }}
+      trigger_run_attempt: ${{ inputs.trigger_run_attempt }}
+    secrets:
+      ROMAN_PLATFORM_SSH_PRIVATE_KEY: ${{ secrets.ROMAN_PLATFORM_SSH_PRIVATE_KEY }}
+      ROMAN_PLATFORM_SSH_KNOWN_HOSTS: ${{ secrets.ROMAN_PLATFORM_SSH_KNOWN_HOSTS }}

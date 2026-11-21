@@ -1,9 +1,9 @@
-"""Pure, release-scoped Flyway migration-plan validation.
+"""Release-scoped Flyway migration-plan validation used by the controller.
 
-This module does NOT run migrations or authorize deployment. A future controller
-integration must bind the exact plan fingerprint to an immutable migrator image,
-a verified source commit and a release attempt, then re-check it after backup
-and writer quiescence before running Flyway.
+This module validates migration metadata and result history. The deployment
+controller binds its plan fingerprint to the immutable migrator image, verified
+source commit, database identity, backup, and release attempt, then rechecks the
+plan after backup and writer quiescence before running Flyway.
 """
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 VERSION = re.compile(r"(?:0|[1-9]\d*)(?:\.(?:0|[1-9]\d*))*\Z")
@@ -30,6 +31,7 @@ class ForwardMigrationPlan:
     target_version: str | None
     pending: tuple[tuple[str, str, str, int], ...]
     fingerprint: str
+    history: tuple[tuple[str, str, str, str, str, str, int | None], ...] = ()
 
     @property
     def needs_migration(self) -> bool:
@@ -99,6 +101,7 @@ def validate_forward_plan(
 
     exceptions = _validate_exceptions(allowed_exceptions)
     pending: list[tuple[str, str, str, int]] = []
+    history: list[tuple[str, str, str, str, str, str, int | None]] = []
     seen_versions: set[tuple[int, ...]] = set()
     highest = source_tuple
     success_count = 0
@@ -106,11 +109,30 @@ def validate_forward_plan(
         if not isinstance(entry, dict) or not isinstance(entry.get("state"), str):
             raise MigrationPlanError("Flyway history contains an invalid entry.")
         state = entry["state"]
+        category = entry.get("category", "")
+        migration_type = entry.get("type", "")
+        raw_version = entry.get("version", "")
+        description = entry.get("description", "")
+        filepath = entry.get("filepath", "")
+        checksum = entry.get("checksum")
+        if any(not isinstance(value, str) for value in (category, migration_type, raw_version, description, filepath)):
+            raise MigrationPlanError("Flyway history contains malformed migration metadata.")
+        if checksum is not None and (
+            isinstance(checksum, bool)
+            or not isinstance(checksum, int)
+            or not -(2**31) <= checksum < 2**31
+        ):
+            raise MigrationPlanError("Flyway history contains an invalid checksum.")
+        history.append((state, category, migration_type, raw_version, description, filepath, checksum))
         if state == "Success":
             success_count += 1
-            version = entry.get("version")
-            if version not in (None, ""):
-                _version_tuple(str(version))
+            if raw_version:
+                parts = _version_tuple(raw_version)
+                if category == "Versioned":
+                    if migration_type != "SQL" or checksum is None:
+                        raise MigrationPlanError("Applied versioned migrations need SQL checksums.")
+                    if source_tuple is not None and parts > source_tuple:
+                        raise MigrationPlanError("Applied migration history is ahead of the observed schema version.")
             continue
         if state != "Pending":
             exception = next(
@@ -123,17 +145,12 @@ def validate_forward_plan(
             continue
         if entry.get("category") != "Versioned" or entry.get("type") != "SQL":
             raise MigrationPlanError("Only versioned SQL migrations can run automatically.")
-        version = entry.get("version")
+        version = raw_version
         parts = _version_tuple(version)
-        filepath = entry.get("filepath")
-        if not isinstance(filepath, str):
-            raise MigrationPlanError("Pending SQL migration path is missing.")
         filename = filepath.removeprefix("/flyway/sql/")
         match = MIGRATION_FILE.fullmatch(filename)
         if not filepath.startswith("/flyway/sql/") or match is None or match.group(1).replace("_", ".") != version:
             raise MigrationPlanError("Pending migration file does not match the approved SQL directory and version.")
-        description = entry.get("description")
-        checksum = entry.get("checksum")
         if not isinstance(description, str) or not description.strip():
             raise MigrationPlanError("Pending migration description is missing.")
         if isinstance(checksum, bool) or not isinstance(checksum, int) or not -(2**31) <= checksum < 2**31:
@@ -157,8 +174,45 @@ def validate_forward_plan(
         "source_version": source,
         "target_version": target,
         "pending": pending,
+        "history": history,
+        "schema_name": report.get("schemaName"),
+        "flyway_version": report.get("flywayVersion"),
     }
     fingerprint = hashlib.sha256(
         json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
-    return ForwardMigrationPlan(source, target, tuple(pending), fingerprint)
+    return ForwardMigrationPlan(source, target, tuple(pending), fingerprint, tuple(history))
+
+
+def validate_migration_result(
+    output: str,
+    planned: ForwardMigrationPlan,
+    *,
+    allowed_exceptions: list[dict[str, str]] | None = None,
+    expected_flyway_version: str | None = None,
+    expected_schema_name: str | None = None,
+) -> ForwardMigrationPlan:
+    """Validate a completed Flyway report against the exact planned release."""
+    result = validate_forward_plan(
+        output,
+        allowed_exceptions=allowed_exceptions,
+        expected_flyway_version=expected_flyway_version,
+        expected_schema_name=expected_schema_name,
+    )
+    if result.pending:
+        raise MigrationPlanError("Flyway left pending migrations after execution.")
+    if planned.target_version is None or result.source_version != planned.target_version:
+        raise MigrationPlanError("The applied database version differs from the validated migration target.")
+    for version, filename, description, checksum in planned.pending:
+        if not any(
+            row[0] == "Success"
+            and row[1] == "Versioned"
+            and row[2] == "SQL"
+            and row[3] == version
+            and Path(row[5]).name == filename
+            and row[4] == description
+            and row[6] == checksum
+            for row in result.history
+        ):
+            raise MigrationPlanError("An approved migration is missing or has a different postflight history row.")
+    return result

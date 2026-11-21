@@ -1,0 +1,31 @@
+name: Build-only artifact release
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: Choose the exact release phrase registered in applications.json
+        required: true
+        type: choice
+        options:
+          - CANCEL
+          - BUILD AND PACKAGE APPLICATION
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  build-release:
+    if: >-
+      github.repository == 'Example/android-app' &&
+      github.actor == 'ExampleOwner' &&
+      github.event_name == 'workflow_dispatch' &&
+      github.ref == 'refs/heads/main' &&
+      inputs.confirmation == 'BUILD AND PACKAGE APPLICATION'
+    uses: RomanYsrael-cmd/roman-infrastructure/.github/workflows/build-application.yml@PLATFORM_WORKFLOW_SHA
+    with:
+      app_id: sample-build-only
+      confirmation: BUILD AND PACKAGE APPLICATION
+      platform_ref: PLATFORM_WORKFLOW_SHA
+      release_mode: manual

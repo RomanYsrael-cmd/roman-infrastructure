@@ -1,0 +1,48 @@
+- name: Inspect registered Nginx site file
+  ansible.builtin.stat:
+    path: "{{ registered_route_app.value.nginx_site.site_file }}"
+    follow: false
+  register: registered_site_stat
+
+- name: Read an existing registered Nginx site file
+  ansible.builtin.slurp:
+    src: "{{ registered_route_app.value.nginx_site.site_file }}"
+  register: registered_site_contents
+  when: registered_site_stat.stat.exists
+
+- name: Refuse to replace an unmanaged registered Nginx site
+  ansible.builtin.assert:
+    that:
+      - not registered_site_stat.stat.exists or (not registered_site_stat.stat.islnk and registered_site_stat.stat.isreg and registered_site_stat.stat.pw_name == 'root' and registered_site_contents.content | b64decode is search('Managed by Roman Infrastructure application registry'))
+    fail_msg: "The registered Nginx site path is occupied by an unmanaged file."
+
+- name: Inspect the registered active route include
+  ansible.builtin.stat:
+    path: "{{ registered_route_app.value.route_file }}"
+    follow: false
+  register: registered_route_stat
+
+- name: Refuse an unsafe pre-existing route include
+  ansible.builtin.assert:
+    that:
+      - not registered_route_stat.stat.exists or (not registered_route_stat.stat.islnk and registered_route_stat.stat.isreg and registered_route_stat.stat.pw_name == 'root')
+    fail_msg: "The registered route include is not a root-owned regular file."
+
+- name: Check the registered Nginx loopback listener port
+  ansible.builtin.command:
+    argv:
+      - ss
+      - -ltnH
+      - sport
+      - "="
+      - ":{{ registered_route_app.value.nginx_site.listen_port }}"
+  register: registered_listener_check
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Refuse to claim an unrelated registered listener
+  ansible.builtin.assert:
+    that:
+      - registered_listener_check.stdout | trim == '' or registered_site_stat.stat.exists
+    fail_msg: "The registered Nginx listener port is occupied by an unmanaged service."

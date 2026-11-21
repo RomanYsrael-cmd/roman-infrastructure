@@ -1,0 +1,610 @@
+{
+  "schema_version": 2,
+  "applications": {
+    "sample-static-site": {
+      "app_id": "sample-static-site",
+      "repository": "Example/static-site",
+      "workflow_repository": "Example/static-site",
+      "workflow_path": ".github/workflows/deploy.yml",
+      "production_branch": "main",
+      "environment": "production",
+      "deployment_profile": "static-web",
+      "strategy": "blue-green",
+      "authorized_actors": [
+        "Example"
+      ],
+      "allowed_platform_shas": [
+        "0123456789abcdef0123456789abcdef01234567"
+      ],
+      "reusable_workflow_path": "RomanYsrael-cmd/roman-infrastructure/.github/workflows/deploy-application.yml",
+      "required_ci_workflow_file": "ci.yml",
+      "image_package_repository": "Example/static-site",
+      "image_source_repository": "RomanYsrael-cmd/roman-infrastructure",
+      "image_revision_mode": "caller",
+      "image_namespace": "ghcr.io/example/static-site",
+      "provenance_mode": "github-oidc",
+      "build": {
+        "components": {
+          "main": {
+            "context": ".",
+            "dockerfile": "Dockerfile"
+          }
+        }
+      },
+      "container_port": 8080,
+      "container_memory": "128m",
+      "container_cpus": 0.25,
+      "pids_limit": 64,
+      "slot_ports": {
+        "blue": 20001,
+        "green": 20002
+      },
+      "health_path": "/health",
+      "expected_health_text": "ok",
+      "route_file": "/etc/roman-platform/nginx/active-sample-static-site.conf",
+      "nginx_site": {
+        "site_file": "/etc/nginx/conf.d/roman-platform-app-sample-static-site.conf",
+        "listen_address": "127.0.0.1",
+        "listen_port": 18082
+      },
+      "resources": {
+        "cpu_cores": 0.5,
+        "memory_mb": 256,
+        "pids_limit": 64
+      },
+      "routes": [
+        {
+          "domain": "static.example.test",
+          "path": "/"
+        }
+      ],
+      "secret_refs": [],
+      "confirmation_phrases": {
+        "deploy": "DEPLOY STATIC SITE"
+      }
+    },
+    "sample-api": {
+      "app_id": "sample-api",
+      "repository": "Example/api",
+      "workflow_repository": "Example/api",
+      "workflow_path": ".github/workflows/deploy.yml",
+      "production_branch": "main",
+      "environment": "production",
+      "deployment_profile": "backend-api",
+      "strategy": "blue-green",
+      "authorized_actors": [
+        "Example"
+      ],
+      "allowed_platform_shas": [
+        "0123456789abcdef0123456789abcdef01234567"
+      ],
+      "reusable_workflow_path": "RomanYsrael-cmd/roman-infrastructure/.github/workflows/deploy-application.yml",
+      "required_ci_workflow_file": "ci.yml",
+      "image_package_repository": "Example/api",
+      "image_source_repository": "RomanYsrael-cmd/roman-infrastructure",
+      "image_revision_mode": "caller",
+      "image_namespace": "ghcr.io/example/api",
+      "provenance_mode": "github-oidc",
+      "build": {
+        "components": {
+          "main": {
+            "context": ".",
+            "dockerfile": "Dockerfile"
+          }
+        }
+      },
+      "container_port": 8080,
+      "container_memory": "256m",
+      "container_cpus": 0.5,
+      "pids_limit": 128,
+      "slot_ports": {
+        "blue": 20003,
+        "green": 20004
+      },
+      "health_path": "/health",
+      "expected_health_text": "ok",
+      "route_file": "/etc/roman-platform/nginx/active-sample-api.conf",
+      "nginx_site": {
+        "site_file": "/etc/nginx/conf.d/roman-platform-app-sample-api.conf",
+        "listen_address": "127.0.0.1",
+        "listen_port": 18083
+      },
+      "resources": {
+        "cpu_cores": 1,
+        "memory_mb": 512,
+        "pids_limit": 128
+      },
+      "routes": [
+        {
+          "domain": "api.example.test",
+          "path": "/"
+        }
+      ],
+      "database": {
+        "engine": "postgresql"
+      },
+      "secret_refs": [
+        "/etc/roman-platform/sample-api/runtime.env"
+      ],
+      "confirmation_phrases": {
+        "deploy": "DEPLOY API"
+      }
+    },
+    "sample-full-stack": {
+      "app_id": "sample-full-stack",
+      "repository": "Example/full-stack",
+      "workflow_repository": "Example/full-stack",
+      "workflow_path": ".github/workflows/deploy.yml",
+      "production_branch": "main",
+      "environment": "production",
+      "deployment_profile": "full-stack",
+      "strategy": "blue-green",
+      "authorized_actors": [
+        "Example"
+      ],
+      "allowed_platform_shas": [
+        "0123456789abcdef0123456789abcdef01234567"
+      ],
+      "reusable_workflow_path": "RomanYsrael-cmd/roman-infrastructure/.github/workflows/deploy-application.yml",
+      "required_ci_workflow_file": "ci.yml",
+      "image_package_repository": "Example/full-stack",
+      "image_source_repository": "RomanYsrael-cmd/roman-infrastructure",
+      "image_revision_mode": "caller",
+      "provenance_mode": "github-oidc",
+      "build": {
+        "components": {
+          "backend": {
+            "context": "backend",
+            "dockerfile": "backend/Dockerfile"
+          },
+          "frontend": {
+            "context": "frontend",
+            "dockerfile": "frontend/Dockerfile"
+          }
+        },
+        "migrator": {
+          "context": ".",
+          "dockerfile": "ops/deploy/migration/Dockerfile"
+        }
+      },
+      "route_file": "/etc/roman-platform/nginx/active-sample-full-stack.conf",
+      "private_listener_port": 18090,
+      "container_network": "sample-full-stack",
+      "container_network_mode": "bridge",
+      "container_publish": false,
+      "network_subnet": "172.30.50.0/24",
+      "reserved_network_ips": [
+        "172.30.50.1"
+      ],
+      "resources": {
+        "cpu_cores": 2,
+        "memory_mb": 1024,
+        "pids_limit": 256
+      },
+      "components": {
+        "backend": {
+          "image_namespace": "ghcr.io/example/full-stack-api",
+          "container_port": 8080,
+          "container_memory": "512m",
+          "container_cpus": 1,
+          "pids_limit": 128,
+          "route_prefix": "/api/",
+          "slot_ips": {
+            "blue": "172.30.50.21",
+            "green": "172.30.50.22"
+          },
+          "health_path": "/health",
+          "expected_health_text": "ok",
+          "readiness_timeout_seconds": 120,
+          "route_health_url": "http://127.0.0.1:18090/api/health"
+        },
+        "frontend": {
+          "image_namespace": "ghcr.io/example/full-stack-web",
+          "container_port": 3000,
+          "container_memory": "256m",
+          "container_cpus": 0.5,
+          "pids_limit": 64,
+          "route_prefix": "/",
+          "slot_ips": {
+            "blue": "172.30.50.31",
+            "green": "172.30.50.32"
+          },
+          "health_path": "/health",
+          "expected_health_text": "ok",
+          "readiness_timeout_seconds": 120,
+          "route_health_url": "http://127.0.0.1:18090/health"
+        }
+      },
+      "database": {
+        "engine": "postgresql",
+        "migration_adapter": "flyway",
+        "backup_adapter": "verified-dump"
+      },
+      "migration_image_namespace": "ghcr.io/example/full-stack-migrator",
+      "database_env_file": "/etc/roman-platform/sample-full-stack/database.env",
+      "migration_database_env_file": "/etc/roman-platform/sample-full-stack/migration.env",
+      "migration_database_username": "sample_full_stack_migrator",
+      "writer_observer_database_env_file": "/etc/roman-platform/sample-full-stack/writer-observer.env",
+      "allowed_database_urls": [
+        "jdbc:postgresql://postgres.example.invalid:5432/sample_full_stack"
+      ],
+      "schema_migration": {
+        "adapter": "flyway",
+        "execution_role": "sample_full_stack_app",
+        "max_pending": 32,
+        "writer_usernames": [
+          "sample_full_stack_app"
+        ],
+        "rollback_after_migration": "forward-only",
+        "allow_initial_schema": false
+      },
+      "database_backup": {
+        "adapter": "verified-dump",
+        "env_file": "/etc/roman-platform/sample-full-stack/backup.env",
+        "directory": "/srv/apps/sample-full-stack/backups",
+        "timeout_seconds": 1800,
+        "keep_last": 7
+      },
+      "secret_refs": [
+        "/etc/roman-platform/sample-full-stack/runtime.env",
+        "/etc/roman-platform/sample-full-stack/database.env",
+        "/etc/roman-platform/sample-full-stack/migration.env",
+        "/etc/roman-platform/sample-full-stack/writer-observer.env",
+        "/etc/roman-platform/sample-full-stack/backup.env"
+      ],
+      "confirmation_phrases": {
+        "deploy-stack": "DEPLOY FULL STACK",
+        "rollback-stack": "ROLLBACK FULL STACK"
+      }
+    },
+    "sample-multi-service": {
+      "app_id": "sample-multi-service",
+      "repository": "Example/multi-service",
+      "workflow_repository": "Example/multi-service",
+      "workflow_path": ".github/workflows/deploy.yml",
+      "production_branch": "main",
+      "environment": "production",
+      "deployment_profile": "multi-container",
+      "strategy": "blue-green",
+      "authorized_actors": [
+        "Example"
+      ],
+      "allowed_platform_shas": [
+        "0123456789abcdef0123456789abcdef01234567"
+      ],
+      "reusable_workflow_path": "RomanYsrael-cmd/roman-infrastructure/.github/workflows/deploy-application.yml",
+      "required_ci_workflow_file": "ci.yml",
+      "image_package_repository": "Example/multi-service",
+      "image_source_repository": "RomanYsrael-cmd/roman-infrastructure",
+      "image_revision_mode": "caller",
+      "provenance_mode": "github-oidc",
+      "build": {
+        "components": {
+          "api": {
+            "context": "api",
+            "dockerfile": "api/Dockerfile"
+          },
+          "indexer": {
+            "context": "indexer",
+            "dockerfile": "indexer/Dockerfile"
+          },
+          "web": {
+            "context": "web",
+            "dockerfile": "web/Dockerfile"
+          }
+        }
+      },
+      "route_file": "/etc/roman-platform/nginx/active-sample-multi-service.conf",
+      "private_listener_port": 18091,
+      "container_network": "sample-multi-service",
+      "container_network_mode": "bridge",
+      "container_publish": false,
+      "network_subnet": "172.30.51.0/24",
+      "reserved_network_ips": [
+        "172.30.51.1"
+      ],
+      "resources": {
+        "cpu_cores": 3,
+        "memory_mb": 1536,
+        "pids_limit": 384
+      },
+      "components": {
+        "api": {
+          "image_namespace": "ghcr.io/example/multi-api",
+          "container_port": 8080,
+          "container_memory": "512m",
+          "container_cpus": 1,
+          "pids_limit": 128,
+          "route_prefix": "/api/",
+          "slot_ips": {
+            "blue": "172.30.51.21",
+            "green": "172.30.51.22"
+          },
+          "health_path": "/health",
+          "expected_health_text": "ok",
+          "readiness_timeout_seconds": 120,
+          "route_health_url": "http://127.0.0.1:18091/api/health"
+        },
+        "indexer": {
+          "image_namespace": "ghcr.io/example/multi-indexer",
+          "container_port": 8081,
+          "container_memory": "512m",
+          "container_cpus": 1,
+          "pids_limit": 128,
+          "route_prefix": "/indexer/",
+          "slot_ips": {
+            "blue": "172.30.51.31",
+            "green": "172.30.51.32"
+          },
+          "health_path": "/health",
+          "expected_health_text": "ok",
+          "readiness_timeout_seconds": 120,
+          "route_health_url": "http://127.0.0.1:18091/indexer/health"
+        },
+        "web": {
+          "image_namespace": "ghcr.io/example/multi-web",
+          "container_port": 3000,
+          "container_memory": "256m",
+          "container_cpus": 0.5,
+          "pids_limit": 64,
+          "route_prefix": "/",
+          "slot_ips": {
+            "blue": "172.30.51.41",
+            "green": "172.30.51.42"
+          },
+          "health_path": "/health",
+          "expected_health_text": "ok",
+          "readiness_timeout_seconds": 120,
+          "route_health_url": "http://127.0.0.1:18091/health"
+        }
+      },
+      "secret_refs": [],
+      "confirmation_phrases": {
+        "deploy-stack": "DEPLOY MULTI SERVICE",
+        "rollback-stack": "ROLLBACK MULTI SERVICE"
+      }
+    },
+    "sample-worker": {
+      "app_id": "sample-worker",
+      "repository": "Example/worker",
+      "workflow_repository": "Example/worker",
+      "workflow_path": ".github/workflows/deploy.yml",
+      "production_branch": "main",
+      "environment": "production",
+      "deployment_profile": "worker",
+      "strategy": "recreate",
+      "authorized_actors": [
+        "Example"
+      ],
+      "allowed_platform_shas": [
+        "0123456789abcdef0123456789abcdef01234567"
+      ],
+      "reusable_workflow_path": "RomanYsrael-cmd/roman-infrastructure/.github/workflows/deploy-application.yml",
+      "required_ci_workflow_file": "ci.yml",
+      "image_package_repository": "Example/worker",
+      "image_source_repository": "RomanYsrael-cmd/roman-infrastructure",
+      "image_revision_mode": "caller",
+      "image_namespace": "ghcr.io/example/worker",
+      "provenance_mode": "github-oidc",
+      "build": {
+        "components": {
+          "main": {
+            "context": ".",
+            "dockerfile": "Dockerfile"
+          }
+        }
+      },
+      "resources": {
+        "cpu_cores": 1,
+        "memory_mb": 512,
+        "pids_limit": 128
+      },
+      "runtime": {
+        "health": "docker-healthcheck",
+        "network": "roman-platform-sample-worker",
+        "uid": 10001,
+        "gid": 10001,
+        "env_file": "/etc/roman-platform/sample-worker/runtime.env"
+      },
+      "secret_refs": [
+        "/etc/roman-platform/sample-worker/runtime.env"
+      ],
+      "confirmation_phrases": {
+        "deploy-service": "DEPLOY WORKER",
+        "rollback-service": "ROLLBACK WORKER"
+      }
+    },
+    "sample-scheduled-job": {
+      "app_id": "sample-scheduled-job",
+      "repository": "Example/scheduled-job",
+      "workflow_repository": "Example/scheduled-job",
+      "workflow_path": ".github/workflows/deploy.yml",
+      "production_branch": "main",
+      "environment": "production",
+      "deployment_profile": "scheduled-job",
+      "strategy": "scheduled",
+      "authorized_actors": [
+        "Example"
+      ],
+      "allowed_platform_shas": [
+        "0123456789abcdef0123456789abcdef01234567"
+      ],
+      "reusable_workflow_path": "RomanYsrael-cmd/roman-infrastructure/.github/workflows/deploy-application.yml",
+      "required_ci_workflow_file": "ci.yml",
+      "image_package_repository": "Example/scheduled-job",
+      "image_source_repository": "RomanYsrael-cmd/roman-infrastructure",
+      "image_revision_mode": "caller",
+      "image_namespace": "ghcr.io/example/scheduled-job",
+      "provenance_mode": "github-oidc",
+      "build": {
+        "components": {
+          "main": {
+            "context": ".",
+            "dockerfile": "Dockerfile"
+          }
+        }
+      },
+      "resources": {
+        "cpu_cores": 0.5,
+        "memory_mb": 256,
+        "pids_limit": 64
+      },
+      "runtime": {
+        "health": "systemd-timer",
+        "systemd_calendar": "Mon..Fri *-*-* 03:00:00 UTC",
+        "network": "roman-platform-sample-scheduled-job",
+        "uid": 10001,
+        "gid": 10001
+      },
+      "secret_refs": [],
+      "confirmation_phrases": {
+        "deploy-service": "DEPLOY SCHEDULED JOB",
+        "rollback-service": "ROLLBACK SCHEDULED JOB"
+      }
+    },
+    "sample-stateful-service": {
+      "app_id": "sample-stateful-service",
+      "repository": "Example/stateful-service",
+      "workflow_repository": "Example/stateful-service",
+      "workflow_path": ".github/workflows/deploy.yml",
+      "production_branch": "main",
+      "environment": "production",
+      "deployment_profile": "stateful-service",
+      "strategy": "maintenance",
+      "authorized_actors": [
+        "Example"
+      ],
+      "allowed_platform_shas": [
+        "0123456789abcdef0123456789abcdef01234567"
+      ],
+      "reusable_workflow_path": "RomanYsrael-cmd/roman-infrastructure/.github/workflows/deploy-application.yml",
+      "required_ci_workflow_file": "ci.yml",
+      "image_package_repository": "Example/stateful-service",
+      "image_source_repository": "RomanYsrael-cmd/roman-infrastructure",
+      "image_revision_mode": "caller",
+      "image_namespace": "ghcr.io/example/stateful-service",
+      "provenance_mode": "github-oidc",
+      "build": {
+        "components": {
+          "main": {
+            "context": ".",
+            "dockerfile": "Dockerfile"
+          }
+        }
+      },
+      "resources": {
+        "cpu_cores": 1,
+        "memory_mb": 1024,
+        "pids_limit": 128
+      },
+      "runtime": {
+        "health": "docker-healthcheck",
+        "storage_root": "/srv/apps/sample-stateful-service",
+        "backup_adapter": "verified-volume-archive",
+        "network": "roman-platform-sample-stateful-service",
+        "uid": 10001,
+        "gid": 10001,
+        "env_file": "/etc/roman-platform/sample-stateful-service/runtime.env"
+      },
+      "secret_refs": [
+        "/etc/roman-platform/sample-stateful-service/runtime.env"
+      ],
+      "confirmation_phrases": {
+        "deploy-service": "DEPLOY STATEFUL SERVICE",
+        "rollback-service": "ROLLBACK STATEFUL SERVICE"
+      }
+    },
+    "sample-game-server": {
+      "app_id": "sample-game-server",
+      "repository": "Example/game-server",
+      "workflow_repository": "Example/game-server",
+      "workflow_path": ".github/workflows/deploy.yml",
+      "production_branch": "main",
+      "environment": "production",
+      "deployment_profile": "game-server",
+      "strategy": "recreate",
+      "authorized_actors": [
+        "Example"
+      ],
+      "allowed_platform_shas": [
+        "0123456789abcdef0123456789abcdef01234567"
+      ],
+      "reusable_workflow_path": "RomanYsrael-cmd/roman-infrastructure/.github/workflows/deploy-application.yml",
+      "required_ci_workflow_file": "ci.yml",
+      "image_package_repository": "Example/game-server",
+      "image_source_repository": "RomanYsrael-cmd/roman-infrastructure",
+      "image_revision_mode": "caller",
+      "image_namespace": "ghcr.io/example/game-server",
+      "provenance_mode": "github-oidc",
+      "build": {
+        "components": {
+          "main": {
+            "context": ".",
+            "dockerfile": "Dockerfile"
+          }
+        }
+      },
+      "resources": {
+        "cpu_cores": 2,
+        "memory_mb": 2048,
+        "pids_limit": 256
+      },
+      "runtime": {
+        "health": "docker-healthcheck",
+        "storage_root": "/srv/apps/sample-game-server",
+        "backup_adapter": "verified-volume-archive",
+        "network": "roman-platform-sample-game-server",
+        "uid": 10001,
+        "gid": 10001,
+        "env_file": "/etc/roman-platform/sample-game-server/runtime.env",
+        "ports": [
+          {
+            "host_port": 25565,
+            "container_port": 25565,
+            "protocol": "tcp",
+            "bind_address": "0.0.0.0"
+          },
+          {
+            "host_port": 19132,
+            "container_port": 19132,
+            "protocol": "udp",
+            "bind_address": "0.0.0.0"
+          }
+        ]
+      },
+      "secret_refs": [
+        "/etc/roman-platform/sample-game-server/runtime.env"
+      ],
+      "confirmation_phrases": {
+        "deploy-service": "DEPLOY GAME SERVER",
+        "rollback-service": "ROLLBACK GAME SERVER"
+      }
+    },
+    "sample-build-only": {
+      "app_id": "sample-build-only",
+      "repository": "Example/android-app",
+      "workflow_repository": "Example/android-app",
+      "workflow_path": ".github/workflows/release-artifact.yml",
+      "production_branch": "main",
+      "environment": "release",
+      "deployment_profile": "build-only",
+      "strategy": "build-only",
+      "deployment_enabled": false,
+      "workflow_event": "workflow_dispatch",
+      "authorized_actors": ["ExampleOwner"],
+      "allowed_platform_shas": ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
+      "required_ci_workflow_file": "ci.yml",
+      "reusable_workflow_path": "RomanYsrael-cmd/roman-infrastructure/.github/workflows/build-application.yml",
+      "confirmation_phrases": {
+        "build-artifact": "BUILD AND PACKAGE APPLICATION"
+      },
+      "artifact_build": {
+        "system": "gradle-android",
+        "project_path": ".",
+        "artifact_globs": [
+          "app/build/outputs/apk/debug/*.apk"
+        ]
+      }
+    }
+  }
+}

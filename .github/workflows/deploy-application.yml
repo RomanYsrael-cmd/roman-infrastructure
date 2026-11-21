@@ -1,0 +1,309 @@
+name: Reusable registered application deployment
+
+on:
+  workflow_call:
+    inputs:
+      app_id:
+        required: true
+        type: string
+      operation:
+        required: true
+        type: string
+      confirmation:
+        required: true
+        type: string
+      platform_ref:
+        description: Full SHA pinned in the caller's reusable-workflow reference
+        required: true
+        type: string
+      source_sha:
+        required: false
+        type: string
+        default: ''
+      component:
+        required: false
+        type: string
+        default: ''
+      release_mode:
+        required: false
+        type: string
+        default: manual
+      trigger_run_id:
+        required: false
+        type: string
+        default: ''
+      trigger_run_attempt:
+        required: false
+        type: string
+        default: ''
+    secrets:
+      ROMAN_PLATFORM_SSH_PRIVATE_KEY:
+        required: true
+      ROMAN_PLATFORM_SSH_KNOWN_HOSTS:
+        required: true
+
+permissions:
+  contents: read
+  actions: read
+  pull-requests: read
+  packages: write
+
+concurrency:
+  group: roman-platform-${{ inputs.app_id }}
+  cancel-in-progress: false
+
+jobs:
+  authorize-release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: read
+    outputs:
+      environment: ${{ steps.authorize.outputs.environment }}
+      strategy: ${{ steps.authorize.outputs.strategy }}
+      registry_ref: ${{ steps.registry-snapshot.outputs.registry_ref }}
+    steps:
+      - name: Check out the pinned reusable-workflow code
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          repository: RomanYsrael-cmd/roman-infrastructure
+          ref: ${{ inputs.platform_ref }}
+          path: platform
+          token: ${{ github.token }}
+          persist-credentials: false
+
+      - name: Resolve the root-owned registry snapshot
+        id: registry-ref
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          repository: RomanYsrael-cmd/roman-infrastructure
+          ref: main
+          path: registry
+          token: ${{ github.token }}
+          persist-credentials: false
+
+      - name: Record the immutable registry snapshot for this run
+        id: registry-snapshot
+        run: |
+          set -euo pipefail
+          ref="$(git -C registry rev-parse HEAD)"
+          [[ "$ref" =~ ^[0-9a-f]{40}$ ]]
+          echo "registry_ref=$ref" >> "$GITHUB_OUTPUT"
+          echo "Root registry snapshot: $ref" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Verify registry, current workflow run, exact source commit, and CI
+        id: authorize
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          APP_ID: ${{ inputs.app_id }}
+          OPERATION: ${{ inputs.operation }}
+          COMPONENT: ${{ inputs.component }}
+          CONFIRMATION: ${{ inputs.confirmation }}
+          PLATFORM_REF: ${{ inputs.platform_ref }}
+          SOURCE_SHA: ${{ inputs.source_sha || github.sha }}
+          RELEASE_MODE: ${{ inputs.release_mode }}
+          TRIGGER_RUN_ID: ${{ inputs.trigger_run_id }}
+          TRIGGER_RUN_ATTEMPT: ${{ inputs.trigger_run_attempt }}
+          SOURCE_BRANCH: ${{ github.ref_name }}
+          CALLER_EVENT: ${{ github.event_name }}
+          CALLER_ACTOR: ${{ github.actor }}
+          WORKFLOW_SHA: ${{ github.sha }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          python platform/deploy/scripts/verify_release_request.py \
+            --registry registry/platform/applications.json \
+            --app-id "$APP_ID" --operation "$OPERATION" --component "$COMPONENT" \
+            --repository "$REPOSITORY" --branch "$SOURCE_BRANCH" --source-sha "$SOURCE_SHA" \
+            --workflow-sha "$WORKFLOW_SHA" --platform-sha "$PLATFORM_REF" \
+            --event "$CALLER_EVENT" --actor "$CALLER_ACTOR" --run-id "$RUN_ID" \
+            --run-attempt "$RUN_ATTEMPT" --release-mode "$RELEASE_MODE" \
+            --trigger-run-id "$TRIGGER_RUN_ID" --trigger-run-attempt "$TRIGGER_RUN_ATTEMPT" \
+            --confirmation "$CONFIRMATION" > "$RUNNER_TEMP/roman-release-authorization.json"
+          python - "$RUNNER_TEMP/roman-release-authorization.json" >> "$GITHUB_OUTPUT" <<'PY'
+          import json, sys
+          value=json.load(open(sys.argv[1], encoding='utf-8'))
+          print('environment=' + value['environment'])
+          print('strategy=' + value['strategy'])
+          PY
+
+  build-release:
+    needs: [authorize-release]
+    if: >-
+      inputs.operation == 'deploy' || inputs.operation == 'deploy-service' ||
+      inputs.operation == 'deploy-stack' || inputs.operation == 'test-stack' ||
+      inputs.operation == 'unhealthy-test' || inputs.operation == 'validate-database'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.build.outputs.image }}
+      migration_image: ${{ steps.build.outputs.migration_image }}
+      images: ${{ steps.build.outputs.images }}
+      build_spec_sha256: ${{ steps.build.outputs.build_spec_sha256 }}
+      provenance_audience: ${{ steps.build.outputs.provenance_audience }}
+    steps:
+      - name: Check out the exact application source commit
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          ref: ${{ inputs.source_sha || github.sha }}
+          path: application
+          persist-credentials: false
+
+      - name: Check out the pinned build workflow code
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          repository: RomanYsrael-cmd/roman-infrastructure
+          ref: ${{ inputs.platform_ref }}
+          path: platform
+          token: ${{ github.token }}
+          persist-credentials: false
+
+      - name: Check out the root-owned build specification
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          repository: RomanYsrael-cmd/roman-infrastructure
+          ref: ${{ needs.authorize-release.outputs.registry_ref }}
+          path: registry
+          token: ${{ github.token }}
+          persist-credentials: false
+
+      - name: Authenticate to GHCR with package-scoped workflow token
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: printf '%s' "$GH_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+
+      - name: Build and publish immutable images from the root registry
+        id: build
+        env:
+          TEMP: ${{ runner.temp }}
+          TMP: ${{ runner.temp }}
+          APP_ID: ${{ inputs.app_id }}
+          OPERATION: ${{ inputs.operation }}
+          COMPONENT: ${{ inputs.component }}
+          REPOSITORY: ${{ github.repository }}
+          SOURCE_SHA: ${{ inputs.source_sha || github.sha }}
+          PLATFORM_REF: ${{ inputs.platform_ref }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          python platform/deploy/scripts/build_release.py \
+            --registry registry/platform/applications.json \
+            --app-id "$APP_ID" \
+            --repository "$REPOSITORY" \
+            --operation "$OPERATION" \
+            --component "$COMPONENT" \
+            --source-sha "$SOURCE_SHA" \
+            --platform-sha "$PLATFORM_REF" \
+            --run-id "$RUN_ID" \
+            --run-attempt "$RUN_ATTEMPT" \
+            --source-root application \
+            --platform-root platform \
+            --temp-dir "$RUNNER_TEMP/roman-build" \
+            --github-output "$GITHUB_OUTPUT"
+          docker logout ghcr.io
+
+  submit-release:
+    needs: [authorize-release, build-release]
+    if: >-
+      always() && needs.authorize-release.result == 'success' &&
+      (needs.build-release.result == 'success' || needs.build-release.result == 'skipped')
+    runs-on: [self-hosted, Windows, X64, roman-laptop]
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: read
+      packages: read
+      id-token: write
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      APP_ID: ${{ inputs.app_id }}
+      OPERATION: ${{ inputs.operation }}
+      COMPONENT: ${{ inputs.component }}
+      CONFIRMATION: ${{ inputs.confirmation }}
+      PLATFORM_REF: ${{ inputs.platform_ref }}
+      SOURCE_SHA: ${{ inputs.source_sha || github.sha }}
+      RELEASE_MODE: ${{ inputs.release_mode }}
+      TRIGGER_RUN_ID: ${{ inputs.trigger_run_id }}
+      TRIGGER_RUN_ATTEMPT: ${{ inputs.trigger_run_attempt }}
+      APP_ENVIRONMENT: ${{ needs.authorize-release.outputs.environment }}
+      STRATEGY: ${{ needs.authorize-release.outputs.strategy }}
+      IMAGE: ${{ needs.build-release.outputs.image }}
+      MIGRATION_IMAGE: ${{ needs.build-release.outputs.migration_image }}
+      IMAGES_JSON: ${{ needs.build-release.outputs.images }}
+      BUILD_SPEC_SHA256: ${{ needs.build-release.outputs.build_spec_sha256 }}
+      PROVENANCE_AUDIENCE: ${{ needs.build-release.outputs.provenance_audience }}
+      PLATFORM_SSH_PRIVATE_KEY: ${{ secrets.ROMAN_PLATFORM_SSH_PRIVATE_KEY }}
+      PLATFORM_SSH_KNOWN_HOSTS: ${{ secrets.ROMAN_PLATFORM_SSH_KNOWN_HOSTS }}
+      GH_TOKEN: ${{ github.token }}
+      SOURCE_BRANCH: ${{ github.ref_name }}
+    steps:
+      - name: Submit the authorized immutable release through restricted SSH
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $taskTempRoot = 'D:\CodexTemp\roman-platform'
+          New-Item -ItemType Directory -Path $taskTempRoot -Force | Out-Null
+          $knownHosts = Join-Path $taskTempRoot ('known-' + $env:GITHUB_RUN_ID)
+          $key = Join-Path $taskTempRoot ('key-' + $env:GITHUB_RUN_ID)
+          try {
+            $utf8 = [Text.UTF8Encoding]::new($false)
+            [IO.File]::WriteAllText($knownHosts, $env:PLATFORM_SSH_KNOWN_HOSTS.Trim() + [Environment]::NewLine, $utf8)
+            [IO.File]::WriteAllText($key, $env:PLATFORM_SSH_PRIVATE_KEY.Trim() + [Environment]::NewLine, $utf8)
+            & icacls.exe $key /inheritance:r /grant:r "$($env:USERNAME):(F)" | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw 'Could not secure the deployment key.' }
+            & ssh-keygen.exe -F '100.67.102.11' -f $knownHosts | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw 'The approved server host key is not configured.' }
+
+            $request = @{
+              operation=$env:OPERATION; app_id=$env:APP_ID; repository=$env:GITHUB_REPOSITORY;
+              branch=$env:SOURCE_BRANCH; commit_sha=$env:SOURCE_SHA; workflow_sha=$env:GITHUB_SHA;
+              platform_sha=$env:PLATFORM_REF; environment=$env:APP_ENVIRONMENT;
+              github_token=$env:GH_TOKEN;
+              release=@{run_id=$env:GITHUB_RUN_ID; run_attempt=$env:GITHUB_RUN_ATTEMPT; actor=$env:GITHUB_ACTOR; mode=$env:RELEASE_MODE}
+            }
+            if ($env:RELEASE_MODE -eq 'automatic') {
+              $request.release.trigger_run_id=$env:TRIGGER_RUN_ID
+              $request.release.trigger_run_attempt=$env:TRIGGER_RUN_ATTEMPT
+            }
+            $needsRegistry = $env:OPERATION -in @('deploy','deploy-service','deploy-stack','test-stack','validate-database','unhealthy-test')
+            if ($needsRegistry) { $request.registry_token=$env:GH_TOKEN }
+            if ($env:BUILD_SPEC_SHA256) { $request.build_spec_sha256=$env:BUILD_SPEC_SHA256 }
+            if ($env:PROVENANCE_AUDIENCE) {
+              $audience = [Uri]::EscapeDataString($env:PROVENANCE_AUDIENCE)
+              $tokenUrl = $env:ACTIONS_ID_TOKEN_REQUEST_URL + '&audience=' + $audience
+              $tokenResponse = Invoke-RestMethod -Method Get -Uri $tokenUrl -Headers @{ Authorization='Bearer ' + $env:ACTIONS_ID_TOKEN_REQUEST_TOKEN }
+              if (-not $tokenResponse.value) { throw 'GitHub did not issue an image-bound OIDC token.' }
+              Write-Output ('::add-mask::' + $tokenResponse.value)
+              $request.provenance_token=$tokenResponse.value
+            }
+            if ($env:OPERATION -eq 'deploy' -or $env:OPERATION -eq 'deploy-service') {
+              $request.image=$env:IMAGE
+              $request.strategy=$env:STRATEGY
+            } elseif ($env:OPERATION -eq 'deploy-stack') {
+              $request.strategy=$env:STRATEGY
+              $request.images=$env:IMAGES_JSON | ConvertFrom-Json -AsHashtable
+              if ($env:MIGRATION_IMAGE) { $request.migration_image=$env:MIGRATION_IMAGE }
+            } elseif ($env:OPERATION -eq 'test-stack') {
+              $request.component=$env:COMPONENT
+              $request.image=$env:IMAGE
+            } elseif ($env:OPERATION -in @('validate-database')) {
+              $request.migration_image=$env:MIGRATION_IMAGE
+            } elseif ($env:OPERATION -eq 'unhealthy-test') {
+              $request.image=$env:IMAGE
+            }
+            $json = $request | ConvertTo-Json -Depth 8 -Compress
+            $json | & ssh.exe -i $key -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o "UserKnownHostsFile=$knownHosts" roman-deploy@100.67.102.11
+            if ($LASTEXITCODE -ne 0) { throw 'The restricted deployment controller rejected the release.' }
+          } finally {
+            Remove-Item -LiteralPath $key, $knownHosts -Force -ErrorAction SilentlyContinue
+          }

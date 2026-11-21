@@ -1,0 +1,188 @@
+name: Reusable build-only application release
+
+on:
+  workflow_call:
+    inputs:
+      app_id:
+        required: true
+        type: string
+      confirmation:
+        required: true
+        type: string
+      platform_ref:
+        description: Full SHA pinned in the caller's reusable-workflow reference
+        required: true
+        type: string
+      source_sha:
+        required: false
+        type: string
+        default: ''
+      release_mode:
+        required: false
+        type: string
+        default: manual
+      trigger_run_id:
+        required: false
+        type: string
+        default: ''
+      trigger_run_attempt:
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+  actions: read
+  pull-requests: read
+
+jobs:
+  authorize-release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: read
+    outputs:
+      build_system: ${{ steps.authorize.outputs.build_system }}
+      registry_ref: ${{ steps.registry-snapshot.outputs.registry_ref }}
+    steps:
+      - name: Check out the pinned reusable-workflow code
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: RomanYsrael-cmd/roman-infrastructure
+          ref: ${{ inputs.platform_ref }}
+          path: platform
+          token: ${{ github.token }}
+          persist-credentials: false
+
+      - name: Check out the root-owned application registry
+        id: registry-ref
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: RomanYsrael-cmd/roman-infrastructure
+          ref: main
+          path: registry
+          token: ${{ github.token }}
+          persist-credentials: false
+
+      - name: Record the immutable registry snapshot for this run
+        id: registry-snapshot
+        run: |
+          set -euo pipefail
+          ref="$(git -C registry rev-parse HEAD)"
+          [[ "$ref" =~ ^[0-9a-f]{40}$ ]]
+          echo "registry_ref=$ref" >> "$GITHUB_OUTPUT"
+          echo "Root registry snapshot: $ref" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Verify registered app, exact source commit, workflow and CI
+        id: authorize
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          APP_ID: ${{ inputs.app_id }}
+          CONFIRMATION: ${{ inputs.confirmation }}
+          PLATFORM_REF: ${{ inputs.platform_ref }}
+          SOURCE_SHA: ${{ inputs.source_sha || github.sha }}
+          RELEASE_MODE: ${{ inputs.release_mode }}
+          TRIGGER_RUN_ID: ${{ inputs.trigger_run_id }}
+          TRIGGER_RUN_ATTEMPT: ${{ inputs.trigger_run_attempt }}
+          SOURCE_BRANCH: ${{ github.ref_name }}
+          CALLER_EVENT: ${{ github.event_name }}
+          CALLER_ACTOR: ${{ github.actor }}
+          WORKFLOW_SHA: ${{ github.sha }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          python platform/deploy/scripts/verify_release_request.py \
+            --registry registry/platform/applications.json \
+            --app-id "$APP_ID" --operation build-artifact --component '' \
+            --repository "$REPOSITORY" --branch "$SOURCE_BRANCH" --source-sha "$SOURCE_SHA" \
+            --workflow-sha "$WORKFLOW_SHA" --platform-sha "$PLATFORM_REF" \
+            --event "$CALLER_EVENT" --actor "$CALLER_ACTOR" --run-id "$RUN_ID" \
+            --run-attempt "$RUN_ATTEMPT" --release-mode "$RELEASE_MODE" \
+            --trigger-run-id "$TRIGGER_RUN_ID" --trigger-run-attempt "$TRIGGER_RUN_ATTEMPT" \
+            --confirmation "$CONFIRMATION" > "$RUNNER_TEMP/roman-build-authorization.json"
+          python - "$RUNNER_TEMP/roman-build-authorization.json" >> "$GITHUB_OUTPUT" <<'PY'
+          import json,sys
+          print('build_system=' + json.load(open(sys.argv[1], encoding='utf-8'))['build_system'])
+          PY
+
+  build-and-package:
+    needs: authorize-release
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the exact application source commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ inputs.source_sha || github.sha }}
+          path: application
+          persist-credentials: false
+
+      - name: Check out the pinned build workflow code
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: RomanYsrael-cmd/roman-infrastructure
+          ref: ${{ inputs.platform_ref }}
+          path: platform
+          token: ${{ github.token }}
+          persist-credentials: false
+
+      - name: Check out the root-owned build registry
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: RomanYsrael-cmd/roman-infrastructure
+          ref: ${{ needs.authorize-release.outputs.registry_ref }}
+          path: registry
+          token: ${{ github.token }}
+          persist-credentials: false
+
+      - name: Set up Java for Android and JVM builds
+        if: needs.authorize-release.outputs.build_system == 'gradle-android' || needs.authorize-release.outputs.build_system == 'gradle-jvm' || needs.authorize-release.outputs.build_system == 'maven-jvm'
+        uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3
+        with:
+          distribution: temurin
+          java-version: ${{ needs.authorize-release.outputs.build_system == 'gradle-android' && '17' || '21' }}
+
+      - name: Set up Node.js
+        if: needs.authorize-release.outputs.build_system == 'npm'
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '22.16.0'
+
+      - name: Set up Python
+        if: needs.authorize-release.outputs.build_system == 'python'
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.12'
+
+      - name: Build, run tests, and create checksummed immutable artifact
+        env:
+          TEMP: ${{ runner.temp }}
+          TMP: ${{ runner.temp }}
+          APP_ID: ${{ inputs.app_id }}
+          SOURCE_SHA: ${{ inputs.source_sha || github.sha }}
+          PLATFORM_REF: ${{ inputs.platform_ref }}
+        run: |
+          set -euo pipefail
+          python platform/deploy/scripts/build_artifact.py \
+            --registry registry/platform/applications.json \
+            --app-id "$APP_ID" \
+            --source-sha "$SOURCE_SHA" \
+            --platform-sha "$PLATFORM_REF" \
+            --source-root application \
+            --platform-root platform \
+            --output "$RUNNER_TEMP/roman-release" \
+            --archive "$RUNNER_TEMP/roman-release.zip"
+
+      - name: Upload the immutable release artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: ${{ inputs.app_id }}-${{ inputs.source_sha || github.sha }}
+          path: ${{ runner.temp }}/roman-release.zip
+          if-no-files-found: error
+          retention-days: 30
