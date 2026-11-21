@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 import unittest
 from argparse import Namespace
@@ -116,6 +117,18 @@ class ReleaseAuthorizationTests(unittest.TestCase):
             with self.assertRaisesRegex(AuthorizationError, "root application allowlist"):
                 authorize(args)
         api.assert_not_called()
+
+    def test_authorizer_runs_standalone_from_the_repository_root(self) -> None:
+        script = ROOT / "deploy" / "scripts" / "verify_release_request.py"
+        result = subprocess.run(
+            [sys.executable, str(script), "--help"],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Check a reusable GitHub deployment request", result.stdout)
 
 
 class BuildOnlyReleaseAuthorizationTests(unittest.TestCase):

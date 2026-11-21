@@ -13,7 +13,7 @@ import urllib.request
 from typing import Any
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-sys.path.insert(0, os.path.join(ROOT, "controller"))
+sys.path.insert(0, os.path.join(ROOT, "deploy", "controller"))
 from application_registry import RegistryError, validate_registry  # noqa: E402
 from romanlms_ci_gate import CiGateError, github_api, verify_ci_release  # noqa: E402
 
