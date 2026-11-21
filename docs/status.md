@@ -1,8 +1,8 @@
-# Platform status — 2026-11-20
+# Platform status — 2026-11-21
 
 ## Universal platform work
 
-The universal deployment and migration changes are being completed in draft [Infrastructure PR #26](https://github.com/RomanYsrael-cmd/roman-infrastructure/pull/26) and a coordinated RomanLMS branch. The public PR head `d3967178a726bcc395449c562ab55449cf7191cc` had a successful CI run before the current local implementation edits; those later edits were not yet pushed or checked by GitHub CI at this snapshot. The universal controller and registry have not been installed on production.
+The universal deployment and migration changes are under review in draft [Infrastructure PR #26](https://github.com/RomanYsrael-cmd/roman-infrastructure/pull/26) and coordinated RomanLMS work. Infrastructure PR head `a24422c12baa790cf31f77b14b2c9f697adf78db` passed its required CI on 2026-11-21, including disposable PostgreSQL tests for one and multiple pending migrations. The RomanLMS integration is committed locally at `17555ba6` and its complete local deployment suite passed; it still needs the latest-main sync, caller workflow pin updates, and hosted CI. Neither the universal controller nor the RomanLMS migrator update has been installed on production.
 
 See the [platform overview](universal-deployment-platform.md), [onboarding guide](application-onboarding.md), [migration lifecycle](database-migration-lifecycle.md), and [current runbook](universal-deployment-runbook.md). The dated [RomanLMS deployment notes](deployment-runbook.md) and [November 9 hardening report](production-hardening-2026-11-09.md) are historical records.
 

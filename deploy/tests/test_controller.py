@@ -684,6 +684,19 @@ class FlywayMigrationPolicyTests(unittest.TestCase):
             ],
         }
 
+    def _bound_plan(self, request_value, database_values):
+        fingerprint = deploy._release_plan_fingerprint(
+            self.plan, request_value, self.app, database_values,
+        )
+        return deploy.ForwardMigrationPlan(
+            self.plan.source_version,
+            self.plan.target_version,
+            self.plan.pending,
+            self.plan.fingerprint,
+            self.plan.history,
+            fingerprint,
+        )
+
     def test_multiple_pending_migrations_are_ordered_and_dynamically_targeted(self):
         deploy._verify_flyway_migration_plan(
             json.dumps(self.pending_info),
@@ -734,8 +747,9 @@ class FlywayMigrationPolicyTests(unittest.TestCase):
         request_value = {
             "operation": "deploy-stack",
             "commit_sha": SHA,
+            "platform_sha": WORKFLOW_SHA,
             "migration_image": "registry/migrator@sha256:" + DIGEST,
-            "release": {"run_id": "123", "actor": "RomanYsrael-cmd"},
+            "release": {"run_id": "123", "run_attempt": "1", "actor": "RomanYsrael-cmd"},
         }
         commands = [
             subprocess.CompletedProcess([], 0, "", ""),
@@ -759,6 +773,7 @@ class FlywayMigrationPolicyTests(unittest.TestCase):
              mock.patch.object(deploy, "_read_state", return_value={}), mock.patch.object(deploy, "_write_metrics"):
             result = deploy._validate_database(request_value, self.app, allow_pending_migration=True)
         self.assertTrue(result["migration_pending"])
+        self.assertRegex(result["migration_plan"]["release_fingerprint"], r"^[0-9a-f]{64}$")
 
         commands[2] = subprocess.CompletedProcess([], 0, json.dumps({
             **self.pending_info,
@@ -800,9 +815,16 @@ class FlywayMigrationPolicyTests(unittest.TestCase):
     def test_migration_uses_a_release_scoped_container_and_removes_it_after_timeout(self):
         request_value = {
             "commit_sha": SHA,
+            "platform_sha": WORKFLOW_SHA,
             "migration_image": "registry/migrator@sha256:" + DIGEST,
             "release": {"run_id": "123", "run_attempt": "2", "actor": "RomanYsrael-cmd"},
         }
+        migration_values = {
+            "DB_URL": "jdbc:postgresql://127.0.0.1:5432/romanlms_prod",
+            "DB_USERNAME": "romanlms_migrator",
+            "DB_PASSWORD": "migration-secret",
+        }
+        bound_plan = self._bound_plan(request_value, migration_values)
         migration_container = "roman-platform-migration-romanlms-production-123-2"
         missing = subprocess.CompletedProcess([], 1, "", f"Error: No such object: {migration_container}")
         with mock.patch.object(deploy, "run_command", side_effect=[
@@ -813,7 +835,7 @@ class FlywayMigrationPolicyTests(unittest.TestCase):
                 "DB_URL": "jdbc:postgresql://127.0.0.1:5432/romanlms_prod",
                 "DB_USERNAME": "romanlms_migrator",
                 "DB_PASSWORD": "migration-secret",
-            }, self.plan)
+            }, bound_plan)
         self.assertIn("--name", run.call_args_list[1].args[0])
         self.assertIn(migration_container, run.call_args_list[1].args[0])
         command_args = run.call_args_list[1].args[0]
@@ -833,7 +855,7 @@ class FlywayMigrationPolicyTests(unittest.TestCase):
                     "DB_URL": "jdbc:postgresql://127.0.0.1:5432/romanlms_prod",
                     "DB_USERNAME": "romanlms_migrator",
                     "DB_PASSWORD": "migration-secret",
-                }, self.plan)
+                }, bound_plan)
         self.assertEqual(run.call_args_list[2].args[0][:4], ["docker", "rm", "--force", migration_container])
 
         with mock.patch.object(deploy, "run_command", side_effect=[
@@ -847,15 +869,57 @@ class FlywayMigrationPolicyTests(unittest.TestCase):
                     "DB_URL": "jdbc:postgresql://127.0.0.1:5432/romanlms_prod",
                     "DB_USERNAME": "romanlms_migrator",
                     "DB_PASSWORD": "migration-secret",
-                }, self.plan)
+                }, bound_plan)
         self.assertEqual(run.call_args_list[2].args[0][:4], ["docker", "rm", "--force", migration_container])
+
+    def test_migration_plan_rejects_a_different_release_or_database_binding(self):
+        request_value = {
+            "commit_sha": SHA,
+            "platform_sha": WORKFLOW_SHA,
+            "migration_image": "registry/migrator@sha256:" + DIGEST,
+            "release": {"run_id": "123", "run_attempt": "1", "actor": "RomanYsrael-cmd"},
+        }
+        migration_values = {
+            "DB_URL": "jdbc:postgresql://127.0.0.1:5432/romanlms_prod",
+            "DB_USERNAME": "romanlms_migrator",
+            "DB_PASSWORD": "migration-secret",
+        }
+        bound_plan = self._bound_plan(request_value, migration_values)
+        alternatives = (
+            ({**request_value, "commit_sha": "e" * 40}, migration_values),
+            ({**request_value, "migration_image": "registry/migrator@sha256:" + "d" * 64}, migration_values),
+            (request_value, {**migration_values, "DB_URL": "jdbc:postgresql://127.0.0.1:5432/other_db"}),
+        )
+        for changed_request, changed_database in alternatives:
+            with self.subTest(request=changed_request, database=changed_database), \
+                 mock.patch.object(deploy, "run_command") as run:
+                with self.assertRaisesRegex(deploy.DeploymentError, "not bound to this exact release"):
+                    deploy._run_approved_migration(
+                        changed_request, self.app, Path("/safe/migration.env"), changed_database, bound_plan,
+                    )
+                run.assert_not_called()
+
+        with self.assertRaisesRegex(deploy.DeploymentError, "credentials must use"):
+            deploy._release_plan_fingerprint(
+                self.plan,
+                request_value,
+                self.app,
+                {**migration_values, "DB_URL": "jdbc:postgresql://migrator:secret@127.0.0.1:5432/romanlms_prod"},
+            )
 
     def test_unconfirmed_migration_container_cleanup_marks_the_outcome_unknown(self):
         request_value = {
             "commit_sha": SHA,
+            "platform_sha": WORKFLOW_SHA,
             "migration_image": "registry/migrator@sha256:" + DIGEST,
             "release": {"run_id": "123", "run_attempt": "2", "actor": "RomanYsrael-cmd"},
         }
+        migration_values = {
+            "DB_URL": "jdbc:postgresql://127.0.0.1:5432/romanlms_prod",
+            "DB_USERNAME": "romanlms_migrator",
+            "DB_PASSWORD": "migration-secret",
+        }
+        bound_plan = self._bound_plan(request_value, migration_values)
         migration_container = "roman-platform-migration-romanlms-production-123-2"
         missing = subprocess.CompletedProcess([], 1, "", f"Error: No such object: {migration_container}")
         with mock.patch.object(deploy, "run_command", side_effect=[
@@ -868,7 +932,7 @@ class FlywayMigrationPolicyTests(unittest.TestCase):
                     "DB_URL": "jdbc:postgresql://127.0.0.1:5432/romanlms_prod",
                     "DB_USERNAME": "romanlms_migrator",
                     "DB_PASSWORD": "migration-secret",
-                }, self.plan)
+                }, bound_plan)
 
         with mock.patch.object(deploy, "run_command", return_value=subprocess.CompletedProcess([], 0, "running", "")), \
              mock.patch.object(deploy, "_append_audit"):
@@ -877,7 +941,7 @@ class FlywayMigrationPolicyTests(unittest.TestCase):
                     "DB_URL": "jdbc:postgresql://127.0.0.1:5432/romanlms_prod",
                     "DB_USERNAME": "romanlms_migrator",
                     "DB_PASSWORD": "migration-secret",
-                }, self.plan)
+                }, bound_plan)
 
         with mock.patch.object(deploy, "run_command", side_effect=deploy.DeploymentError("docker daemon unavailable")), \
              mock.patch.object(deploy, "_append_audit"):
@@ -886,7 +950,7 @@ class FlywayMigrationPolicyTests(unittest.TestCase):
                     "DB_URL": "jdbc:postgresql://127.0.0.1:5432/romanlms_prod",
                     "DB_USERNAME": "romanlms_migrator",
                     "DB_PASSWORD": "migration-secret",
-                }, self.plan)
+                }, bound_plan)
 
     def test_fresh_full_backup_is_required_and_its_identity_is_audited(self):
         request_value = {"commit_sha": SHA, "release": {"run_id": "123", "actor": "RomanYsrael-cmd"}}

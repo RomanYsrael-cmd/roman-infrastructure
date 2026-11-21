@@ -18,6 +18,7 @@ import tarfile
 import tempfile
 import time
 import urllib.error
+from urllib.parse import urlsplit
 import urllib.request
 import uuid
 from datetime import datetime, timezone
@@ -1970,7 +1971,68 @@ def _migration_plan_data(plan: ForwardMigrationPlan) -> dict[str, Any]:
         "target_version": plan.target_version,
         "pending": [list(row) for row in plan.pending],
         "fingerprint": plan.fingerprint,
+        "release_fingerprint": plan.release_fingerprint,
     }
+
+
+def _release_plan_fingerprint(
+    plan: ForwardMigrationPlan,
+    request: dict[str, Any],
+    app: dict[str, Any],
+    database_values: dict[str, str],
+) -> str:
+    """Bind observed Flyway history to one app, release, migrator, and database."""
+    release = request.get("release")
+    image = request.get("migration_image")
+    commit_sha = request.get("commit_sha")
+    platform_sha = request.get("platform_sha")
+    database_url = database_values.get("DB_URL")
+    database_username = database_values.get("DB_USERNAME")
+    if (
+        not isinstance(release, dict)
+        or not isinstance(release.get("run_id"), str)
+        or not release["run_id"].isdigit()
+        or not isinstance(release.get("run_attempt"), str)
+        or not release["run_attempt"].isdigit()
+        or not isinstance(release.get("actor"), str)
+        or not isinstance(image, str)
+        or not re.fullmatch(r"[^\s]+@sha256:[0-9a-f]{64}", image)
+        or not isinstance(commit_sha, str)
+        or not SHA_RE.fullmatch(commit_sha)
+        or not isinstance(platform_sha, str)
+        or not SHA_RE.fullmatch(platform_sha)
+        or not isinstance(database_url, str)
+        or not re.fullmatch(r"jdbc:postgresql://[^\s/]+/[^\s]+", database_url)
+        or not isinstance(database_username, str)
+        or not database_username
+    ):
+        raise DeploymentError("The Flyway plan cannot be bound to an exact release and database identity.")
+    try:
+        parsed_url = urlsplit(database_url.removeprefix("jdbc:"))
+    except ValueError as exc:
+        raise DeploymentError("The Flyway plan database identity is malformed.") from exc
+    if parsed_url.username or parsed_url.password:
+        raise DeploymentError("Database credentials must use the dedicated environment variables, not the JDBC URL.")
+
+    migration_policy = _schema_migration_policy(app)
+    binding = {
+        "plan_fingerprint": plan.fingerprint,
+        "app_id": app.get("app_id"),
+        "source_commit": commit_sha,
+        "platform_commit": platform_sha,
+        "migrator_image": image,
+        "database_url_sha256": hashlib.sha256(database_url.encode("utf-8")).hexdigest(),
+        "database_username": database_username,
+        "schema": app.get("flyway_schema"),
+        "execution_role": migration_policy.get("execution_role") if migration_policy else None,
+        "workflow_run_id": release["run_id"],
+        "workflow_run_attempt": release["run_attempt"],
+        "release_actor": release["actor"],
+        "release_mode": release.get("mode", "manual"),
+    }
+    return hashlib.sha256(
+        json.dumps(binding, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
 
 
 def _empty_database_status() -> dict[str, Any]:
@@ -2005,11 +2067,17 @@ def _migration_plan_from_data(value: Any) -> ForwardMigrationPlan:
         rows.append((row[0], row[1], row[2], row[3]))
     source = value.get("source_version")
     target = value.get("target_version")
+    release_fingerprint = value.get("release_fingerprint")
     if source is not None and not isinstance(source, str):
         raise DeploymentError("The validated Flyway source version is malformed.")
     if target is not None and not isinstance(target, str):
         raise DeploymentError("The validated Flyway target version is malformed.")
-    return ForwardMigrationPlan(source, target, tuple(rows), value["fingerprint"])
+    if release_fingerprint is not None and (
+        not isinstance(release_fingerprint, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", release_fingerprint)
+    ):
+        raise DeploymentError("The validated Flyway release binding is malformed.")
+    return ForwardMigrationPlan(source, target, tuple(rows), value["fingerprint"], (), release_fingerprint)
 
 
 def _schema_migration_policy(app: dict[str, Any]) -> dict[str, Any] | None:
@@ -2576,6 +2644,9 @@ def _run_approved_migration(
     policy = _schema_migration_policy(app)
     if policy is None or not plan.needs_migration:
         raise DeploymentError("No production migration is approved for this application.")
+    expected_release_fingerprint = _release_plan_fingerprint(plan, request, app, env_values)
+    if plan.release_fingerprint != expected_release_fingerprint:
+        raise DeploymentError("The migration plan is not bound to this exact release and database.")
     release = request.get("release")
     if not isinstance(release, dict):
         raise DeploymentError("Approved migration release identity is unavailable.")
@@ -2599,6 +2670,7 @@ def _run_approved_migration(
             for version, filename, description, checksum in plan.pending
         ],
         "migration_plan_fingerprint": plan.fingerprint,
+        "release_binding_fingerprint": plan.release_fingerprint,
         "commit_sha": request["commit_sha"],
         "migration_image": request["migration_image"],
         "workflow_run_id": run_id,
@@ -2755,8 +2827,32 @@ def _validate_database(
             raise DeploymentError("Pending migrations exist but this application has no approved migration and backup adapters.")
         if migration_pending and not allow_pending_migration:
             raise DeploymentError("Pending migrations require an authorized forward deployment.")
-        if migration_pending:
-            _migration_database_env(app, env_values)
+        binding_database_values = env_values
+        if migration_pending or (expected_plan is not None and expected_plan.needs_migration):
+            _, binding_database_values = _migration_database_env(app, env_values)
+        if expected_plan is not None:
+            expected_release_fingerprint = _release_plan_fingerprint(
+                expected_plan, request, app, binding_database_values,
+            )
+            if expected_plan.release_fingerprint != expected_release_fingerprint:
+                raise DeploymentError("The validated migration plan is bound to a different release or database.")
+            plan = ForwardMigrationPlan(
+                plan.source_version,
+                plan.target_version,
+                plan.pending,
+                plan.fingerprint,
+                plan.history,
+                expected_plan.release_fingerprint,
+            )
+        else:
+            plan = ForwardMigrationPlan(
+                plan.source_version,
+                plan.target_version,
+                plan.pending,
+                plan.fingerprint,
+                plan.history,
+                _release_plan_fingerprint(plan, request, app, binding_database_values),
+            )
     duration = round(time.time() - started, 3)
     timestamp = datetime.now(timezone.utc).isoformat()
     _append_audit(app, {
@@ -2768,6 +2864,7 @@ def _validate_database(
         "schema_target_version": plan.target_version,
         "pending_migrations": [row[0] for row in plan.pending],
         "migration_plan_fingerprint": plan.fingerprint,
+        "release_binding_fingerprint": plan.release_fingerprint,
         "workflow_run_id": request["release"]["run_id"],
         "actor": request["release"]["actor"],
         "duration_seconds": duration,
@@ -3265,7 +3362,10 @@ def _deploy_stack(request: dict[str, Any], app: dict[str, Any]) -> dict[str, Any
             # A concurrent migration invalidates this attempt before Flyway runs.
             latest_database_status = _validate_database(request, app, allow_pending_migration=True)
             latest_plan = _migration_plan_from_data(latest_database_status["migration_plan"])
-            if latest_plan.fingerprint != validated_plan.fingerprint:
+            if (
+                latest_plan.fingerprint != validated_plan.fingerprint
+                or latest_plan.release_fingerprint != validated_plan.release_fingerprint
+            ):
                 raise DeploymentError("Database migration history changed after backup; no migration was run.")
             migration_started = True
             migration_env_file, migration_env_values = _migration_database_env(app, env_values)
@@ -3285,6 +3385,7 @@ def _deploy_stack(request: dict[str, Any], app: dict[str, Any]) -> dict[str, Any
                 "schema_source_version": validated_plan.source_version,
                 "schema_target_version": validated_plan.target_version,
                 "migration_plan_fingerprint": validated_plan.fingerprint,
+                "release_binding_fingerprint": validated_plan.release_fingerprint,
                 "pending_migrations": [row[0] for row in validated_plan.pending],
                 "commit_sha": request["commit_sha"],
                 "workflow_run_id": request["release"]["run_id"],
@@ -3333,7 +3434,10 @@ def _deploy_stack(request: dict[str, Any], app: dict[str, Any]) -> dict[str, Any
             # be hidden by switching traffic using the stale observation.
             latest_database_status = _validate_database(request, app)
             latest_plan = _migration_plan_from_data(latest_database_status["migration_plan"])
-            if latest_plan.fingerprint != validated_plan.fingerprint:
+            if (
+                latest_plan.fingerprint != validated_plan.fingerprint
+                or latest_plan.release_fingerprint != validated_plan.release_fingerprint
+            ):
                 raise DeploymentError("Database migration history changed during the application rollout; traffic was not switched.")
             database_status = latest_database_status
         _switch_stack_route(app, slot)

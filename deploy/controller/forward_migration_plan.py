@@ -33,6 +33,7 @@ class ForwardMigrationPlan:
     pending: tuple[tuple[str, str, str, int], ...]
     fingerprint: str
     history: tuple[tuple[str, str, str, str, str, str, int | None], ...] = ()
+    release_fingerprint: str | None = None
 
     @property
     def needs_migration(self) -> bool:
