@@ -56,6 +56,11 @@ class ApplicationRegistryTests(unittest.TestCase):
                 self.assertEqual(set(app["components"]), {"backend"})
                 self.assertTrue(app["components"]["backend"]["sse_enabled"])
                 self.assertTrue(app["single_backend_maintenance"])
+                self.assertEqual(app["storage_root"], f"/srv/apps/{app['app_id']}")
+                self.assertEqual(app["required_mounts"], ["/srv/apps", "/srv/databases"])
+                self.assertEqual(app["docker_root_prefix"], "/srv/apps")
+                self.assertGreaterEqual(app["minimum_free_gib"], 10)
+                self.assertGreaterEqual(app["minimum_cpu_cores"], 2)
                 self.assertEqual(app["database"]["backup_adapter"], "verified-dump")
                 self.assertEqual(app["schema_migration"]["rollback_after_migration"], "forward-only")
 
