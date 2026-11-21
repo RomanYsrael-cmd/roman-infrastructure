@@ -30,6 +30,35 @@ class ApplicationRegistryTests(unittest.TestCase):
     def test_installed_registry_validates(self):
         validate_registry(self.platform)
 
+    def test_schedulease_environments_are_isolated(self):
+        apps = self.platform["applications"]
+        staging = apps["schedulease-staging"]
+        production = apps["schedulease-production"]
+        lms = apps["romanlms-production"]
+        for field in (
+            "container_network", "allowed_database_urls", "migration_database_username",
+            "state_file", "history_file", "route_file", "metrics_file",
+        ):
+            with self.subTest(field=field):
+                self.assertNotEqual(staging[field], production[field])
+                self.assertNotEqual(production[field], lms[field])
+        self.assertTrue(set(staging["secret_refs"]).isdisjoint(production["secret_refs"]))
+        lms_secrets = {
+            lms["database_env_file"], lms["migration_database_env_file"],
+            lms["components"]["backend"]["container_env_file"],
+        }
+        self.assertTrue(set(production["secret_refs"]).isdisjoint(lms_secrets))
+        self.assertTrue(set(staging["secret_refs"]).isdisjoint(lms_secrets))
+        for app in (staging, production):
+            with self.subTest(app=app["app_id"]):
+                self.assertEqual(app["container_network_mode"], "bridge")
+                self.assertFalse(app["container_publish"])
+                self.assertEqual(set(app["components"]), {"backend"})
+                self.assertTrue(app["components"]["backend"]["sse_enabled"])
+                self.assertTrue(app["single_backend_maintenance"])
+                self.assertEqual(app["database"]["backup_adapter"], "verified-dump")
+                self.assertEqual(app["schema_migration"]["rollback_after_migration"], "forward-only")
+
     def test_rejects_build_only_application_that_can_be_deployed(self):
         app = copy.deepcopy(self.examples["applications"]["sample-build-only"])
         app["deployment_enabled"] = True
