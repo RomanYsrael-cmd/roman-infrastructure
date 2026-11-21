@@ -113,7 +113,8 @@
       "allowed_platform_shas": [
         "cc58db3a4ac802249992e60ef498205f5d48e1bb",
         "a9153164e3ecc2a10f24f2d36c2f32a99a433ff2",
-        "60c74abfec435dd3eb20ea71b9246d7de476615e"
+        "60c74abfec435dd3eb20ea71b9246d7de476615e",
+        "e386312fdccd56670c029a6ff3066e6d03c932dd"
       ],
       "workflow_event": "workflow_dispatch",
       "production_branch": "main",
@@ -319,7 +320,8 @@
         "db3150973746fad8497becd39dfb9bbb3f701556",
         "cf74c8031de7e46fce8fd49f401be973820bfa50",
         "7daa21f7b9ba3f0ee74f58b3e9c74ab2a7ecb87b",
-        "fcebbbaa87a2823d66a0b01503f07a6254eeb352"
+        "fcebbbaa87a2823d66a0b01503f07a6254eeb352",
+        "e386312fdccd56670c029a6ff3066e6d03c932dd"
       ],
       "workflow_event": "workflow_dispatch",
       "automatic_workflow_event": "workflow_run",
