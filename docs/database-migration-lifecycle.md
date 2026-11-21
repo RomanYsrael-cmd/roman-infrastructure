@@ -36,6 +36,6 @@ The controller audits the source/target, exact plan and fingerprint, migration i
 
 ## RomanLMS specifics
 
-RomanLMS uses the `romanlms-production` registry entry, PostgreSQL schema `roman_lms`, Flyway CLI pinned to the release metadata, an app-scoped production database environment file, a separate app-scoped migration environment file, dedicated role `romanlms_app`, and verified pgBackRest. Its old installed release policy is not replaced until the matching infrastructure and RomanLMS revisions are merged and installed together. The prior V132/V133 exception is removed from the release path; future normal migrations require no infrastructure source change.
+RomanLMS uses the `romanlms-production` registry entry, PostgreSQL schema `roman_lms`, Flyway CLI pinned to the release metadata, an app-scoped production database environment file, a separate app-scoped migration environment file, dedicated role `romanlms_app`, and verified pgBackRest. The shared migration adapter is installed and passed the read-only RomanLMS production acceptance. The prior V132/V133 exception is removed from the release path; future normal migrations require no infrastructure source change.
 
 Private Phase 6 remains a separate test database and uses validation/info without applying production migrations.
