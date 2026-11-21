@@ -10,14 +10,19 @@ if [[ ! "$MIGRATION_DB_PASSWORD" =~ ^[A-Za-z0-9_-]{12,80}$ ]]; then
   exit 64
 fi
 
-mapfile -t postgres_networks < <(
-  docker inspect --format '{{range $name, $network := .NetworkSettings.Networks}}{{println $name}}{{end}}' "$POSTGRES_CONTAINER"
-)
-if [[ ${#postgres_networks[@]} -ne 1 || ! "${postgres_networks[0]}" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$ ]]; then
-  echo "The disposable PostgreSQL container must be attached to exactly one valid job network." >&2
+network_name="roman-flyway-plan-${GITHUB_RUN_ID:-local}-$$"
+if [[ ! "$network_name" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$ ]]; then
+  echo "The disposable PostgreSQL integration network name is invalid." >&2
   exit 1
 fi
-POSTGRES_NETWORK="${postgres_networks[0]}"
+docker network create "$network_name" >/dev/null
+cleanup_network() {
+  docker network disconnect "$network_name" "$POSTGRES_CONTAINER" >/dev/null 2>&1 || true
+  docker network rm "$network_name" >/dev/null 2>&1 || true
+}
+trap cleanup_network EXIT
+docker network connect --alias postgres "$network_name" "$POSTGRES_CONTAINER"
+POSTGRES_NETWORK="$network_name"
 
 context_root="${RUNNER_TEMP:-/tmp}/flyway-plan-integration"
 image_tag="${GITHUB_SHA:-local}"

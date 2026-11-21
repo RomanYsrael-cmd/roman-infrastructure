@@ -1701,6 +1701,7 @@ class RomanLmsProductionPolicyTests(unittest.TestCase):
         self.assertRegex(self.app["required_ci_workflow_blob_sha"], r"^[0-9a-f]{40}$")
         self.assertTrue(self.app["allow_unhealthy_active_replacement"])
         self.assertEqual(self.app["allowed_platform_shas"], [
+            "cc58db3a4ac802249992e60ef498205f5d48e1bb",
             "f14001afa20e54681826394dd06a485dafbdcdac",
             "d5a4b3589c1c5057b94f7355f4f4e5f89a646ea6",
             "03ccb655ad7102decea52b1d3dbd67a53b7933d0",
