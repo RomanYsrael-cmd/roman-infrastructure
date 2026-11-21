@@ -4,7 +4,7 @@ Roman Infrastructure is a restricted deployment platform for independently regis
 
 ## Current implementation
 
-The universal migration and application workflow changes are under review in [Infrastructure PR #26](https://github.com/RomanYsrael-cmd/roman-infrastructure/pull/26) with the matching RomanLMS changes on a coordinated branch. The local implementation contains:
+Roman Infrastructure PR #26 merged to `main` on 2026-11-21 as `61d2305c0fe2458ee939303f509ee2c8d986fc0e`. Post-merge CI run [44854410980](https://github.com/RomanYsrael-cmd/roman-infrastructure/actions/runs/44854410980) passed, including the disposable PostgreSQL migration integration checks. The merged implementation includes:
 
 - A strict root-owned application registry with port, route, subnet, network and resource conflict checks.
 - App-specific build definitions, immutable image digests, GitHub OIDC provenance and authorized reusable workflows.
@@ -13,7 +13,9 @@ The universal migration and application workflow changes are under review in [In
 - A separate build-only workflow for Android/JVM, Maven, npm and Python artifacts; it has no server secrets or production job.
 - Per-app deployment audit and metrics through the existing Prometheus, Grafana and Telegram monitoring path.
 
-The branch changes are not production-installed until both repositories' CI passes and the controller, root registry, caller workflow and migrator revisions are verified as a compatible set. See [the platform overview](docs/universal-deployment-platform.md), [onboarding guide](docs/application-onboarding.md), [migration lifecycle](docs/database-migration-lifecycle.md), and [operations runbook](docs/universal-deployment-runbook.md).
+The matching RomanLMS migrator and caller-workflow integration is still in progress. The infrastructure implementation has not been verified on production; the last successful host check was 2026-11-20. On 2026-11-21, Tailscale reported `roman-server` offline and SSH timed out. The production freeze remains closed. Keep the controller, registry, caller workflow and migrator revisions coordinated; see [current platform status](docs/status.md) before any rollout.
+
+See [the platform overview](docs/universal-deployment-platform.md), [onboarding guide](docs/application-onboarding.md), [migration lifecycle](docs/database-migration-lifecycle.md), and [operations runbook](docs/universal-deployment-runbook.md).
 
 ## Repository map
 
