@@ -1,6 +1,6 @@
 # Universal deployment platform
 
-Status: **merged to Roman Infrastructure `main` on 2026-11-21 as `61d2305c0fe2458ee939303f509ee2c8d986fc0e`.** Post-merge CI run [44854410980](https://github.com/RomanYsrael-cmd/roman-infrastructure/actions/runs/44854410980) passed, including disposable PostgreSQL coverage for clean, single-migration and multi-migration states. The matching RomanLMS caller and migrator integration is still being completed; production installation and acceptance have not been verified.
+Status: **merged to Roman Infrastructure `main` on 2026-11-21 as `61d2305c0fe2458ee939303f509ee2c8d986fc0e`.** Post-merge CI run [44854410980](https://github.com/RomanYsrael-cmd/roman-infrastructure/actions/runs/44854410980) passed, including disposable PostgreSQL coverage for clean, single-migration and multi-migration states. RomanLMS OIDC policy PR [#111](https://github.com/RomanYsrael-cmd/roman-lms/pull/111) is merged; the matching caller and migrator integration is under review in [PR #112](https://github.com/RomanYsrael-cmd/roman-lms/pull/112), where hosted LONG CI is pending. Production installation and acceptance have not been verified.
 
 The last successful production host inspection was 2026-11-20. On 2026-11-21, Tailscale reported `roman-server` offline and the SSH probe timed out. Automated public requests received Cloudflare 530 and 403 error 1010 responses, which did not verify origin health. No production changes were made. The production release freeze remains closed. See [current platform status](status.md) before rollout.
 
