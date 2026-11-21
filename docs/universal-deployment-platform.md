@@ -1,6 +1,8 @@
 # Universal deployment platform
 
-Status: **implementation is under review in Roman Infrastructure PR #26 and the coordinated RomanLMS branch.** The local code now contains the version-agnostic migration path, registered application profiles, reusable deployment workflow, OIDC-bound image provenance, and a build-only artifact workflow. These changes are not production-installed until the PRs pass CI and the matching controller and RomanLMS migrator revisions are installed together.
+Status: **merged to Roman Infrastructure `main` on 2026-11-21 as `61d2305c0fe2458ee939303f509ee2c8d986fc0e`.** Post-merge CI run [44854410980](https://github.com/RomanYsrael-cmd/roman-infrastructure/actions/runs/44854410980) passed, including disposable PostgreSQL coverage for clean, single-migration and multi-migration states. The matching RomanLMS caller and migrator integration is still being completed; production installation and acceptance have not been verified.
+
+The last successful production host inspection was 2026-11-20. On 2026-11-21, Tailscale reported `roman-server` offline and the SSH probe timed out. Automated public requests received Cloudflare 530 and 403 error 1010 responses, which did not verify origin health. No production changes were made. The production release freeze remains closed. See [current platform status](status.md) before rollout.
 
 The main branch remains unprotected. Existing direct pushes to `main`, RomanLMS SHORT CI authorization, and RomanLMS pull-request LONG CI authorization remain supported.
 

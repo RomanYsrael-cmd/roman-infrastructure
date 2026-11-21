@@ -1,4 +1,13 @@
+---
+title: Historical smoke deployment architecture
+status: historical
+historical_since: 2026-11-21
+superseded_by: universal-deployment-platform.md
+---
+
 # Deployment architecture
+
+> This document describes the earlier RomanLMS smoke deployment architecture. It is superseded by the [universal deployment platform](universal-deployment-platform.md), which is the current architecture and rollout guide.
 
 ## Release path
 
