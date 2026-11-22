@@ -2327,6 +2327,19 @@ def _database_backup_credentials(app: dict[str, Any], runtime_values: dict[str, 
     return values, environment
 
 
+def _verified_pg_dump_listing(archive_path: Path) -> str:
+    listing = run_command(
+        ["/usr/bin/pg_restore", "--list", str(archive_path)], timeout=120, check=False
+    )
+    # pg_restore 18 writes a standalone comment separator before the archive header.
+    lines = listing.stdout.splitlines()
+    if lines[:1] == [";"]:
+        lines = lines[1:]
+    if listing.returncode != 0 or not lines or not lines[0].startswith("; Archive created at "):
+        raise DeploymentError("The PostgreSQL dump failed archive integrity verification.")
+    return listing.stdout
+
+
 def _verify_dump_backup(app: dict[str, Any], archive_path: Path, manifest: dict[str, Any]) -> str:
     try:
         metadata = archive_path.lstat()
@@ -2351,9 +2364,7 @@ def _verify_dump_backup(app: dict[str, Any], archive_path: Path, manifest: dict[
     digest = _volume_digest(archive_path)
     if manifest.get("sha256") != digest:
         raise DeploymentError("The PostgreSQL dump backup checksum is invalid.")
-    listing = run_command(["/usr/bin/pg_restore", "--list", str(archive_path)], timeout=120, check=False)
-    if listing.returncode != 0 or not listing.stdout.startswith("; Archive created at"):
-        raise DeploymentError("The PostgreSQL dump failed archive integrity verification.")
+    _verified_pg_dump_listing(archive_path)
     return digest
 
 
@@ -2450,9 +2461,7 @@ def _create_verified_dump_backup(
         )
         if dump.returncode != 0 or not temp_path.is_file() or temp_path.stat().st_size == 0:
             raise DeploymentError("The consistent PostgreSQL dump failed; the migration was not started.")
-        listing = run_command(["/usr/bin/pg_restore", "--list", str(temp_path)], timeout=120, check=False)
-        if listing.returncode != 0 or not listing.stdout.startswith("; Archive created at"):
-            raise DeploymentError("The PostgreSQL dump failed archive integrity verification; the migration was not started.")
+        _verified_pg_dump_listing(temp_path)
         digest = _volume_digest(temp_path)
         os.replace(temp_path, archive_path)
         manifest = {

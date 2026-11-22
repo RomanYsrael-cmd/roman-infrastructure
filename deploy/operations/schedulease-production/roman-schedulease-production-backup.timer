@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily SchedulEase production PostgreSQL backup
+
+[Timer]
+OnCalendar=*-*-* 19:00:00 UTC
+Persistent=true
+Unit=roman-schedulease-production-backup.service
+
+[Install]
+WantedBy=timers.target
