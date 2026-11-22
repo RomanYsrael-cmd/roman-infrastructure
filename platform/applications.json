@@ -562,7 +562,7 @@
         "RomanYsrael-cmd"
       ],
       "allowed_platform_shas": [
-        "e386312fdccd56670c029a6ff3066e6d03c932dd"
+        "27c001d5eadf531645c9869a977905d89ba49bb3"
       ],
       "production_branch": "main",
       "environment": "staging",
