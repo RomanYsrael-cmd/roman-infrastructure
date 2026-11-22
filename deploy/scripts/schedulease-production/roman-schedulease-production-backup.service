@@ -1,0 +1,12 @@
+[Unit]
+Description=Verify a SchedulEase production PostgreSQL backup
+Requires=roman-schedulease-production-db.service
+After=roman-schedulease-production-db.service
+RequiresMountsFor=/srv/apps /srv/databases
+
+[Service]
+Type=oneshot
+ExecStart=/opt/roman-platform/bin/backup-schedulease-production
+User=root
+UMask=0077
+TimeoutStartSec=20min

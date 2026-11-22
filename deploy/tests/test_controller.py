@@ -661,6 +661,23 @@ class RomanLmsContainerPolicyTests(unittest.TestCase):
 
 
 class FlywayMigrationPolicyTests(unittest.TestCase):
+
+    def test_verified_dump_listing_accepts_the_postgres_comment_separator(self):
+        header = "; Archive created at 2026-11-22 08:00:42 UTC"
+        for output in (f"{header}\n", f";\n{header}\n;     TOC Entries: 8\n"):
+            with self.subTest(output=output), mock.patch.object(
+                deploy, "run_command", return_value=mock.Mock(returncode=0, stdout=output)
+            ):
+                self.assertEqual(deploy._verified_pg_dump_listing(Path("archive.dump")), output)
+
+    def test_verified_dump_listing_rejects_failed_and_unexpected_output(self):
+        for returncode, output in ((1, ";\n; Archive created at date\n"), (0, ";\n"), (0, "notice\n; Archive created at date\n")):
+            with self.subTest(returncode=returncode, output=output), mock.patch.object(
+                deploy, "run_command", return_value=mock.Mock(returncode=returncode, stdout=output)
+            ):
+                with self.assertRaisesRegex(deploy.DeploymentError, "archive integrity"):
+                    deploy._verified_pg_dump_listing(Path("archive.dump"))
+
     def setUp(self):
         self.app = copy.deepcopy(CONFIG["applications"]["romanlms-production"])
         self.exceptions = self.app["flyway_history_exceptions"]

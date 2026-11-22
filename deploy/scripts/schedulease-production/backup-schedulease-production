@@ -1,0 +1,150 @@
+#!/usr/bin/python3
+"""Take an app-specific, verified SchedulEase PostgreSQL backup."""
+import argparse
+import json
+import os
+import re
+import sys
+import tempfile
+from datetime import datetime, timezone
+from pathlib import Path
+
+sys.path.insert(0, "/opt/roman-platform/controller")
+import roman_deploy as controller
+from application_registry import validate_registry
+
+APP_ID = "schedulease-production"
+CONFIG = Path("/etc/roman-platform/applications.json")
+BACKUP_ROOT = Path("/srv/apps/schedulease-production/backups")
+METRICS = Path("/srv/apps/monitoring/textfile_collector/schedulease_production_backup.prom")
+
+
+def secure_directory(path):
+    path.mkdir(mode=0o700, exist_ok=True)
+    metadata = path.lstat()
+    if path.is_symlink() or not path.is_dir() or metadata.st_uid != 0 or metadata.st_mode & 0o077:
+        raise RuntimeError("The database backup directory is not root-owned and private.")
+
+
+def flyway_history(connection, env, redactions):
+    query = """
+        SELECT coalesce(json_agg(json_build_object('version', version, 'checksum', checksum,
+            'script', script, 'success', success) ORDER BY installed_rank), '[]'::json)::text
+        FROM public.flyway_schema_history;
+    """
+    result = controller.run_command(
+        ["/usr/bin/psql", "-XAt", "-v", "ON_ERROR_STOP=1", *connection, "-c", query],
+        env=env, timeout=60, redactions=redactions,
+    )
+    history = json.loads(result.stdout)
+    if not history or any(not row["success"] for row in history):
+        raise RuntimeError("The production Flyway history is empty or failed.")
+    return history
+
+
+def backup(app, *, baseline):
+    if (app.get("database_backup", {}).get("adapter") != "verified-dump"
+            or app.get("flyway_schema") != "public"
+            or Path(app["database_backup"]["directory"]) != BACKUP_ROOT
+            or app.get("schema_migration", {}).get("allow_initial_schema")):
+        raise RuntimeError("The strict production backup policy must be active.")
+    controller.require_storage_mounts(app)
+    active = controller._read_state(app["state_file"]).get("active")
+    if not active or active["app_id"] != APP_ID:
+        raise RuntimeError("The managed SchedulEase production release is unavailable.")
+    secure_directory(BACKUP_ROOT)
+    directory = BACKUP_ROOT / "baseline" if baseline else BACKUP_ROOT
+    secure_directory(directory)
+    stamp = datetime.now(timezone.utc)
+    archive = directory / ("fresh-schema-v12.dump" if baseline else stamp.strftime("%Y%m%dT%H%M%SZ-periodic.dump"))
+    manifest_path = archive.with_suffix(".json")
+    if archive.exists() or archive.is_symlink() or manifest_path.exists() or manifest_path.is_symlink():
+        raise RuntimeError("An archive already exists at the selected backup path.")
+    runtime = controller._env_file_values(controller._secure_env_file(app["components"]["backend"]["container_env_file"]))
+    credentials, env = controller._database_backup_credentials(app, {
+        "DB_URL": runtime.get("SPRING_DATASOURCE_URL"),
+        "DB_USERNAME": runtime.get("SPRING_DATASOURCE_USERNAME"),
+    })
+    connection = ["--dbname", controller._pg_connection_uri(credentials["DB_URL"]), "--username", credentials["DB_USERNAME"]]
+    redactions = (credentials["DB_PASSWORD"], credentials["DB_URL"], credentials["DB_USERNAME"])
+    history = flyway_history(connection, env, redactions)
+    if history[-1]["version"] != str(active["schema_version"]):
+        raise RuntimeError("The live schema differs from the active managed release.")
+    if baseline:
+        row_counts = controller.run_command(
+            ["/usr/bin/psql", "-XAt", "-v", "ON_ERROR_STOP=1", *connection, "-c",
+             "SELECT (SELECT count(*) FROM public.useraccount), (SELECT count(*) FROM public.school), "
+             "(SELECT count(*) FROM public.department), (SELECT count(*) FROM public.scheduleentry);"],
+            env=env, timeout=60, redactions=redactions,
+        ).stdout.strip()
+        if history[-1]["version"] != "12" or row_counts != "0|0|0|0":
+            raise RuntimeError("The first-schema baseline requires the empty V12 business tables.")
+    size = int(controller.run_command(
+        ["/usr/bin/psql", "-XAt", "-v", "ON_ERROR_STOP=1", *connection, "-c",
+         "SELECT pg_database_size(current_database());"],
+        env=env, timeout=60, redactions=redactions,
+    ).stdout.strip())
+    storage = os.statvfs(directory)
+    if size <= 0 or storage.f_bavail * storage.f_frsize < size + 2 * 1024**3:
+        raise RuntimeError("Insufficient disk space for a backup and its recovery reserve.")
+    fd, name = tempfile.mkstemp(prefix=".periodic-",suffix=".dump",dir=directory)
+    os.close(fd)
+    pending = Path(name)
+    try:
+        controller.run_command(
+            ["/usr/bin/pg_dump", "--format=custom", "--no-owner", "--no-privileges",
+             "--file", str(pending), *connection],
+            env=env, timeout=app["database_backup"]["timeout_seconds"], redactions=redactions,
+        )
+        listing = controller._verified_pg_dump_listing(pending)
+        if "flyway_schema_history" not in listing:
+            raise RuntimeError("The archive cannot be read or is missing Flyway history.")
+        if flyway_history(connection, env, redactions) != history:
+            raise RuntimeError("Flyway history changed during backup.")
+        manifest = {
+            "adapter": "verified-dump", "app_id": APP_ID, "archive": archive.name,
+            "sha256": controller._volume_digest(pending), "created_at": stamp.isoformat(),
+            "database": "schedulease_prod", "schema": "public", "schema_version": active["schema_version"],
+            "source_sha": active["commit_sha"], "migrator": active["migration_image"], "history": history,
+        }
+        os.replace(pending,archive)
+        controller._atomic_write(str(manifest_path),json.dumps(manifest,sort_keys=True) + "\n",0o600)
+        controller._verify_dump_backup(app,archive,manifest)
+    finally:
+        pending.unlink(missing_ok=True)
+    if not baseline:
+        controller._prune_verified_dump_backups(app,app["database_backup"]["keep_last"])
+    print(json.dumps({"app_id": APP_ID, "archive": str(archive), "sha256": manifest["sha256"],
+                       "schema_version": active["schema_version"], "result": "verified"}))
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--baseline",action="store_true",help="preserve the first empty-schema production archive")
+    args = parser.parse_args()
+    if os.geteuid() != 0:
+        raise RuntimeError("The installed app backup requires root.")
+    app = validate_registry(json.loads(CONFIG.read_bytes()))["applications"][APP_ID]
+    outcome = 0
+    try:
+        with controller._lock(app):
+            backup(app,baseline=args.baseline)
+        outcome = 1
+    finally:
+        controller.require_storage_mounts(app)
+        controller._atomic_write(
+            str(METRICS),
+            '# TYPE roman_platform_database_backup_success gauge\n'
+            f'roman_platform_database_backup_success{{app_id="{APP_ID}"}} {outcome}\n'
+            '# TYPE roman_platform_database_backup_timestamp_seconds gauge\n'
+            f'roman_platform_database_backup_timestamp_seconds{{app_id="{APP_ID}"}} {datetime.now(timezone.utc).timestamp():.0f}\n',
+            0o644,
+        )
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (OSError, ValueError, KeyError, RuntimeError, controller.DeploymentError) as error:
+        print(f"SchedulEase backup did not complete ({type(error).__name__}).",file=sys.stderr)
+        sys.exit(1)
