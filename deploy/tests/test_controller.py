@@ -160,6 +160,16 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertIn("path: platform", workflow_text)
         self.assertIn("--platform-sha \"$PLATFORM_REF\"", workflow_text)
 
+    def test_ssh_credentials_are_written_under_a_protected_runner_identity_directory(self):
+        workflow = yaml.safe_load((ROOT / ".github" / "workflows" / "deploy-application.yml").read_text(encoding="utf-8"))
+        script = workflow["jobs"]["submit-release"]["steps"][0]["run"]
+        self.assertIn("[Security.Principal.WindowsIdentity]::GetCurrent().User", script)
+        self.assertIn("$acl.SetAccessRuleProtection($true, $false)", script)
+        self.assertIn("[Security.AccessControl.FileSystemAccessRule]::new($sid", script)
+        self.assertNotIn("$env:USERNAME", script)
+        self.assertLess(script.index("[IO.FileSystemAclExtensions]::Create"), script.index("WriteAllText($key"))
+        self.assertIn("foreach ($path in @($key, $knownHosts, $credentialDir))", script)
+
     def test_build_only_workflow_has_no_server_credentials_and_uploads_a_registered_artifact(self):
         workflow_text = (ROOT / ".github" / "workflows" / "build-application.yml").read_text(encoding="utf-8")
         workflow = yaml.safe_load(workflow_text)

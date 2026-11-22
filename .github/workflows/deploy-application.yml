@@ -253,14 +253,22 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $taskTempRoot = 'D:\CodexTemp\roman-platform'
           New-Item -ItemType Directory -Path $taskTempRoot -Force | Out-Null
-          $knownHosts = Join-Path $taskTempRoot ('known-' + $env:GITHUB_RUN_ID)
-          $key = Join-Path $taskTempRoot ('key-' + $env:GITHUB_RUN_ID)
+          $credentialDir = Join-Path $taskTempRoot ([Guid]::NewGuid().ToString('N'))
+          $knownHosts = Join-Path $credentialDir 'known_hosts'
+          $key = Join-Path $credentialDir 'id_deploy'
+          # Service runners can report the computer account in USERNAME. Use the process token SID.
+          $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User
+          $acl = [Security.AccessControl.DirectorySecurity]::new()
+          $acl.SetAccessRuleProtection($true, $false)
+          $inheritance = [Security.AccessControl.InheritanceFlags]'ContainerInherit,ObjectInherit'
+          $rule = [Security.AccessControl.FileSystemAccessRule]::new($sid, 'FullControl', $inheritance, 'None', 'Allow')
+          $acl.SetAccessRule($rule)
+          [IO.FileSystemAclExtensions]::Create([IO.DirectoryInfo]::new($credentialDir), $acl)
           try {
             $utf8 = [Text.UTF8Encoding]::new($false)
-            [IO.File]::WriteAllText($knownHosts, $env:PLATFORM_SSH_KNOWN_HOSTS.Trim() + [Environment]::NewLine, $utf8)
-            [IO.File]::WriteAllText($key, $env:PLATFORM_SSH_PRIVATE_KEY.Trim() + [Environment]::NewLine, $utf8)
-            & icacls.exe $key /inheritance:r /grant:r "$($env:USERNAME):(F)" | Out-Null
-            if ($LASTEXITCODE -ne 0) { throw 'Could not secure the deployment key.' }
+            [IO.File]::WriteAllText($knownHosts, $env:PLATFORM_SSH_KNOWN_HOSTS.Trim() + "`n", $utf8)
+            $privateKey = ($env:PLATFORM_SSH_PRIVATE_KEY.Trim() -replace "`r`n", "`n") + "`n"
+            [IO.File]::WriteAllText($key, $privateKey, $utf8)
             & ssh-keygen.exe -F '100.67.102.11' -f $knownHosts | Out-Null
             if ($LASTEXITCODE -ne 0) { throw 'The approved server host key is not configured.' }
 
@@ -305,5 +313,7 @@ jobs:
             $json | & ssh.exe -i $key -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o "UserKnownHostsFile=$knownHosts" roman-deploy@100.67.102.11
             if ($LASTEXITCODE -ne 0) { throw 'The restricted deployment controller rejected the release.' }
           } finally {
-            Remove-Item -LiteralPath $key, $knownHosts -Force -ErrorAction SilentlyContinue
+            foreach ($path in @($key, $knownHosts, $credentialDir)) {
+              if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force }
+            }
           }
