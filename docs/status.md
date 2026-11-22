@@ -1,4 +1,4 @@
-# Platform status — 2026-11-21
+# Platform status — 2026-11-22
 
 ## Universal platform work
 
@@ -10,7 +10,7 @@ Infrastructure PR [#30](https://github.com/RomanYsrael-cmd/roman-infrastructure/
 
 See the [platform overview](universal-deployment-platform.md), [onboarding guide](application-onboarding.md), [migration lifecycle](database-migration-lifecycle.md), and [production runbook](universal-deployment-runbook.md). The dated [RomanLMS deployment notes](deployment-runbook.md) and [November 9 hardening report](production-hardening-2026-11-09.md) are historical records.
 
-## Production installation and acceptance
+## Initial production installation and acceptance on 2026-11-21
 
 Roman Infrastructure is installed on `roman-server`. The restricted controller SHA-256 is `68fa2a8bf8f52de166207caa21023844a7e995eafa0b69630c8a670925530e34`; the schema-v2 registry SHA-256 is `7ba5a267861457df81cd3e830f34f18310b176c34dd1938d49e99959b4d7bb66`. The registry contains `platform-smoke`, `romanlms-phase6`, and `romanlms-production`. All three allow platform pin `e386312fdccd56670c029a6ff3066e6d03c932dd`. A root-owned pre-update registry backup is retained at `/etc/roman-platform/applications.json.149606.2026-11-21@06:46:13~`.
 
@@ -24,8 +24,24 @@ The first read-only verify attempt was rejected by the previously active migrato
 
 The server has 12 CPUs and about 7.1 GiB RAM. The observed free space was 171 GiB on `/srv/apps`, 196 GiB on `/srv/databases`, and 907 GiB on `/srv/data`. Docker, Nginx, PostgreSQL 18, Cloudflare Tunnel, Prometheus, and Grafana were healthy; the existing Telegram alert route remains configured. These observations do not certify peak-load capacity.
 
+## RomanLMS retirement acceptance on 2026-11-22
+
+RomanLMS removed the old fixed-target deployment paths, their systemd units and
+archived production workflow. The trusted-policy transition and script removal
+merged in [RomanLMS PR #115](https://github.com/RomanYsrael-cmd/roman-lms/pull/115)
+and [PR #116](https://github.com/RomanYsrael-cmd/roman-lms/pull/116).
+The cleanup's [LONG CI](https://github.com/RomanYsrael-cmd/roman-lms/actions/runs/44933306069)
+and [main SHORT CI](https://github.com/RomanYsrael-cmd/roman-lms/actions/runs/44942279301)
+passed. Infrastructure [PR #32](https://github.com/RomanYsrael-cmd/roman-infrastructure/pull/32)
+authorized the new CI workflow identity. The installed controller code stayed
+at SHA-256 `68fa2a8bf8f52de166207caa21023844a7e995eafa0b69630c8a670925530e34`.
+The [read-only production verification](https://github.com/RomanYsrael-cmd/roman-lms/actions/runs/44943993988)
+passed against the new pin. RomanLMS remained on its existing healthy release
+with Flyway V133 and zero failed migrations. The release freeze is open, with
+automatic releases enabled.
+
 ## Current rollout boundary
 
-The checked-in registry has three registrations, including the isolated smoke target and RomanLMS Phase 6 and production. Candidate repositories remain unregistered until their stack, data, ports, domains, secrets, resource budgets, backup, and rollback plans are reviewed. `main` remains unprotected; direct-main SHORT and merged-PR LONG authorization paths remain enabled. Other database engines and migration tools are not enabled: PostgreSQL/Flyway is the implemented migration adapter, with pgBackRest and verified dump backup options.
+The installed registry has five registrations. Its active RomanLMS and smoke entries are joined by `schedulease-staging` and `schedulease-production`. The [SchedulEase runbook](schedulease-deployment.md) records which parts of onboarding passed and which deployment steps are pending. Other candidate repositories remain unregistered until their operating and recovery needs are reviewed. `main` remains unprotected; direct-main SHORT and merged-PR LONG authorization paths remain enabled. Other database engines and migration tools are not enabled: PostgreSQL/Flyway is the implemented migration adapter, with pgBackRest and verified dump backup options.
 
 Examples for all profiles are in [application-profiles.json](../examples/application-profiles.json). Registering a repository does not authorize it for deployment until the root-owned application policy and its release workflow are configured and reviewed.
