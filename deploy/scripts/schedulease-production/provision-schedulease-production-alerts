@@ -1,0 +1,40 @@
+#!/usr/bin/python3
+"""Add only SchedulEase alerts to the existing Telegram notification policy."""
+import importlib.machinery
+import importlib.util
+
+loader = importlib.machinery.SourceFileLoader("roman_grafana","/opt/roman-platform/bin/provision-grafana-alerts")
+spec = importlib.util.spec_from_loader(loader.name, loader)
+grafana = importlib.util.module_from_spec(spec)
+loader.exec_module(grafana)
+
+APP = "schedulease-production"
+
+
+def main():
+    password = grafana.GRAFANA_PASSWORD_FILE.read_text().strip()
+    folder = grafana._verify_existing_telegram_route(password)
+    match = f'app_id="{APP}"'
+    definitions = (
+        ("deploy-failed","Deployment failed",
+         f'roman_platform_last_deployment_info{{{match},outcome="failure"}}',"0s"),
+        ("deploy-succeeded","Deployment succeeded",
+         f'(time() - roman_platform_last_deployment_timestamp_seconds{{{match},outcome="success"}}) < bool 300',"0s"),
+        ("readiness","Readiness failed",
+         f'1 - roman_platform_application_readiness_up{{{match}}}',"2m"),
+        ("backup","Database backup failed",
+         f'1 - roman_platform_database_backup_success{{{match}}}',"2m"),
+    )
+    for name,title,query,duration in definitions:
+        rule = grafana._rule_resource(
+            name=f"{APP}-{name}", title=f"SchedulEase production {title.lower()}", folder_uid=folder,
+            query=query, summary=f"SchedulEase production {title.lower()}",
+            description="Inspect SchedulEase production readiness, deployment audit, or backup status on roman-server.",
+            for_duration=duration, component=APP,
+        )
+        grafana._upsert_rule(password,rule)
+    print(f"{len(definitions)} SchedulEase rules verified against the existing warning-to-Telegram policy.")
+
+
+if __name__ == "__main__":
+    main()

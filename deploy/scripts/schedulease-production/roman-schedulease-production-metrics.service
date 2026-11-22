@@ -1,0 +1,11 @@
+[Unit]
+Description=Collect SchedulEase private production health and resource metrics
+After=docker.service nginx.service
+RequiresMountsFor=/srv/apps /srv/databases
+
+[Service]
+Type=oneshot
+ExecStart=/opt/roman-platform/bin/collect-schedulease-production
+User=root
+UMask=0077
+TimeoutStartSec=35
