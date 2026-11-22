@@ -1,0 +1,56 @@
+#!/usr/bin/python3
+"""Collect private health and bounded resource metrics for SchedulEase production."""
+import json
+import re
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+sys.path.insert(0, "/opt/roman-platform/controller")
+import roman_deploy as controller
+
+APP_ID = "schedulease-production"
+TARGET = "/srv/apps/monitoring/textfile_collector/schedulease_production_app.prom"
+
+
+def output(*args):
+    return subprocess.check_output(args, text=True, timeout=10).strip()
+
+
+def main():
+    registry = json.loads(Path("/etc/roman-platform/applications.json").read_bytes())
+    app = registry["applications"][APP_ID]
+    controller.require_storage_mounts(app)
+    data = controller._read_state(app["state_file"]).get("active") or {}
+    container = data.get("components", {}).get("backend", {}).get("container", "")
+    if not re.fullmatch(r"roman-platform-schedulease-production-backend-(?:blue|green)-[a-f0-9]{12}", container):
+        raise RuntimeError("No managed production backend is available.")
+    up = 0
+    try:
+        with urllib.request.urlopen("http://127.0.0.1:18092/actuator/health/readiness", timeout=5) as response:
+            up = int(response.status == 200 and json.load(response)["status"] == "UP")
+    except (OSError, ValueError, KeyError):
+        pass
+    metrics = {"readiness_up": up}
+    try:
+        restarts, memory = output("docker","inspect","--format","{{.RestartCount}} {{.HostConfig.Memory}}",container).split()
+        metrics["container_restarts"] = int(restarts)
+        metrics["container_memory_limit_bytes"] = int(memory)
+        cpu, memory = output("docker","stats","--no-stream","--format","{{.CPUPerc}} {{.MemPerc}}",container).split()
+        metrics["container_cpu_percent"] = float(cpu.rstrip("%"))
+        metrics["container_memory_percent"] = float(memory.rstrip("%"))
+    except (OSError, ValueError, subprocess.SubprocessError):
+        metrics["container_stats_available"] = 0
+    else:
+        metrics["container_stats_available"] = 1
+    lines = []
+    for name,value in metrics.items():
+        metric = f"roman_platform_application_{name}"
+        lines.extend((f"# TYPE {metric} gauge", f'{metric}{{app_id="{APP_ID}"}} {value}'))
+    controller._atomic_write(TARGET,"\n".join(lines) + "\n",0o644)
+
+
+if __name__ == "__main__":
+    main()

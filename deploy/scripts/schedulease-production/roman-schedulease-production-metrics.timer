@@ -1,0 +1,10 @@
+[Unit]
+Description=Refresh SchedulEase production metrics every minute
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=1min
+Unit=roman-schedulease-production-metrics.service
+
+[Install]
+WantedBy=timers.target

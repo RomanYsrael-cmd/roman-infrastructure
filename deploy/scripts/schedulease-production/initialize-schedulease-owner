@@ -8,6 +8,8 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
+from datetime import datetime, timezone
 from http.cookies import SimpleCookie
 from pathlib import Path
 
@@ -81,11 +83,14 @@ COMMIT;
 
 
 class PrivateSession:
-    def __init__(self):
+    def __init__(self, *, public=False):
         self.cookies = {}
+        self.public = public
 
     def request(self, method, path, body=None, *, csrf=None, stream=False):
-        headers = {"Host": HOST, "X-Forwarded-Proto": "https", "Origin": f"https://{HOST}"}
+        headers = {"Host": HOST, "Origin": f"https://{HOST}"}
+        if not self.public:
+            headers["X-Forwarded-Proto"] = "https"
         if self.cookies:
             headers["Cookie"] = "; ".join(f"{name}={value}" for name, value in self.cookies.items())
         if body is not None:
@@ -95,7 +100,8 @@ class PrivateSession:
             headers[csrf["headerName"]] = csrf["token"]
         if stream:
             headers["Accept"] = "text/event-stream"
-        connection = http.client.HTTPConnection("127.0.0.1", PORT, timeout=10)
+        connection = (http.client.HTTPSConnection(HOST, timeout=10) if self.public
+                      else http.client.HTTPConnection("127.0.0.1", PORT, timeout=10))
         try:
             connection.request(method, path, body, headers)
             response = connection.getresponse()
@@ -129,8 +135,8 @@ def verify_ready():
         raise RuntimeError("Managed production readiness has not passed.")
 
 
-def verify_owner(username, password):
-    session = PrivateSession()
+def verify_owner(username, password, *, public=False):
+    session = PrivateSession(public=public)
     status, body, cookies, _ = session.request("GET", "/api/auth/csrf")
     if status != 200 or not cookies.get("XSRF-TOKEN") or not cookies["XSRF-TOKEN"]["secure"]:
         raise RuntimeError("Forwarded HTTPS did not produce a secure CSRF cookie.")
@@ -170,6 +176,28 @@ def validated_config():
     if state["active"].get("schema_version") != "12":
         raise RuntimeError("The active production release has not verified schema V12.")
     verify_ready()
+    return state["active"]["commit_sha"]
+
+
+def record_acceptance(source, *, public):
+    scope = "public" if public else "private"
+    target = Path(f"/etc/roman-platform/schedulease-production/owner-{scope}-acceptance.json")
+    payload = {
+        "app_id": APP_ID,
+        "source_sha": source,
+        "scope": scope,
+        "confirmed_at": datetime.now(timezone.utc).isoformat(),
+        "checks": ["login", "permissions", "csrf", "secure-cookies", "sse", "logout"],
+    }
+    descriptor, pending = tempfile.mkstemp(dir=target.parent, prefix=".owner-acceptance-")
+    try:
+        with os.fdopen(descriptor, "w") as file:
+            file.write(json.dumps(payload) + "\n")
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(pending, target)
+    finally:
+        Path(pending).unlink(missing_ok=True)
 
 
 def name_argument(parser, name):
@@ -180,32 +208,37 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     name_argument(parser, "school")
     name_argument(parser, "department")
-    parser.add_argument("--verify", action="store_true", help="verify credentials for an existing owner")
+    verify = parser.add_mutually_exclusive_group()
+    verify.add_argument("--verify", action="store_true", help="verify an existing owner privately")
+    verify.add_argument("--verify-public", action="store_true", help="verify an existing owner through HTTPS")
     args = parser.parse_args()
+    verify_only = args.verify or args.verify_public
     if os.geteuid() != 0 or not sys.stdin.isatty():
         raise RuntimeError("Run through the private administrator SSH session with a terminal.")
-    if not args.verify and (
+    if not verify_only and (
         not args.school or not args.department or len(args.school.strip()) > 160 or len(args.department.strip()) > 160
         or not args.school.strip() or not args.department.strip()
     ):
         parser.error("Specify the owner's real --school and --department names.")
-    validated_config()
-    if not args.verify and psql("SELECT count(*) FROM public.useraccount;") != "0":
+    source = validated_config()
+    if not verify_only and psql("SELECT count(*) FROM public.useraccount;") != "0":
         raise RuntimeError("The initial owner has already been created. Use --verify.")
     username = input("Owner username: ").strip()
     if not re.fullmatch(r"[A-Za-z0-9._-]{3,64}", username) or username.lower() in RESERVED:
         raise RuntimeError("Choose a non-reserved username of 3–64 letters, digits, dots, underscores or hyphens.")
-    email = None if args.verify else input("Owner email: ").strip()
+    email = None if verify_only else input("Owner email: ").strip()
     if email is not None and (len(email) > 254 or not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email)):
         raise RuntimeError("Enter the owner's valid email address.")
     password = getpass.getpass("Owner password: ")
-    if not args.verify:
+    if not verify_only:
         if not 18 <= len(password.encode()) <= 72 or password != getpass.getpass("Confirm password: "):
             raise RuntimeError("Passwords must match and be 18–72 UTF-8 bytes.")
         create_owner(args.school.strip(), args.department.strip(), username, email, password)
         print("The first administrator was created for the named institution and department.")
-    verify_owner(username, password)
-    print("Private owner login, permissions, CSRF, secure cookies, SSE and logout passed.")
+    verify_owner(username, password, public=args.verify_public)
+    record_acceptance(source, public=args.verify_public)
+    scope = "Public" if args.verify_public else "Private"
+    print(f"{scope} owner login, permissions, CSRF, secure cookies, SSE and logout passed.")
 
 
 if __name__ == "__main__":

@@ -1,0 +1,18 @@
+[Unit]
+Description=Isolated SchedulEase production PostgreSQL
+Requires=docker.service
+After=docker.service
+PartOf=docker.service
+RequiresMountsFor=/srv/apps /srv/databases
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/docker start --attach roman-platform-schedulease-production-db
+ExecStop=/usr/bin/docker stop --time 45 roman-platform-schedulease-production-db
+TimeoutStopSec=65
+Restart=on-failure
+RestartSec=5
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
