@@ -848,7 +848,8 @@
         "execution_role": "schedulease_prod_owner",
         "max_pending": 32,
         "writer_usernames": [
-          "schedulease_prod_runtime"
+          "schedulease_prod_runtime",
+          "schedulease_prod_dbeaver"
         ],
         "rollback_after_migration": "forward-only",
         "allow_initial_schema": false
