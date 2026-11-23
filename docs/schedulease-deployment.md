@@ -181,10 +181,10 @@ Open a separate SSH forward from PowerShell. The RomanLMS forward uses a
 different port and database.
 
 ```powershell
-ssh -N -L 127.0.0.1:15433:172.30.73.10:5432 roman-server
+ssh -N -L 127.0.0.1:15434:172.30.73.10:5432 roman-server
 ```
 
-Set DBeaver to PostgreSQL at `127.0.0.1:15433` with database
+Set DBeaver to PostgreSQL at `127.0.0.1:15434` with database
 `schedulease_prod` and the dedicated login. Enter its password privately.
 Disconnect DBeaver before a schema migration. The controller checks for
 sessions under this login before applying migrations.
