@@ -170,6 +170,25 @@ then restores the original app-specific site from the root-owned
 without restarting it. Other Cloudflare hostnames and Nginx sites retain their
 existing configuration.
 
+### DBeaver access
+
+Use the dedicated `schedulease_prod_dbeaver` login for administrative data
+editing. Its permissions include application table reads and writes and
+read-only Flyway history. It does not own the schema or have schema creation
+rights.
+
+Open a separate SSH forward from PowerShell. The RomanLMS forward uses a
+different port and database.
+
+```powershell
+ssh -N -L 127.0.0.1:15434:172.30.73.10:5432 roman-server
+```
+
+Set DBeaver to PostgreSQL at `127.0.0.1:15434` with database
+`schedulease_prod` and the dedicated login. Enter its password privately.
+Disconnect DBeaver before a schema migration. The controller checks for
+sessions under this login before applying migrations.
+
 ### Baseline, ongoing backups, and monitoring
 
 The preserved baseline is
