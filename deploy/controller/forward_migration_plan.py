@@ -16,7 +16,12 @@ from pathlib import Path
 from typing import Any
 
 VERSION = re.compile(r"(?:0|[1-9]\d*)(?:\.(?:0|[1-9]\d*))*\Z")
-MIGRATION_FILE = re.compile(r"V(\d+(?:_\d+)*)__([a-z0-9_]+)\.sql\Z")
+MIGRATION_FILE = re.compile(
+    r"V(?P<version>\d+(?:[._]\d+)*)__"
+    r"(?P<description>[A-Za-z0-9]+(?:[ _][A-Za-z0-9]+)*)\.sql\Z",
+    re.ASCII,
+)
+SQL_CONF_SUFFIX = ".sql.conf"
 LEGACY_EXCEPTION_FIELDS = frozenset({
     "state", "category", "type", "version", "description", "filepath",
 })
@@ -40,10 +45,52 @@ class ForwardMigrationPlan:
         return bool(self.pending)
 
 
+@dataclass(frozen=True)
+class MigrationSqlIdentity:
+    filename: str
+    version: str
+    version_parts: tuple[int, ...]
+    description: str
+
+
 def _version_tuple(value: str) -> tuple[int, ...]:
     if not isinstance(value, str) or not VERSION.fullmatch(value):
         raise MigrationPlanError("Flyway migration version is not canonical numeric notation.")
-    return tuple(int(part) for part in value.split("."))
+    parts = [int(part) for part in value.split(".")]
+    while len(parts) > 1 and parts[-1] == 0:
+        parts.pop()
+    return tuple(parts)
+
+
+def _parse_migration_filename(filename: str) -> MigrationSqlIdentity:
+    """Parse a Flyway versioned SQL filename without rewriting its identity."""
+    if (
+        not isinstance(filename, str)
+        or not filename
+        or filename in {".", ".."}
+        or "/" in filename
+        or "\\" in filename
+        or "\x00" in filename
+    ):
+        raise MigrationPlanError("The Flyway SQL migration filename is unsafe.")
+    match = MIGRATION_FILE.fullmatch(filename)
+    if match is None:
+        raise MigrationPlanError("A versioned SQL migration has an invalid Flyway identity.")
+    version = match.group("version").replace("_", ".")
+    version_parts = _version_tuple(version)
+    description = re.sub(r"[ _]+", " ", match.group("description"))
+    return MigrationSqlIdentity(filename, version, version_parts, description)
+
+
+def _parse_migration_script_path(filepath: str) -> MigrationSqlIdentity:
+    """Require Flyway's script path to be a direct child of the verified SQL root."""
+    prefix = "/flyway/sql/"
+    if not isinstance(filepath, str) or not filepath.startswith(prefix):
+        raise MigrationPlanError("A versioned migration path is outside the verified SQL directory.")
+    filename = filepath.removeprefix(prefix)
+    if not filename or "/" in filename or "\\" in filename:
+        raise MigrationPlanError("A versioned migration path is malformed or traverses directories.")
+    return _parse_migration_filename(filename)
 
 
 def _validate_exceptions(value: list[dict[str, str]] | None) -> list[dict[str, str]]:
@@ -80,6 +127,7 @@ def migration_artifact_checksums(directory: Path) -> dict[str, int]:
         raise MigrationPlanError("The verified SQL migration directory is unavailable or unsafe.")
     checksums: dict[str, int] = {}
     versions: set[tuple[int, ...]] = set()
+    sidecars: set[str] = set()
     try:
         paths = sorted(directory.iterdir(), key=lambda path: path.name)
     except OSError as exc:
@@ -87,17 +135,21 @@ def migration_artifact_checksums(directory: Path) -> dict[str, int]:
     for path in paths:
         if path.is_symlink() or not path.is_file():
             raise MigrationPlanError("Nested or linked SQL migration paths are unsupported.")
-        if not path.name.startswith("V"):
+        if path.name.endswith(SQL_CONF_SUFFIX):
+            sql_filename = path.name[:-len(".conf")]
+            _parse_migration_filename(sql_filename)
+            sidecars.add(sql_filename)
             continue
-        match = MIGRATION_FILE.fullmatch(path.name)
-        if match is None:
-            raise MigrationPlanError("A versioned SQL migration has an invalid Flyway identity.")
-        version = match.group(1).replace("_", ".")
-        parts = _version_tuple(version)
-        if parts in versions:
+        if not path.name.startswith("V") or not path.name.endswith(".sql"):
+            raise MigrationPlanError("The verified SQL migration directory contains an unsupported file.")
+        identity = _parse_migration_filename(path.name)
+        if identity.version_parts in versions:
             raise MigrationPlanError("The release artifact contains duplicate versioned SQL identities.")
-        versions.add(parts)
+        versions.add(identity.version_parts)
         checksums[path.name] = flyway_sql_checksum(path)
+    missing_sql = sidecars - checksums.keys()
+    if missing_sql:
+        raise MigrationPlanError("A Flyway SQL configuration sidecar has no matching migration file.")
     return checksums
 
 
@@ -133,6 +185,9 @@ def bind_flyway_checksums(
             raise MigrationPlanError("The Flyway migration identity is malformed.")
         if not script or "/" in script or "\\" in script or script in {".", ".."}:
             raise MigrationPlanError("The Flyway migration script identity is unsafe.")
+        identity = _parse_migration_filename(script)
+        if identity.version != version or identity.description != description:
+            raise MigrationPlanError("Flyway version or description does not match the SQL migration filename.")
         return version, description, migration_type, script
 
     applied: dict[tuple[str, str, str, str], int] = {}
@@ -249,7 +304,7 @@ def validate_forward_plan(
     exceptions = _validate_exceptions(allowed_exceptions)
     pending: list[tuple[str, str, str, int]] = []
     history: list[tuple[str, str, str, str, str, str, int | None]] = []
-    seen_versions: set[tuple[int, ...]] = set()
+    seen_versioned_versions: set[tuple[int, ...]] = set()
     highest = source_tuple
     success_count = 0
     for entry in report["migrations"]:
@@ -273,13 +328,18 @@ def validate_forward_plan(
         history.append((state, category, migration_type, raw_version, description, filepath, checksum))
         if state == "Success":
             success_count += 1
-            if raw_version:
+            if category == "Versioned":
+                if migration_type != "SQL" or checksum is None or not raw_version:
+                    raise MigrationPlanError("Applied versioned migrations need a version, SQL file and checksum.")
                 parts = _version_tuple(raw_version)
-                if category == "Versioned":
-                    if migration_type != "SQL" or checksum is None:
-                        raise MigrationPlanError("Applied versioned migrations need SQL checksums.")
-                    if source_tuple is not None and parts > source_tuple:
-                        raise MigrationPlanError("Applied migration history is ahead of the observed schema version.")
+                identity = _parse_migration_script_path(filepath)
+                if identity.version != raw_version or identity.description != description:
+                    raise MigrationPlanError("Applied Flyway identity does not match its SQL migration filename.")
+                if parts in seen_versioned_versions:
+                    raise MigrationPlanError("Flyway history contains duplicate versioned migration versions.")
+                seen_versioned_versions.add(parts)
+                if source_tuple is not None and parts > source_tuple:
+                    raise MigrationPlanError("Applied migration history is ahead of the observed schema version.")
             continue
         if state != "Pending":
             exception = next(
@@ -294,17 +354,17 @@ def validate_forward_plan(
             raise MigrationPlanError("Only versioned SQL migrations can run automatically.")
         version = raw_version
         parts = _version_tuple(version)
-        filename = filepath.removeprefix("/flyway/sql/")
-        match = MIGRATION_FILE.fullmatch(filename)
-        if not filepath.startswith("/flyway/sql/") or match is None or match.group(1).replace("_", ".") != version:
+        identity = _parse_migration_script_path(filepath)
+        filename = identity.filename
+        if identity.version != version:
             raise MigrationPlanError("Pending migration file does not match the approved SQL directory and version.")
-        if not isinstance(description, str) or not description.strip():
+        if not isinstance(description, str) or not description.strip() or identity.description != description:
             raise MigrationPlanError("Pending migration description is missing.")
         if isinstance(checksum, bool) or not isinstance(checksum, int) or not -(2**31) <= checksum < 2**31:
             raise MigrationPlanError("Pending SQL checksum is unavailable or invalid.")
-        if parts in seen_versions or (highest is not None and parts <= highest):
+        if parts in seen_versioned_versions or (highest is not None and parts <= highest):
             raise MigrationPlanError("Pending versions must be unique and strictly increasing.")
-        seen_versions.add(parts)
+        seen_versioned_versions.add(parts)
         highest = parts
         pending.append((version, filename, description, checksum))
         if len(pending) > max_pending:
