@@ -5,6 +5,7 @@ import tempfile
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "controller"))
 from forward_migration_plan import (
@@ -70,6 +71,33 @@ class ForwardMigrationPlanTests(unittest.TestCase):
         self.assertEqual(plan.pending, (("134", "V134__add_attendance_metadata.sql", "add attendance metadata", -321),))
         self.assertIn(("Success", "Versioned", "SQL", "133", "existing migration", "/flyway/sql/V133__existing_migration.sql", 231), plan.history)
 
+    def test_checksum_binding_accepts_historical_case_and_space_descriptions(self):
+        report = {
+            "schemaVersion": "34",
+            "flywayVersion": "11.14.1",
+            "schemaName": "roman_lms",
+            "migrations": [
+                {"version": "34", "state": "Success", "category": "Versioned",
+                 "type": "SQL", "description": "prior migration",
+                 "filepath": "/flyway/sql/V34__prior_migration.sql", "checksum": None},
+                {"version": "35", "state": "Pending", "category": "Versioned",
+                 "type": "SQL", "description": "file derivative rerun",
+                 "filepath": "/flyway/sql/V35__file_derivative rerun.sql", "checksum": None},
+            ],
+        }
+        history = [{
+            "version": "34", "description": "prior migration", "type": "SQL",
+            "script": "V34__prior_migration.sql", "checksum": 340, "success": True,
+        }]
+        enriched = bind_flyway_checksums(
+            json.dumps(report), json.dumps(history),
+            {"V34__prior_migration.sql": 340, "V35__file_derivative rerun.sql": 350},
+        )
+        self.assertEqual(
+            check(json.loads(enriched), max_pending=1).pending,
+            (("35", "V35__file_derivative rerun.sql", "file derivative rerun", 350),),
+        )
+
     def test_checksum_binding_rejects_history_drift_and_missing_release_migrations(self):
         report = example()
         report["migrations"] = report["migrations"][:2]
@@ -100,11 +128,73 @@ class ForwardMigrationPlanTests(unittest.TestCase):
             self.assertEqual(checksums["V134__add_attendance_metadata.sql"], checksum)
             self.assertEqual(set(checksums), {"V134__add_attendance_metadata.sql", "V135__add_other_metadata.sql"})
 
-    def test_migration_artifact_rejects_duplicate_and_unsafe_versions(self):
+    def test_migration_artifact_accepts_historical_descriptions_and_linked_script_sidecars(self):
+        with tempfile.TemporaryDirectory(prefix="roman-flyway-historical-") as temp:
+            directory = Path(temp)
+            historical = {
+                "V35__file_derivative rerun.sql": "SELECT 35;\n",
+                "V9__phase1_refresh_tokensV8Rerun.sql": "SELECT 9;\n",
+                "V87__module_content_ownership_indexes.sql": "SELECT 87;\n",
+                "V135__versioned_paid_feature_registry.sql": "SELECT 135;\n",
+                "V136__generalize_paid_feature_entitlement_keys.sql": "SELECT 136;\n",
+            }
+            for filename, contents in historical.items():
+                (directory / filename).write_text(contents, encoding="utf-8")
+            (directory / "V87__module_content_ownership_indexes.sql.conf").write_text(
+                "executeInTransaction=true\n", encoding="utf-8"
+            )
+
+            checksums = migration_artifact_checksums(directory)
+
+            self.assertEqual(set(checksums), set(historical))
+            self.assertTrue(all(isinstance(checksum, int) for checksum in checksums.values()))
+            self.assertNotIn("V87__module_content_ownership_indexes.sql.conf", checksums)
+
+    def test_flyway_info_accepts_historical_descriptions_and_preserves_identity(self):
+        report = {
+            "schemaVersion": "34",
+            "flywayVersion": "11.14.1",
+            "schemaName": "roman_lms",
+            "migrations": [
+                {"version": "34", "state": "Success", "category": "Versioned",
+                 "type": "SQL", "description": "previous migration",
+                 "filepath": "/flyway/sql/V34__previous_migration.sql", "checksum": 234},
+                {"version": "35", "state": "Pending", "category": "Versioned",
+                 "type": "SQL", "description": "file derivative rerun",
+                 "filepath": "/flyway/sql/V35__file_derivative rerun.sql", "checksum": 350},
+            ],
+        }
+        plan = check(report)
+        self.assertEqual(
+            plan.pending,
+            (("35", "V35__file_derivative rerun.sql", "file derivative rerun", 350),),
+        )
+
+        legacy = copy.deepcopy(report)
+        legacy["schemaVersion"] = "8"
+        legacy["migrations"] = [
+            {"version": "8", "state": "Success", "category": "Versioned",
+             "type": "SQL", "description": "phase1 authentication",
+             "filepath": "/flyway/sql/V8__phase1_authentication.sql", "checksum": 80},
+            {"version": "9", "state": "Pending", "category": "Versioned",
+             "type": "SQL", "description": "phase1 refresh tokensV8Rerun",
+             "filepath": "/flyway/sql/V9__phase1_refresh_tokensV8Rerun.sql", "checksum": 90},
+        ]
+        self.assertEqual(
+            check(legacy).pending,
+            (("9", "V9__phase1_refresh_tokensV8Rerun.sql", "phase1 refresh tokensV8Rerun", 90),),
+        )
+
+    def test_migration_artifact_rejects_duplicate_versions_and_invalid_identities(self):
         for filenames in (
             ("V134__first.sql", "V134__second.sql"),
+            ("V134__first.sql", "V134_0__second.sql"),
             ("V01__bad.sql",),
-            ("V134__BadCase.sql",),
+            ("V1_02__bad_version.sql",),
+            ("V1..2__bad_version.sql",),
+            ("V134__Bad-Case.sql",),
+            ("V134__bad.sql.txt",),
+            ("V134__bad.sql.bak",),
         ):
             with tempfile.TemporaryDirectory(prefix="roman-flyway-identity-") as temp:
                 directory = Path(temp)
@@ -112,6 +202,50 @@ class ForwardMigrationPlanTests(unittest.TestCase):
                     (directory / filename).write_text("SELECT 1;\n", encoding="utf-8")
                 with self.subTest(filenames=filenames), self.assertRaises(MigrationPlanError):
                     migration_artifact_checksums(directory)
+
+    def test_migration_artifact_rejects_orphan_and_malformed_sidecars_and_unexpected_files(self):
+        cases = (
+            {"V87__module_content_ownership_indexes.sql.conf": "executeInTransaction=true\n"},
+            {"V01__invalid.sql": "SELECT 1;\n", "V01__invalid.sql.conf": "executeInTransaction=true\n"},
+            {"V1__migration.conf": "executeInTransaction=true\n"},
+            {"README.md": "not a Flyway migration\n"},
+            {"R__repeatable.sql": "SELECT 1;\n"},
+        )
+        for files in cases:
+            with tempfile.TemporaryDirectory(prefix="roman-flyway-sidecar-") as temp:
+                directory = Path(temp)
+                for filename, contents in files.items():
+                    (directory / filename).write_text(contents, encoding="utf-8")
+                with self.subTest(files=files), self.assertRaises(MigrationPlanError):
+                    migration_artifact_checksums(directory)
+
+    def test_migration_artifact_rejects_symlinks_and_nested_directories(self):
+        with tempfile.TemporaryDirectory(prefix="roman-flyway-links-") as temp:
+            directory = Path(temp)
+            target = directory / "V2__target.sql"
+            target.write_text("SELECT 1;\n", encoding="utf-8")
+            link = directory / "V1__linked.sql"
+            try:
+                link.symlink_to(target)
+            except (OSError, NotImplementedError):
+                link.write_text("SELECT 2;\n", encoding="utf-8")
+                original_is_symlink = Path.is_symlink
+                with patch.object(
+                    Path,
+                    "is_symlink",
+                    lambda path: path.name == link.name or original_is_symlink(path),
+                ):
+                    with self.assertRaises(MigrationPlanError):
+                        migration_artifact_checksums(directory)
+            else:
+                with self.assertRaises(MigrationPlanError):
+                    migration_artifact_checksums(directory)
+
+        with tempfile.TemporaryDirectory(prefix="roman-flyway-nested-") as temp:
+            directory = Path(temp)
+            (directory / "nested").mkdir()
+            with self.assertRaises(MigrationPlanError):
+                migration_artifact_checksums(directory)
 
     def test_multiple_pending_versions_without_manifest_version_pin(self):
         plan = check(example())
@@ -133,6 +267,8 @@ class ForwardMigrationPlanTests(unittest.TestCase):
         for mutate in (
             lambda row: row.update(filepath="/tmp/V134__add_attendance_metadata.sql"),
             lambda row: row.update(filepath="/flyway/sql/V135__wrong.sql"),
+            lambda row: row.update(filepath="/flyway/sql/V134__add_attendance_metadata.sql.conf"),
+            lambda row: row.update(filepath="/flyway/sql/V134__add_attendance_metadata.txt"),
             lambda row: row.update(category="Repeatable"),
             lambda row: row.update(type="JDBC"),
             lambda row: row.update(checksum=None),
@@ -155,6 +291,26 @@ class ForwardMigrationPlanTests(unittest.TestCase):
         report["migrations"][1], report["migrations"][2] = report["migrations"][2], report["migrations"][1]
         with self.assertRaises(MigrationPlanError):
             check(report)
+
+    def test_rejects_duplicate_successful_versions_and_traversing_migration_paths(self):
+        report = example()
+        report["migrations"].insert(1, {
+            "version": "133.0", "state": "Success", "category": "Versioned",
+            "type": "SQL", "description": "different description",
+            "filepath": "/flyway/sql/V133_0__different_description.sql", "checksum": 232,
+        })
+        with self.assertRaises(MigrationPlanError):
+            check(report)
+
+        for path in (
+            "/flyway/sql/../V134__add_attendance_metadata.sql",
+            "/flyway/sql/subdir/V134__add_attendance_metadata.sql",
+            "/flyway/sql\\V134__add_attendance_metadata.sql",
+        ):
+            report = example()
+            report["migrations"][1]["filepath"] = path
+            with self.subTest(path=path), self.assertRaises(MigrationPlanError):
+                check(report)
 
     def test_rejects_unapproved_history_and_warnings(self):
         for state in ("Failed", "Missing", "Future", "Above Target", "Outdated", "Ignored"):
@@ -194,7 +350,49 @@ class ForwardMigrationPlanTests(unittest.TestCase):
         self.assertNotEqual(first.fingerprint, check(report).fingerprint)
         report = example()
         report["migrations"][2]["filepath"] = "/flyway/sql/V135__new_approved_feature.sql"
+        report["migrations"][2]["description"] = "new approved feature"
         self.assertNotEqual(first.fingerprint, check(report).fingerprint)
+
+    def test_plan_fingerprint_is_stable_for_identical_historical_identity_and_checksums(self):
+        report = {
+            "schemaVersion": "34",
+            "flywayVersion": "11.14.1",
+            "schemaName": "roman_lms",
+            "migrations": [
+                {"version": "34", "state": "Success", "category": "Versioned",
+                 "type": "SQL", "description": "prior migration",
+                 "filepath": "/flyway/sql/V34__prior_migration.sql", "checksum": 340},
+                {"version": "35", "state": "Pending", "category": "Versioned",
+                 "type": "SQL", "description": "file derivative rerun",
+                 "filepath": "/flyway/sql/V35__file_derivative rerun.sql", "checksum": 350},
+            ],
+        }
+        first = check(report)
+        self.assertEqual(first.fingerprint, check(copy.deepcopy(report)).fingerprint)
+        changed = copy.deepcopy(report)
+        changed["migrations"][1]["checksum"] += 1
+        self.assertNotEqual(first.fingerprint, check(changed).fingerprint)
+
+    def test_missing_pending_sql_checksum_and_modified_applied_checksum_fail_closed(self):
+        report = example()
+        report["migrations"] = report["migrations"][:2]
+        report["migrations"][0]["checksum"] = None
+        report["migrations"][1]["checksum"] = None
+        history = [{
+            "version": "133", "description": "existing migration", "type": "SQL",
+            "script": "V133__existing_migration.sql", "checksum": 231, "success": True,
+        }]
+        with self.assertRaises(MigrationPlanError):
+            bind_flyway_checksums(
+                json.dumps(report), json.dumps(history),
+                {"V133__existing_migration.sql": 231},
+            )
+        with self.assertRaises(MigrationPlanError):
+            bind_flyway_checksums(
+                json.dumps(report), json.dumps(history),
+                {"V133__existing_migration.sql": 232,
+                 "V134__add_attendance_metadata.sql": -321},
+            )
 
     def test_legacy_exception_requires_exact_matching_history_row(self):
         exception = {
