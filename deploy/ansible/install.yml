@@ -633,10 +633,15 @@
       when: install_romanlms_phase6 | bool
 
     - name: Validate existing files and listeners for registered application routes
-      ansible.builtin.include_tasks: tasks/validate-registered-route.yml
+      ansible.builtin.include_tasks:
+        file: tasks/validate-registered-route.yml
+        apply:
+          tags:
+            - roman-platform-registered-routes
       loop: "{{ platform_registered_route_apps }}"
       loop_control:
         loop_var: registered_route_app
+      tags: [roman-platform-registered-routes]
 
     - name: Install the server allowlist
       ansible.builtin.copy:
@@ -659,6 +664,7 @@
       loop: "{{ platform_registered_route_apps }}"
       loop_control:
         label: "{{ item.key }}"
+      tags: [roman-platform-registered-routes]
 
     - name: Install Nginx virtual hosts for registered application routes
       ansible.builtin.template:
@@ -673,6 +679,7 @@
       vars:
         registered_route_app: "{{ item }}"
       notify: Reload Roman platform Nginx
+      tags: [roman-platform-registered-routes]
 
     - name: Create the restricted deployment account
       ansible.builtin.user:
@@ -788,9 +795,11 @@
       ansible.builtin.command: nginx -t
       check_mode: false
       listen: Reload Roman platform Nginx
+      tags: [roman-platform-registered-routes]
 
     - name: Reload Nginx without restarting it
       ansible.builtin.service:
         name: nginx
         state: reloaded
       listen: Reload Roman platform Nginx
+      tags: [roman-platform-registered-routes]
