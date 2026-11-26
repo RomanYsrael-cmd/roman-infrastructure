@@ -1009,7 +1009,7 @@
           "pids_limit": 64,
           "container_tmpfs": [
             "/tmp:rw,nosuid,nodev,noexec,size=16m,mode=1777",
-            "/var/cache/nginx:rw,nosuid,nodev,noexec,size=32m,mode=0777",
+            "/var/cache/nginx:rw,nosuid,nodev,noexec,size=32m,uid=101,gid=101,mode=0777",
             "/var/run:rw,nosuid,nodev,noexec,size=8m,mode=0777",
             "/etc/nginx/conf.d:rw,nosuid,nodev,noexec,size=1m,mode=0777"
           ],
