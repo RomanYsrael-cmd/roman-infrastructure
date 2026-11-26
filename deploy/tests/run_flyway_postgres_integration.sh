@@ -165,3 +165,56 @@ if [[ "$actual" != "multi-release|4" ]]; then
 fi
 
 echo "Flyway PostgreSQL integration passed: one pending migration, a three-migration release batch, and a clean schema at V137."
+
+docker exec "$POSTGRES_CONTAINER" psql -U postgres -d postgres -v ON_ERROR_STOP=1 \
+  -c "CREATE DATABASE roman_control_prod"
+docker exec "$POSTGRES_CONTAINER" psql -U postgres -d roman_control_prod -v ON_ERROR_STOP=1 \
+  -c "CREATE ROLE roman_control_owner NOLOGIN" \
+  -c "CREATE ROLE roman_control_migrator LOGIN" \
+  -c "CREATE ROLE roman_control_runtime LOGIN" \
+  -c "CREATE ROLE roman_control_backup LOGIN" \
+  -c "CREATE ROLE roman_control_observer LOGIN" \
+  -c "CREATE SCHEMA roman_control AUTHORIZATION roman_control_owner" \
+  -c "GRANT roman_control_owner TO roman_control_migrator" \
+  -c "GRANT pg_read_all_data TO roman_control_backup" \
+  -c "GRANT pg_read_all_stats TO roman_control_observer" \
+  -c "GRANT USAGE ON SCHEMA roman_control TO roman_control_runtime, roman_control_backup, roman_control_observer"
+docker exec -i "$POSTGRES_CONTAINER" psql -U postgres -d roman_control_prod -v ON_ERROR_STOP=1 -f - \
+  < deploy/scripts/romanlms-control-plane/database-roles.sql
+docker exec "$POSTGRES_CONTAINER" psql -U postgres -d roman_control_prod -v ON_ERROR_STOP=1 \
+  -c "SET ROLE roman_control_owner; CREATE TABLE roman_control.role_policy_smoke (id integer); CREATE SEQUENCE roman_control.role_policy_smoke_seq; CREATE FUNCTION roman_control.role_policy_smoke_function() RETURNS integer LANGUAGE SQL AS 'SELECT 1'; RESET ROLE"
+docker exec "$POSTGRES_CONTAINER" psql -U postgres -d roman_control_prod -v ON_ERROR_STOP=1 \
+  -c "DO \$check\$ BEGIN
+    IF pg_has_role('roman_control_backup','pg_read_all_data','MEMBER') THEN
+      RAISE EXCEPTION 'Backup role still has cluster-wide data access';
+    END IF;
+    IF pg_has_role('roman_control_migrator','roman_control_owner','USAGE')
+       OR NOT pg_has_role('roman_control_migrator','roman_control_owner','SET') THEN
+      RAISE EXCEPTION 'Migration login role membership is not least-privilege';
+    END IF;
+    IF NOT has_table_privilege('roman_control_runtime','roman_control.role_policy_smoke','SELECT')
+       OR NOT has_table_privilege('roman_control_runtime','roman_control.role_policy_smoke','INSERT')
+       OR has_table_privilege('roman_control_runtime','roman_control.role_policy_smoke','TRUNCATE')
+       OR NOT has_sequence_privilege('roman_control_runtime','roman_control.role_policy_smoke_seq','USAGE')
+       OR NOT has_table_privilege('roman_control_backup','roman_control.role_policy_smoke','SELECT')
+       OR has_table_privilege('roman_control_backup','roman_control.role_policy_smoke','INSERT')
+       OR NOT has_sequence_privilege('roman_control_backup','roman_control.role_policy_smoke_seq','SELECT')
+       OR NOT has_table_privilege('roman_control_migrator','roman_control.role_policy_smoke','SELECT')
+       OR has_table_privilege('roman_control_migrator','roman_control.role_policy_smoke','INSERT')
+       OR NOT has_function_privilege('roman_control_runtime','roman_control.role_policy_smoke_function()','EXECUTE')
+       OR has_function_privilege('roman_control_backup','roman_control.role_policy_smoke_function()','EXECUTE')
+       OR has_function_privilege('roman_control_observer','roman_control.role_policy_smoke_function()','EXECUTE') THEN
+      RAISE EXCEPTION 'Runtime, backup, or migrator privileges do not match the application policy';
+    END IF;
+    IF has_schema_privilege('roman_control_runtime','roman_control','CREATE')
+       OR has_schema_privilege('roman_control_backup','roman_control','CREATE')
+       OR has_schema_privilege('roman_control_observer','roman_control','USAGE')
+       OR NOT pg_has_role('roman_control_observer','pg_read_all_stats','MEMBER') THEN
+      RAISE EXCEPTION 'Schema or observer privileges do not match the application policy';
+    END IF;
+    IF (SELECT pg_get_userbyid(relowner) FROM pg_class WHERE oid='roman_control.role_policy_smoke'::regclass) <> 'roman_control_owner' THEN
+      RAISE EXCEPTION 'New database objects are not owned by the migration role';
+    END IF;
+  END \$check\$;"
+docker exec "$POSTGRES_CONTAINER" pg_dump -U roman_control_backup -d roman_control_prod --schema-only >/dev/null
+echo "Control Plane database role integration passed: migration ownership and scoped runtime, backup, and observer permissions."

@@ -64,6 +64,28 @@ class ApplicationRegistryTests(unittest.TestCase):
                 self.assertEqual(app["database"]["backup_adapter"], "verified-dump")
                 self.assertEqual(app["schema_migration"]["rollback_after_migration"], "forward-only")
 
+    def test_control_plane_uses_registered_maintenance_migrations_and_least_privilege_sql(self):
+        app = self.platform["applications"]["romanlms-control-plane"]
+        self.assertTrue(app["single_backend_maintenance"])
+        self.assertFalse(app["automatic_release_enabled"])
+        self.assertEqual(app["automatic_operations"], [])
+
+        policy = (ROOT / "deploy" / "scripts" / "romanlms-control-plane" / "database-roles.sql").read_text(encoding="utf-8")
+        for statement in (
+            "REVOKE pg_read_all_data FROM roman_control_backup;",
+            "ALTER ROLE roman_control_migrator NOINHERIT;",
+            "WITH INHERIT FALSE, SET TRUE",
+            "ALTER DEFAULT PRIVILEGES FOR ROLE roman_control_owner IN SCHEMA roman_control",
+            "GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO roman_control_runtime",
+            "GRANT SELECT ON TABLES TO roman_control_backup, roman_control_migrator",
+            "REVOKE EXECUTE ON ALL ROUTINES IN SCHEMA roman_control FROM PUBLIC",
+            "GRANT EXECUTE ON FUNCTIONS TO roman_control_runtime",
+            "REVOKE ALL PRIVILEGES ON SCHEMA roman_control FROM roman_control_observer;",
+        ):
+            with self.subTest(statement=statement):
+                self.assertIn(statement, policy)
+        self.assertNotIn("GRANT pg_read_all_data TO roman_control_backup", policy)
+
     def test_rejects_build_only_application_that_can_be_deployed(self):
         app = copy.deepcopy(self.examples["applications"]["sample-build-only"])
         app["deployment_enabled"] = True

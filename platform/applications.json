@@ -911,6 +911,7 @@
       "environment": "production",
       "deployment_profile": "full-stack",
       "strategy": "blue-green",
+      "single_backend_maintenance": true,
       "automatic_workflow_event": "workflow_run",
       "automatic_release_enabled": false,
       "automatic_operations": [],
