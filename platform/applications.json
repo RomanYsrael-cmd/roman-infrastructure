@@ -949,11 +949,7 @@
       "network_subnet": "172.30.74.0/24",
       "reserved_network_ips": [
         "172.30.74.1",
-        "172.30.74.10",
-        "172.30.74.21",
-        "172.30.74.22",
-        "172.30.74.31",
-        "172.30.74.32"
+        "172.30.74.10"
       ],
       "container_restart_policy": "unless-stopped",
       "stack_test_enabled": false,

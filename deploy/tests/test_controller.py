@@ -1723,6 +1723,17 @@ class StackDeploymentTests(unittest.TestCase):
         with self.assertRaisesRegex(deploy.DeploymentError, "without published ports"):
             deploy._stack_validate_network(self.app)
 
+    def test_control_plane_registered_private_addresses_are_unique(self):
+        app = CONFIG["applications"]["romanlms-control-plane"]
+        deploy._stack_validate_network(app)
+        reserved = set(app["reserved_network_ips"])
+        component_addresses = {
+            address
+            for component in app["components"].values()
+            for address in component["slot_ips"].values()
+        }
+        self.assertFalse(reserved & component_addresses)
+
     def test_production_host_network_requires_loopback_per_slot_without_published_ports(self):
         app = dict(self.app, container_network="host", container_network_mode="host", allow_host_network=True,
                    components={
