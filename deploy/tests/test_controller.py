@@ -1784,6 +1784,33 @@ class StackDeploymentTests(unittest.TestCase):
         self.assertIn("proxy_pass http://172.30.74.21:8081/actuator/health;", rendered)
         self.assertNotIn("proxy_pass http://172.30.74.21:8081/api/actuator/health;", rendered)
 
+    def test_stack_component_address_waits_for_docker_ipam_to_settle(self):
+        app = {"container_network": "private-stack"}
+        component = {"slot_ips": {"blue": "172.30.66.21"}}
+        inspect_results = [
+            subprocess.CompletedProcess([], 0, json.dumps({"private-stack": {"IPAddress": ""}}), ""),
+            subprocess.CompletedProcess([], 0, json.dumps({"private-stack": {"IPAddress": "172.30.66.21"}}), ""),
+        ]
+        with mock.patch.object(deploy, "run_command", side_effect=inspect_results) as inspect, \
+             mock.patch.object(deploy.time, "sleep") as pause:
+            address = deploy._stack_component_network_ip(app, component, "candidate", "blue")
+        self.assertEqual(address, "172.30.66.21")
+        self.assertEqual(inspect.call_count, 2)
+        pause.assert_called_once_with(deploy.PRIVATE_NETWORK_POLL_INTERVAL_SECONDS)
+
+    def test_stack_component_address_still_rejects_wrong_ip_and_extra_networks(self):
+        app = {"container_network": "private-stack"}
+        component = {"slot_ips": {"blue": "172.30.66.21"}}
+        cases = (
+            ({"private-stack": {"IPAddress": "172.30.66.22"}}, "approved private address"),
+            ({"private-stack": {"IPAddress": "172.30.66.21"}, "bridge": {"IPAddress": "172.17.0.2"}}, "unapproved private network"),
+        )
+        for networks, message in cases:
+            with self.subTest(networks=networks), \
+                 mock.patch.object(deploy, "run_command", return_value=subprocess.CompletedProcess([], 0, json.dumps(networks), "")):
+                with self.assertRaisesRegex(deploy.DeploymentError, message):
+                    deploy._stack_component_network_ip(app, component, "candidate", "blue")
+
     def test_production_host_network_requires_loopback_per_slot_without_published_ports(self):
         app = dict(self.app, container_network="host", container_network_mode="host", allow_host_network=True,
                    components={

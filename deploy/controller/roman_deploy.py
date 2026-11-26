@@ -40,6 +40,8 @@ from romanlms_ci_gate import CiGateError, github_api, verify_ci_release
 
 CONFIG_PATH = Path("/etc/roman-platform/applications.json")
 MAX_REQUEST_BYTES = 32 * 1024
+PRIVATE_NETWORK_READY_TIMEOUT_SECONDS = 5
+PRIVATE_NETWORK_POLL_INTERVAL_SECONDS = 0.1
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 APP_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,47}$")
@@ -3122,6 +3124,46 @@ def _stack_validate_network(app: dict[str, Any]) -> None:
         raise DeploymentError("The application private network address policy is invalid.") from exc
 
 
+def _stack_component_network_ip(
+    app: dict[str, Any], component_app: dict[str, Any], container: str, slot: str
+) -> str:
+    network_name = app.get("container_network")
+    try:
+        expected_ip = str(ipaddress.IPv4Address(component_app["slot_ips"][slot]))
+    except (KeyError, TypeError, ValueError) as exc:
+        raise DeploymentError("The configured private component address is invalid.") from exc
+    deadline = time.monotonic() + PRIVATE_NETWORK_READY_TIMEOUT_SECONDS
+    while True:
+        result = run_command(
+            ["docker", "inspect", "--format", "{{json .NetworkSettings.Networks}}", container],
+            timeout=15,
+            check=False,
+        )
+        try:
+            networks = json.loads(result.stdout)
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise DeploymentError("The application component network could not be verified.") from exc
+        if result.returncode != 0 or not isinstance(networks, dict) or network_name not in networks:
+            raise DeploymentError("The application component network could not be verified.")
+        if set(networks) != {network_name}:
+            raise DeploymentError("The application component is attached to an unapproved private network.")
+        network = networks[network_name]
+        if not isinstance(network, dict):
+            raise DeploymentError("The application component network could not be verified.")
+        actual_ip = network.get("IPAddress")
+        if isinstance(actual_ip, str) and actual_ip:
+            try:
+                actual_ip = str(ipaddress.IPv4Address(actual_ip))
+            except ipaddress.AddressValueError as exc:
+                raise DeploymentError("The application component is not on its approved private address.") from exc
+            if actual_ip != expected_ip:
+                raise DeploymentError("The application component is not on its approved private address.")
+            return actual_ip
+        if time.monotonic() >= deadline:
+            raise DeploymentError("The application component did not receive its approved private address.")
+        time.sleep(PRIVATE_NETWORK_POLL_INTERVAL_SECONDS)
+
+
 def _stack_release_healthy(app: dict[str, Any], release: dict[str, Any]) -> None:
     slot = release.get("slot")
     components = release.get("components")
@@ -3141,14 +3183,7 @@ def _stack_release_healthy(app: dict[str, Any], release: dict[str, Any]) -> None
             actual_ip = "127.0.0.1"
             port = int(component_app["slot_ports"][slot])
         else:
-            result = run_command(["docker", "inspect", "--format", "{{json .NetworkSettings.Networks}}", record["container"]], timeout=15, check=False)
-            try:
-                networks = json.loads(result.stdout)
-                actual_ip = networks[app["container_network"]]["IPAddress"]
-            except (KeyError, TypeError, json.JSONDecodeError) as exc:
-                raise DeploymentError("The application component network could not be verified.") from exc
-            if result.returncode != 0 or actual_ip != component_app["slot_ips"][slot] or set(networks) != {app["container_network"]}:
-                raise DeploymentError("The application component is not on its approved private address.")
+            actual_ip = _stack_component_network_ip(app, component_app, record["container"], slot)
             port = int(component_app["container_port"])
         try:
             _wait_http(
