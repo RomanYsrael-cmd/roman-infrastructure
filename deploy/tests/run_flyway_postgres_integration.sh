@@ -192,6 +192,12 @@ docker exec "$POSTGRES_CONTAINER" psql -U postgres -d roman_control_prod -v ON_E
        OR NOT pg_has_role('roman_control_migrator','roman_control_owner','SET') THEN
       RAISE EXCEPTION 'Migration login role membership is not least-privilege';
     END IF;
+    IF NOT has_database_privilege('roman_control_owner','roman_control_prod','CREATE')
+       OR has_database_privilege('roman_control_migrator','roman_control_prod','CREATE')
+       OR has_database_privilege('roman_control_runtime','roman_control_prod','CREATE')
+       OR has_database_privilege('roman_control_backup','roman_control_prod','CREATE') THEN
+      RAISE EXCEPTION 'Database CREATE privilege is not restricted to the non-login migration owner';
+    END IF;
     IF NOT has_table_privilege('roman_control_runtime','roman_control.role_policy_smoke','SELECT')
        OR NOT has_table_privilege('roman_control_runtime','roman_control.role_policy_smoke','INSERT')
        OR has_table_privilege('roman_control_runtime','roman_control.role_policy_smoke','TRUNCATE')

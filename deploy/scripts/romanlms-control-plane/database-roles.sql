@@ -40,6 +40,7 @@ $guard$;
 -- rights. The registered migration container uses SET ROLE only for migrate.
 ALTER ROLE roman_control_migrator NOINHERIT;
 GRANT roman_control_owner TO roman_control_migrator WITH INHERIT FALSE, SET TRUE;
+GRANT CREATE ON DATABASE roman_control_prod TO roman_control_owner;
 
 -- Remove cluster-wide data access from the application-scoped backup identity.
 REVOKE pg_read_all_data FROM roman_control_backup;

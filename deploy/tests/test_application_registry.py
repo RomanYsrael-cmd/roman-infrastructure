@@ -75,6 +75,7 @@ class ApplicationRegistryTests(unittest.TestCase):
             "REVOKE pg_read_all_data FROM roman_control_backup;",
             "ALTER ROLE roman_control_migrator NOINHERIT;",
             "WITH INHERIT FALSE, SET TRUE",
+            "GRANT CREATE ON DATABASE roman_control_prod TO roman_control_owner;",
             "ALTER DEFAULT PRIVILEGES FOR ROLE roman_control_owner IN SCHEMA roman_control",
             "GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO roman_control_runtime",
             "GRANT SELECT ON TABLES TO roman_control_backup, roman_control_migrator",
