@@ -996,8 +996,8 @@
           },
           "forwarded_proto_variable": "$http_x_forwarded_proto",
           "health_path": "/actuator/health",
-          "public_health_path": "/__health/romanlms-control-plane-backend",
-          "route_health_url": "http://127.0.0.1:18094/__health/romanlms-control-plane-backend",
+          "public_health_path": "/api/actuator/health",
+          "route_health_url": "http://127.0.0.1:18094/api/actuator/health",
           "expected_health_text": "\"status\":\"UP\"",
           "readiness_timeout_seconds": 180
         },

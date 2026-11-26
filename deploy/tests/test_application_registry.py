@@ -69,6 +69,11 @@ class ApplicationRegistryTests(unittest.TestCase):
         self.assertTrue(app["single_backend_maintenance"])
         self.assertFalse(app["automatic_release_enabled"])
         self.assertEqual(app["automatic_operations"], [])
+        backend = app["components"]["backend"]
+        self.assertEqual(backend["route_prefix"], "/api/")
+        self.assertEqual(backend["health_path"], "/actuator/health")
+        self.assertEqual(backend["public_health_path"], "/api/actuator/health")
+        self.assertEqual(backend["route_health_url"], "http://127.0.0.1:18094/api/actuator/health")
 
         policy = (ROOT / "deploy" / "scripts" / "romanlms-control-plane" / "database-roles.sql").read_text(encoding="utf-8")
         for statement in (

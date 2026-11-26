@@ -1129,17 +1129,20 @@ def _stack_route_content(components: dict[str, Any], slot: str) -> str:
             raise DeploymentError("The application event-stream policy is invalid.")
         public_health_path = component.get("public_health_path")
         if public_health_path is not None:
+            upstream_health_path = component.get("health_path")
             if (
                 not isinstance(public_health_path, str)
                 or not re.fullmatch(r"/(?:[A-Za-z0-9_-]+/)*[A-Za-z0-9_-]+", public_health_path)
                 or not public_health_path.startswith(prefix)
                 or public_health_path in health_paths
+                or not isinstance(upstream_health_path, str)
+                or not re.fullmatch(r"/(?:[A-Za-z0-9_-]+/)*[A-Za-z0-9_-]+", upstream_health_path)
             ):
                 raise DeploymentError("The application public health route is invalid.")
             health_paths.add(public_health_path)
             blocks.append(
                 f"location = {public_health_path} {{\n"
-                f"    proxy_pass http://{address}:{port}{public_health_path};\n"
+                f"    proxy_pass http://{address}:{port}{upstream_health_path};\n"
                 "    proxy_http_version 1.1;\n"
                 "    proxy_set_header Host $host;\n"
                 "    proxy_set_header X-Real-IP $remote_addr;\n"

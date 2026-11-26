@@ -530,6 +530,21 @@ class RomanLmsContainerPolicyTests(unittest.TestCase):
         self.assertNotIn("127.0.0.1:18182", rendered)
         self.assertIn("proxy_set_header Upgrade $http_upgrade", rendered)
 
+    def test_stack_route_maps_public_api_health_path_to_backend_actuator_path(self):
+        components = {
+            "backend": {
+                "route_prefix": "/api/",
+                "slot_ports": {"blue": 18182},
+                "health_path": "/actuator/health",
+                "public_health_path": "/api/actuator/health",
+            },
+            "frontend": {"route_prefix": "/", "slot_ports": {"blue": 18181}},
+        }
+        rendered = deploy._stack_route_content(components, "blue")
+        self.assertIn("location = /api/actuator/health", rendered)
+        self.assertIn("proxy_pass http://127.0.0.1:18182/actuator/health;", rendered)
+        self.assertNotIn("proxy_pass http://127.0.0.1:18182/api/actuator/health;", rendered)
+
     def test_stack_route_rejects_unsafe_or_ambiguous_routes(self):
         for prefix in ("/lms/;return 200;", "/missing-trailing", "/../../"):
             with self.subTest(prefix=prefix), self.assertRaises(deploy.DeploymentError):
@@ -537,6 +552,29 @@ class RomanLmsContainerPolicyTests(unittest.TestCase):
         duplicated = {name: {"route_prefix": "/", "slot_ports": {"blue": port}} for name, port in (("one", 18181), ("two", 18182))}
         with self.assertRaises(deploy.DeploymentError):
             deploy._stack_route_content(duplicated, "blue")
+        for health_path in ("/actuator/health?probe=1", "/../health"):
+            components = {
+                "backend": {
+                    "route_prefix": "/api/",
+                    "slot_ports": {"blue": 18182},
+                    "health_path": health_path,
+                    "public_health_path": "/api/actuator/health",
+                },
+                "frontend": {"route_prefix": "/", "slot_ports": {"blue": 18181}},
+            }
+            with self.subTest(health_path=health_path), self.assertRaisesRegex(deploy.DeploymentError, "public health route"):
+                deploy._stack_route_content(components, "blue")
+        invalid_public_health = {
+            "backend": {
+                "route_prefix": "/api/",
+                "slot_ports": {"blue": 18182},
+                "health_path": "/actuator/health",
+                "public_health_path": "/__health/backend",
+            },
+            "frontend": {"route_prefix": "/", "slot_ports": {"blue": 18181}},
+        }
+        with self.assertRaisesRegex(deploy.DeploymentError, "public health route"):
+            deploy._stack_route_content(invalid_public_health, "blue")
 
     def test_stack_route_uses_fixed_internal_addresses(self):
         components = {
@@ -1734,6 +1772,18 @@ class StackDeploymentTests(unittest.TestCase):
         }
         self.assertFalse(reserved & component_addresses)
 
+    def test_control_plane_registered_public_health_route_targets_actuator_endpoint(self):
+        app = CONFIG["applications"]["romanlms-control-plane"]
+        backend = app["components"]["backend"]
+        self.assertEqual(backend["route_prefix"], "/api/")
+        self.assertEqual(backend["health_path"], "/actuator/health")
+        self.assertEqual(backend["public_health_path"], "/api/actuator/health")
+        self.assertEqual(backend["route_health_url"], "http://127.0.0.1:18094/api/actuator/health")
+        rendered = deploy._stack_route_content(app["components"], "blue")
+        self.assertIn("location = /api/actuator/health", rendered)
+        self.assertIn("proxy_pass http://172.30.74.21:8081/actuator/health;", rendered)
+        self.assertNotIn("proxy_pass http://172.30.74.21:8081/api/actuator/health;", rendered)
+
     def test_production_host_network_requires_loopback_per_slot_without_published_ports(self):
         app = dict(self.app, container_network="host", container_network_mode="host", allow_host_network=True,
                    components={
@@ -1785,6 +1835,7 @@ class StackDeploymentTests(unittest.TestCase):
         components = {
             "backend": {"route_prefix": "/lms/", "slot_ports": {"blue": 18100},
                         "forwarded_proto_variable": "$http_x_forwarded_proto",
+                        "health_path": "/lms/actuator/health",
                         "public_health_path": "/lms/actuator/health", "sse_enabled": True},
             "frontend": {"route_prefix": "/", "slot_ports": {"blue": 18101}},
         }
