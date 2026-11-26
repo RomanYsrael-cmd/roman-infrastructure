@@ -892,6 +892,216 @@
       "storage_root": "/srv/apps/schedulease-production",
       "minimum_free_gib": 10,
       "minimum_cpu_cores": 2
+    },
+    "romanlms-control-plane": {
+      "app_id": "romanlms-control-plane",
+      "repository": "RomanYsrael-cmd/romanlms-control-plane",
+      "workflow_repository": "RomanYsrael-cmd/romanlms-control-plane",
+      "workflow_path": ".github/workflows/platform-deploy.yml",
+      "workflow_event": "workflow_dispatch",
+      "required_ci_workflow_file": "control-plane-ci.yml",
+      "reusable_workflow_path": "RomanYsrael-cmd/roman-infrastructure/.github/workflows/deploy-application.yml",
+      "authorized_actors": [
+        "RomanYsrael-cmd"
+      ],
+      "allowed_platform_shas": [
+        "6af0422e0a4ee611e1ac521200e51bbc1590e86d"
+      ],
+      "production_branch": "main",
+      "environment": "production",
+      "deployment_profile": "full-stack",
+      "strategy": "blue-green",
+      "automatic_workflow_event": "workflow_run",
+      "automatic_release_enabled": false,
+      "automatic_operations": [],
+      "image_package_repository": "RomanYsrael-cmd/romanlms-control-plane",
+      "image_source_repository": "RomanYsrael-cmd/roman-infrastructure",
+      "image_revision_mode": "caller",
+      "provenance_mode": "github-oidc",
+      "build": {
+        "components": {
+          "backend": {
+            "context": ".",
+            "dockerfile": "Dockerfile"
+          },
+          "frontend": {
+            "context": "web",
+            "dockerfile": "web/Dockerfile"
+          }
+        },
+        "migrator": {
+          "context": ".",
+          "dockerfile": "deploy/platform/migration/Dockerfile",
+          "build_args": {
+            "FLYWAY_CLI_VERSION": "11.14.1"
+          }
+        }
+      },
+      "resources": {
+        "cpu_cores": 2,
+        "memory_mb": 1536,
+        "pids_limit": 256
+      },
+      "container_network": "roman-platform-romanlms-control-plane",
+      "container_network_mode": "bridge",
+      "container_publish": false,
+      "network_subnet": "172.30.74.0/24",
+      "reserved_network_ips": [
+        "172.30.74.1",
+        "172.30.74.10",
+        "172.30.74.21",
+        "172.30.74.22",
+        "172.30.74.31",
+        "172.30.74.32"
+      ],
+      "container_restart_policy": "unless-stopped",
+      "stack_test_enabled": false,
+      "route_file": "/etc/roman-platform/nginx/active-romanlms-control-plane.conf",
+      "private_listener_port": 18094,
+      "routes": [
+        {
+          "domain": "controlpane.romanlms.com",
+          "path": "/"
+        }
+      ],
+      "nginx_site": {
+        "site_file": "/etc/nginx/conf.d/roman-platform-app-romanlms-control-plane.conf",
+        "listen_address": "127.0.0.1",
+        "listen_port": 18094
+      },
+      "components": {
+        "backend": {
+          "image_namespace": "ghcr.io/romanysrael-cmd/romanlms-control-plane-backend",
+          "container_port": 8081,
+          "container_memory": "1024m",
+          "container_cpus": 1.25,
+          "pids_limit": 192,
+          "container_env_file": "/etc/roman-platform/romanlms-control-plane/runtime.env",
+          "container_tmpfs": [
+            "/tmp:rw,nosuid,nodev,noexec,size=128m,mode=1777"
+          ],
+          "container_environment_by_slot": {
+            "blue": {
+              "SERVER_ADDRESS": "0.0.0.0",
+              "PORT": "8081",
+              "SPRING_FLYWAY_ENABLED": "false"
+            },
+            "green": {
+              "SERVER_ADDRESS": "0.0.0.0",
+              "PORT": "8081",
+              "SPRING_FLYWAY_ENABLED": "false"
+            }
+          },
+          "route_prefix": "/api/",
+          "slot_ips": {
+            "blue": "172.30.74.21",
+            "green": "172.30.74.22"
+          },
+          "forwarded_proto_variable": "$http_x_forwarded_proto",
+          "health_path": "/actuator/health",
+          "public_health_path": "/__health/romanlms-control-plane-backend",
+          "route_health_url": "http://127.0.0.1:18094/__health/romanlms-control-plane-backend",
+          "expected_health_text": "\"status\":\"UP\"",
+          "readiness_timeout_seconds": 180
+        },
+        "frontend": {
+          "image_namespace": "ghcr.io/romanysrael-cmd/romanlms-control-plane-frontend",
+          "container_port": 8080,
+          "container_memory": "256m",
+          "container_cpus": 0.5,
+          "pids_limit": 64,
+          "container_tmpfs": [
+            "/tmp:rw,nosuid,nodev,noexec,size=16m,mode=1777",
+            "/var/cache/nginx:rw,nosuid,nodev,noexec,size=32m,mode=0777",
+            "/var/run:rw,nosuid,nodev,noexec,size=8m,mode=0777",
+            "/etc/nginx/conf.d:rw,nosuid,nodev,noexec,size=1m,mode=0777"
+          ],
+          "container_environment_by_slot": {
+            "blue": {
+              "CONTROL_PLANE_BACKEND": "172.30.74.21:8081"
+            },
+            "green": {
+              "CONTROL_PLANE_BACKEND": "172.30.74.22:8081"
+            }
+          },
+          "route_prefix": "/",
+          "slot_ips": {
+            "blue": "172.30.74.31",
+            "green": "172.30.74.32"
+          },
+          "health_path": "/",
+          "route_health_url": "http://127.0.0.1:18094/",
+          "expected_health_text": "RomanLMS Control Plane",
+          "readiness_timeout_seconds": 120
+        }
+      },
+      "database": {
+        "engine": "postgresql",
+        "migration_adapter": "flyway",
+        "backup_adapter": "verified-dump"
+      },
+      "migration_image_namespace": "ghcr.io/romanysrael-cmd/romanlms-control-plane-migrator",
+      "database_env_file": "/etc/roman-platform/romanlms-control-plane/database.env",
+      "migration_database_env_file": "/etc/roman-platform/romanlms-control-plane/migration.env",
+      "migration_database_username": "roman_control_migrator",
+      "writer_observer_database_env_file": "/etc/roman-platform/romanlms-control-plane/writer-observer.env",
+      "allowed_database_urls": [
+        "jdbc:postgresql://172.30.74.10:5432/roman_control_prod"
+      ],
+      "flyway_cli_version": "11.14.1",
+      "flyway_schema": "roman_control",
+      "schema_migration": {
+        "adapter": "flyway",
+        "execution_role": "roman_control_owner",
+        "max_pending": 32,
+        "writer_usernames": [
+          "roman_control_runtime"
+        ],
+        "rollback_after_migration": "forward-only",
+        "allow_initial_schema": true
+      },
+      "database_backup": {
+        "adapter": "verified-dump",
+        "env_file": "/etc/roman-platform/romanlms-control-plane/backup.env",
+        "directory": "/srv/apps/romanlms-control-plane/backups",
+        "timeout_seconds": 600,
+        "keep_last": 7
+      },
+      "secret_refs": [
+        "/etc/roman-platform/romanlms-control-plane/runtime.env",
+        "/etc/roman-platform/romanlms-control-plane/database.env",
+        "/etc/roman-platform/romanlms-control-plane/migration.env",
+        "/etc/roman-platform/romanlms-control-plane/writer-observer.env",
+        "/etc/roman-platform/romanlms-control-plane/backup.env",
+        "/etc/roman-platform/romanlms-control-plane/postgres-password"
+      ],
+      "minimum_available_memory_mb": 2048,
+      "required_services": [
+        "docker.service",
+        "nginx.service"
+      ],
+      "required_healthy_containers": [
+        "roman-platform-romanlms-control-plane-db"
+      ],
+      "runtime_tmp_dir": "/run/roman-platform",
+      "lock_dir": "/run/lock/roman-platform",
+      "state_file": "/srv/apps/romanlms-control-plane/state/romanlms-control-plane.json",
+      "history_file": "/srv/apps/romanlms-control-plane/logs/deployments.jsonl",
+      "metrics_file": "/srv/apps/monitoring/textfile_collector/romanlms_control_plane_deploy.prom",
+      "confirmation_phrases": {
+        "deploy-stack": "DEPLOY ROMANLMS CONTROL PLANE",
+        "rollback-stack": "ROLLBACK ROMANLMS CONTROL PLANE",
+        "verify-stack": "VERIFY ROMANLMS CONTROL PLANE",
+        "validate-database": "VALIDATE ROMANLMS CONTROL PLANE DATABASE"
+      },
+      "required_mounts": [
+        "/srv/apps",
+        "/srv/databases"
+      ],
+      "docker_root_prefix": "/srv/apps",
+      "storage_root": "/srv/apps/romanlms-control-plane",
+      "minimum_free_gib": 10,
+      "minimum_cpu_cores": 2
     }
   }
 }
