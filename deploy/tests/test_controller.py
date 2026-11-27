@@ -2145,6 +2145,14 @@ class RomanLmsProductionPolicyTests(unittest.TestCase):
         self.assertIn("listen 127.0.0.1:8081;", gateway)
         self.assertIn("location ^~ /lms/actuator/", gateway)
         self.assertIn("return 404;", gateway)
+        control_plane = CONFIG["applications"]["romanlms-control-plane"]
+        self.assertIn(f"listen {control_plane['reserved_network_ips'][0]}:18095;", gateway)
+        for slot_ip in control_plane["components"]["backend"]["slot_ips"].values():
+            self.assertIn(f"allow {slot_ip};", gateway)
+        self.assertIn("deny all;", gateway)
+        self.assertIn("location ^~ /lms/internal/platform/v1/", gateway)
+        self.assertIn("limit_except GET POST PUT", gateway)
+        self.assertIn("proxy_pass http://127.0.0.1:18100;", gateway)
 
 
 class Phase6PolicyTests(unittest.TestCase):

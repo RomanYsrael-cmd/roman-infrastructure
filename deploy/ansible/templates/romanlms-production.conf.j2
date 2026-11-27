@@ -20,3 +20,35 @@ server {
 
     include /etc/roman-platform/nginx/active-romanlms-production.conf;
 }
+
+# Private Control Plane integration path. The LMS service JWT remains required by
+# the backend; this bridge additionally admits only the registered backend slots.
+server {
+    listen 172.30.74.1:18095;
+    server_name _;
+    server_tokens off;
+    access_log off;
+
+    allow 172.30.74.21;
+    allow 172.30.74.22;
+    deny all;
+
+    location ^~ /lms/internal/platform/v1/ {
+        limit_except GET POST PUT {
+            deny all;
+        }
+        proxy_pass http://127.0.0.1:18100;
+        proxy_http_version 1.1;
+        proxy_set_header Host romanlms.com;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto http;
+        proxy_connect_timeout 2s;
+        proxy_read_timeout 20s;
+        proxy_send_timeout 20s;
+    }
+
+    location / {
+        return 404;
+    }
+}
