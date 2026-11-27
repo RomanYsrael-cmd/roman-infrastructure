@@ -17,6 +17,24 @@ def _b64(data: bytes) -> str:
     return base64.urlsafe_b64encode(data).decode("ascii").rstrip("=")
 
 
+_SIGNED_TEST_TOKEN = (
+    "eyJhbGciOiJSUzI1NiIsImtpZCI6InRlc3Qta2V5LTEifQ."
+    "eyJpc3MiOiJodHRwczovL3Rva2VuLmFjdGlvbnMuZ2l0aHVidXNlcmNvbnRlbnQuY29tIiwiYXVkIjoicm9tYW4tcGxhdGZvcm0tdjE6"
+    "OTI4MTc3YjMxY2VlOTk5MjczZDcwMTAyZGFlOThjNzM1M2UxMjRkMjIwMWIyNzE3NzcyYWQ5NzMxNWM2NWYzMCIsImlhdCI6MTcwMDAwMDAwMCwibmJmIjoxNzAwMDAwMDAwLCJleHAiOjE3MDAwMDAzMDB9."
+    "Q2YGwr5CtWOnGx0b0ptyJNV7TnNvlchluqvJYatJ4-7dOuXCzIy3lCgQAN700Ta3uE0KKsjfNZds-zwNI_wQDtRGSC3v-PwKcE2rwl7cDkblqnQHsm9uYsnqV1dTsV2D-OBSFk8zjUh0myLrgdaJovq848hnVaw2arT2BdgaTtLHL9nMts6ABXcwC9Ec-3svu1c2GCHV5MOGmYrF6N_XgBW9X3XbRMMx5O2pMCpd1ZPSgEurJGCxe2X8ojgT3ojZZutW9NLN2Bbb18jT0_BuK24MMqZe7hmSDqMwOq2DEAlr8iBR-Ga5NRvDD95EpPLhG9v1tIpZ9gqet1Jus99ApA"
+)
+_SIGNED_TEST_JWKS = {
+    "keys": [{
+        "kid": "test-key-1",
+        "kty": "RSA",
+        "alg": "RS256",
+        "use": "sig",
+        "n": "nblOq6MqzG4JTyfi2lzP4rdOclcFT9IjRzA9exgb9fAylpqgerkD9TwGbgB0lTCUKK04hBP2lPIrnxLOqwPxdt-IZe8znRLaENqN9RgNjERa3ookwWuooGuFu3mquFaMeX4TeRKTSFkeyqxNJ00LsNGT62mHsm9z3U6EaMDDnG9BNvU4yzIVUdBY3XrfmxpW1EZLoKNa2dZ_7c3GhVBf-QHPeBlGeQJJrU-RjsTQ2OiAjgZtgm-giDXOSPuxL0z56F9AtlLOJdBpnRNKUJtwZ3WNijTK2Hx0VjZMDpAFnfASxvAhNKqAusjMyQI7yOxvjDikEn6MQI9dEu8K30LBhQ",
+        "e": "AQAB",
+    }]
+}
+
+
 class OidcProvenanceTests(unittest.TestCase):
     def setUp(self) -> None:
         self.sha = "a" * 40
@@ -70,6 +88,39 @@ class OidcProvenanceTests(unittest.TestCase):
         with mock.patch.object(provenance, "fetch_jwks", return_value=jwks):
             with self.assertRaisesRegex(provenance.ProvenanceError, "signature"):
                 provenance.verify_github_token(token, provenance.audience_for(self.images, self.build_hash, self.sha), now=now)
+
+    def test_accepts_a_valid_signed_github_token_for_the_immutable_release(self) -> None:
+        audience = provenance.audience_for(self.images, self.build_hash, self.sha)
+        with mock.patch.object(provenance, "fetch_jwks", return_value=_SIGNED_TEST_JWKS):
+            claims = provenance.verify_github_token(_SIGNED_TEST_TOKEN, audience, now=1_700_000_010)
+        self.assertEqual(claims["iss"], provenance.ISSUER)
+        self.assertEqual(claims["aud"], audience)
+
+    def test_rejects_expired_signed_token_with_safe_time_diagnostics(self) -> None:
+        audience = provenance.audience_for(self.images, self.build_hash, self.sha)
+        with mock.patch.object(provenance, "fetch_jwks", return_value=_SIGNED_TEST_JWKS):
+            with self.assertRaisesRegex(provenance.ProvenanceError, "expired") as caught:
+                provenance.verify_github_token(_SIGNED_TEST_TOKEN, audience, now=1_700_000_300)
+        self.assertIn("iat=1700000000", str(caught.exception))
+        self.assertIn("exp=1700000300", str(caught.exception))
+        self.assertIn("now=1700000300", str(caught.exception))
+
+    def test_rejects_signed_token_for_a_different_audience(self) -> None:
+        with mock.patch.object(provenance, "fetch_jwks", return_value=_SIGNED_TEST_JWKS):
+            with self.assertRaisesRegex(provenance.ProvenanceError, "audience"):
+                provenance.verify_github_token(_SIGNED_TEST_TOKEN, "roman-platform-v1:wrong", now=1_700_000_010)
+
+    def test_rejects_wrong_issuer_after_verifying_the_token_signature(self) -> None:
+        header_segment, payload_segment, signature_segment = _SIGNED_TEST_TOKEN.split(".")
+        claims = provenance._json_segment(payload_segment)
+        claims["iss"] = "https://untrusted.example"
+        forged_payload = _b64(json.dumps(claims, separators=(",", ":")).encode())
+        token = f"{header_segment}.{forged_payload}.{signature_segment}"
+        with mock.patch.object(provenance, "fetch_jwks", return_value=_SIGNED_TEST_JWKS), \
+             mock.patch.object(provenance, "_verify_signature") as verify_signature:
+            with self.assertRaisesRegex(provenance.ProvenanceError, "issuer is invalid"):
+                provenance.verify_github_token(token, claims["aud"], now=1_700_000_010)
+        verify_signature.assert_called_once()
 
     def test_release_claims_bind_caller_and_pinned_reusable_workflow(self) -> None:
         job_path = self.app["reusable_workflow_path"]

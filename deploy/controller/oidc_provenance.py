@@ -124,22 +124,31 @@ def verify_github_token(token: str, audience: str, *, now: int | None = None) ->
     issued = claims.get("iat")
     not_before = claims.get("nbf", issued)
     expiry = claims.get("exp")
+    if claims.get("iss") != ISSUER:
+        raise ProvenanceError("GitHub OIDC token issuer is invalid")
+    if claims.get("aud") != audience:
+        raise ProvenanceError("GitHub OIDC token audience does not match the immutable release")
     if (
-        claims.get("iss") != ISSUER
-        or claims.get("aud") != audience
-        or isinstance(issued, bool)
+        isinstance(issued, bool)
         or not isinstance(issued, int)
         or isinstance(not_before, bool)
         or not isinstance(not_before, int)
         or isinstance(expiry, bool)
         or not isinstance(expiry, int)
-        or issued > current + 30
-        or not_before > current + 30
-        or expiry <= current
-        or expiry <= issued
-        or expiry - issued > 900
     ):
-        raise ProvenanceError("GitHub OIDC token issuer, audience, or lifetime is invalid")
+        raise ProvenanceError("GitHub OIDC token time claims are invalid")
+    if issued > current + 30 or not_before > current + 30:
+        raise ProvenanceError(
+            f"GitHub OIDC token is not active (iat={issued}, nbf={not_before}, now={current})"
+        )
+    if expiry <= issued or expiry - issued > 900:
+        raise ProvenanceError(
+            f"GitHub OIDC token lifetime is invalid (iat={issued}, exp={expiry})"
+        )
+    if expiry <= current:
+        raise ProvenanceError(
+            f"GitHub OIDC token expired (iat={issued}, exp={expiry}, now={current})"
+        )
     return claims
 
 

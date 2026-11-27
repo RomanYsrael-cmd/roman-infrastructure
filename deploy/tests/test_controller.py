@@ -2289,6 +2289,44 @@ class WorkflowOriginTests(unittest.TestCase):
         with mock.patch.object(deploy, "github_json", side_effect=self._responses()):
             deploy.verify_release_origin(value, self.app)
 
+    def test_validates_signed_provenance_before_remote_run_and_ci_lookups(self):
+        value = request()
+        calls = []
+        responses = self._responses()
+
+        def verify_provenance(*_args):
+            calls.append("provenance")
+            return {}
+
+        def github_json(_repository, path, _token):
+            calls.append(path)
+            return responses.pop(0)
+
+        def verify_ci(*_args):
+            calls.append("required-ci")
+
+        with mock.patch.object(deploy, "verify_release_provenance", side_effect=verify_provenance), \
+             mock.patch.object(deploy, "github_json", side_effect=github_json), \
+             mock.patch.object(deploy, "verify_required_ci", side_effect=verify_ci):
+            deploy.verify_release_origin(value, self.app)
+
+        self.assertEqual(calls[0], "provenance")
+        self.assertEqual(calls[1:], [
+            "actions/runs/12345",
+            "branches/main",
+            "branches/main",
+            f"commits/{SHA}",
+            "required-ci",
+        ])
+
+    def test_rejects_invalid_provenance_before_contacting_github(self):
+        value = request()
+        with mock.patch.object(deploy, "verify_release_provenance", side_effect=deploy.ProvenanceError("expired")), \
+             mock.patch.object(deploy, "github_json") as github_json:
+            with self.assertRaisesRegex(deploy.DeploymentError, "Image provenance verification failed: expired"):
+                deploy.verify_release_origin(value, self.app)
+        github_json.assert_not_called()
+
     def test_accepts_only_an_explicit_automatic_workflow_run_with_source_ci_identity(self):
         value = request(
             operation="deploy-stack",
