@@ -16,6 +16,112 @@ PROFILES = frozenset({
 })
 HTTP_PROFILES = frozenset({"static-web", "backend-api"})
 STACK_PROFILES = frozenset({"full-stack", "multi-container"})
+MIGRATION_SCRIPT = re.compile(r"V(?P<version>[0-9]+(?:[._][0-9]+)*)__([A-Za-z0-9]+(?:[ _][A-Za-z0-9]+)*)\.sql\Z")
+
+
+def _version_parts(value: Any) -> tuple[int, ...] | None:
+    if not isinstance(value, str) or not re.fullmatch(r"(?:0|[1-9][0-9]*)(?:\.(?:0|[1-9][0-9]*))*", value):
+        return None
+    return tuple(int(part) for part in value.split("."))
+
+
+def _validate_schema_compatibility_evidence(app: dict[str, Any]) -> None:
+    """Validate exact, root-owned exceptions for reviewed forward schema drift."""
+    entries = app.get("schema_compatibility_evidence", [])
+    if not isinstance(entries, list) or len(entries) > 16:
+        raise RegistryError("schema compatibility evidence must be a bounded list")
+    database = app.get("database")
+    if entries and (not isinstance(database, dict) or database.get("migration_adapter") != "flyway"):
+        raise RegistryError("schema compatibility evidence requires the Flyway adapter")
+    seen_ids: set[str] = set()
+    for entry in entries:
+        fields = {
+            "id", "recorded_schema_version", "observed_schema_version", "target_schema_version",
+            "target_commit_sha", "target_platform_sha", "effect", "applied_migration", "pending_migrations", "retained_release",
+        }
+        if not isinstance(entry, dict) or set(entry) != fields:
+            raise RegistryError("schema compatibility evidence fields are incomplete or unsupported")
+        evidence_id = entry.get("id")
+        if not isinstance(evidence_id, str) or not re.fullmatch(r"[a-z0-9][a-z0-9-]{2,63}", evidence_id) or evidence_id in seen_ids:
+            raise RegistryError("schema compatibility evidence ID is invalid or duplicated")
+        seen_ids.add(evidence_id)
+        recorded = _version_parts(entry.get("recorded_schema_version"))
+        observed = _version_parts(entry.get("observed_schema_version"))
+        target = _version_parts(entry.get("target_schema_version"))
+        if recorded is None or observed is None or target is None or not recorded < observed < target:
+            raise RegistryError("schema compatibility versions must be canonical and strictly increasing")
+        if entry.get("effect") != "grant-only":
+            raise RegistryError("only explicitly reviewed grant-only schema compatibility is supported")
+        target_commit = entry.get("target_commit_sha")
+        if not isinstance(target_commit, str) or not re.fullmatch(r"[0-9a-f]{40}", target_commit):
+            raise RegistryError("schema compatibility target commit must be a full Git SHA")
+        target_platform = entry.get("target_platform_sha")
+        if not isinstance(target_platform, str) or target_platform not in app.get("allowed_platform_shas", []):
+            raise RegistryError("schema compatibility target workflow must be on the root allowlist")
+
+        def validate_migration(item: Any, expected_version: str | None = None) -> tuple[int, ...]:
+            migration_fields = {"version", "script", "checksum", "sha256"}
+            if not isinstance(item, dict) or set(item) != migration_fields:
+                raise RegistryError("schema compatibility migration evidence is incomplete")
+            version = item.get("version")
+            version_tuple = _version_parts(version)
+            script = item.get("script")
+            match = MIGRATION_SCRIPT.fullmatch(script) if isinstance(script, str) else None
+            if (
+                version_tuple is None
+                or match is None
+                or match.group("version").replace("_", ".") != version
+                or (expected_version is not None and version != expected_version)
+                or isinstance(item.get("checksum"), bool)
+                or not isinstance(item.get("checksum"), int)
+                or not -(2**31) <= item["checksum"] < 2**31
+                or not isinstance(item.get("sha256"), str)
+                or not re.fullmatch(r"[0-9a-f]{64}", item["sha256"])
+            ):
+                raise RegistryError("schema compatibility migration identity or checksum is invalid")
+            return version_tuple
+
+        applied = entry.get("applied_migration")
+        if validate_migration(applied, entry["observed_schema_version"]) != observed:
+            raise RegistryError("schema compatibility applied migration must identify the observed schema")
+        pending = entry.get("pending_migrations")
+        if not isinstance(pending, list) or not pending or len(pending) > 32:
+            raise RegistryError("schema compatibility requires a bounded exact pending-migration plan")
+        pending_versions = [validate_migration(item) for item in pending]
+        if (
+            pending_versions[0] <= observed
+            or any(left >= right for left, right in zip(pending_versions, pending_versions[1:]))
+            or pending_versions[-1] != target
+        ):
+            raise RegistryError("schema compatibility pending migrations must be ordered through the exact target")
+
+        retained = entry.get("retained_release")
+        retained_fields = {"commit_sha", "platform_sha", "migration_image", "components"}
+        if not isinstance(retained, dict) or set(retained) != retained_fields:
+            raise RegistryError("schema compatibility retained release identity is incomplete")
+        if (
+            not isinstance(retained.get("commit_sha"), str)
+            or not re.fullmatch(r"[0-9a-f]{40}", retained["commit_sha"])
+            or retained.get("platform_sha") not in app.get("allowed_platform_shas", [])
+            or not isinstance(retained.get("platform_sha"), str)
+            or not re.fullmatch(r"[0-9a-f]{40}", retained["platform_sha"])
+        ):
+            raise RegistryError("schema compatibility retained release commit is invalid")
+        migration_namespace = app.get("migration_image_namespace")
+        if (
+            not isinstance(migration_namespace, str)
+            or not isinstance(retained.get("migration_image"), str)
+            or not re.fullmatch(re.escape(migration_namespace) + r"@sha256:[0-9a-f]{64}", retained["migration_image"])
+        ):
+            raise RegistryError("schema compatibility retained migration image must use its immutable registered digest")
+        components = retained.get("components")
+        if not isinstance(components, dict) or set(components) != set(app.get("components", {})):
+            raise RegistryError("schema compatibility retained components do not match the application")
+        for name, component in app["components"].items():
+            namespace = component.get("image_namespace") if isinstance(component, dict) else None
+            image = components.get(name)
+            if not isinstance(namespace, str) or not isinstance(image, str) or not re.fullmatch(re.escape(namespace) + r"@sha256:[0-9a-f]{64}", image):
+                raise RegistryError("schema compatibility retained component image must use its immutable registered digest")
 
 
 class RegistryError(ValueError):
@@ -502,6 +608,7 @@ def validate_application(app_id: str, app: Any) -> dict[str, Any]:
             raise RegistryError("the configured database migration adapter is unsupported")
         if database.get("migration_adapter") == "flyway" and database.get("backup_adapter") not in {"pgbackrest", "verified-dump"}:
             raise RegistryError("Flyway migrations require an approved database backup adapter")
+    _validate_schema_compatibility_evidence(app)
     secrets = app.get("secret_refs", [])
     if not isinstance(secrets, list) or any(
         not isinstance(ref, str)
