@@ -308,6 +308,35 @@ def github_json(repository: str, path: str, token: str) -> dict[str, Any]:
 
 
 def verify_release_origin(request: dict[str, Any], app: dict[str, Any]) -> None:
+    release_mode = request["release"].get("mode", "manual")
+    if release_mode == "automatic" and (
+        app.get("automatic_release_enabled") is not True
+        or app.get("automatic_workflow_event") != "workflow_run"
+        or request["operation"] not in app.get("automatic_operations", [])
+    ):
+        raise DeploymentError("Automatic release is not enabled by the server policy.")
+    if release_mode == "automatic" and (
+        request["release"].get("actor") not in app.get("authorized_actors", [])
+        or not request["release"].get("trigger_run_id")
+        or not request["release"].get("trigger_run_attempt")
+    ):
+        raise DeploymentError("Automatic release trigger is not authorized by server policy.")
+
+    # Check the signed, image-bound identity as soon as the request reaches the
+    # controller. The Actions token is short-lived; defer no signature, issuer,
+    # audience, or claim checks until after the GitHub API and CI lookups below.
+    if request["operation"] in PROVENANCE_OPERATIONS and app.get("provenance_mode") == "github-oidc":
+        try:
+            verify_release_provenance(
+                request["provenance_token"],
+                request,
+                app,
+                _provenance_image_map(request),
+                request["build_spec_sha256"],
+            )
+        except ProvenanceError as exc:
+            raise DeploymentError(f"Image provenance verification failed: {exc}.") from exc
+
     run_id = request["release"]["run_id"]
     run = github_json(
         app["workflow_repository"],
@@ -315,14 +344,7 @@ def verify_release_origin(request: dict[str, Any], app: dict[str, Any]) -> None:
         request["github_token"],
     )
     expected_path = app["workflow_path"]
-    release_mode = request["release"].get("mode", "manual")
     if release_mode == "automatic":
-        if (
-            app.get("automatic_release_enabled") is not True
-            or app.get("automatic_workflow_event") != "workflow_run"
-            or request.get("operation") not in app.get("automatic_operations", [])
-        ):
-            raise DeploymentError("Automatic release is not enabled by the server policy.")
         expected_event = app["automatic_workflow_event"]
     else:
         expected_event = app["workflow_event"]
@@ -349,14 +371,6 @@ def verify_release_origin(request: dict[str, Any], app: dict[str, Any]) -> None:
     ):
         raise DeploymentError("Workflow run is not an authorized in-progress production release.")
 
-    if release_mode == "automatic" and (
-        request["operation"] not in app.get("automatic_operations", [])
-        or request["release"].get("actor") not in app.get("authorized_actors", [])
-        or not request["release"].get("trigger_run_id")
-        or not request["release"].get("trigger_run_attempt")
-    ):
-        raise DeploymentError("Automatic release trigger is not authorized by server policy.")
-
     workflow_branch = github_json(
         app["workflow_repository"],
         f"branches/{app['production_branch']}",
@@ -376,17 +390,6 @@ def verify_release_origin(request: dict[str, Any], app: dict[str, Any]) -> None:
         raise DeploymentError("GitHub did not confirm the requested commit.")
     if request["operation"] in {"deploy", "deploy-service", "deploy-stack", "rollback-stack", "test-stack", "verify-stack", "refresh-stack"}:
         verify_required_ci(request, app)
-    if request["operation"] in PROVENANCE_OPERATIONS and app.get("provenance_mode") == "github-oidc":
-        try:
-            verify_release_provenance(
-                request["provenance_token"],
-                request,
-                app,
-                _provenance_image_map(request),
-                request["build_spec_sha256"],
-            )
-        except ProvenanceError as exc:
-            raise DeploymentError(f"Image provenance verification failed: {exc}.") from exc
 
 
 def verify_required_ci(request: dict[str, Any], app: dict[str, Any]) -> None:
