@@ -23,6 +23,7 @@ server {
 
 # Private Control Plane integration path. The LMS service JWT remains required by
 # the backend; this bridge additionally admits only the registered backend slots.
+# Relay through the loopback gateway so blue/green slot changes follow the active route.
 server {
     listen 172.30.74.1:18095;
     server_name _;
@@ -37,7 +38,7 @@ server {
         limit_except GET POST PUT {
             deny all;
         }
-        proxy_pass http://127.0.0.1:18100;
+        proxy_pass http://127.0.0.1:8081;
         proxy_http_version 1.1;
         proxy_set_header Host romanlms.com;
         proxy_set_header X-Real-IP $remote_addr;

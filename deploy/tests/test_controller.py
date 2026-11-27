@@ -2152,7 +2152,9 @@ class RomanLmsProductionPolicyTests(unittest.TestCase):
         self.assertIn("deny all;", gateway)
         self.assertIn("location ^~ /lms/internal/platform/v1/", gateway)
         self.assertIn("limit_except GET POST PUT", gateway)
-        self.assertIn("proxy_pass http://127.0.0.1:18100;", gateway)
+        self.assertIn("proxy_pass http://127.0.0.1:8081;", gateway)
+        self.assertNotIn("proxy_pass http://127.0.0.1:18100;", gateway)
+        self.assertNotIn("proxy_pass http://127.0.0.1:18102;", gateway)
 
 
 class Phase6PolicyTests(unittest.TestCase):
