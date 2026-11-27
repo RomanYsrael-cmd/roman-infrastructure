@@ -30,6 +30,24 @@ class ApplicationRegistryTests(unittest.TestCase):
     def test_installed_registry_validates(self):
         validate_registry(self.platform)
 
+    def test_schema_compatibility_evidence_is_exact_and_fail_closed(self):
+        app = copy.deepcopy(self.platform["applications"]["romanlms-production"])
+        validate_application("romanlms-production", app)
+        mutations = (
+            ("missing content hash", lambda item: item["applied_migration"].pop("sha256")),
+            ("unreviewed effect", lambda item: item.update(effect="additive-schema-change")),
+            ("unallowlisted workflow", lambda item: item.update(target_platform_sha="f" * 40)),
+            ("pending migration overlaps observed schema", lambda item: item["pending_migrations"][0].update(version="153", script="V153__gds_runtime_minimum_table_and_sequence_grants.sql")),
+            ("target mismatch", lambda item: item["pending_migrations"][0].update(version="155", script="V155__unexpected_change.sql")),
+            ("mutable retained image", lambda item: item["retained_release"]["components"].update(backend="ghcr.io/owner/backend:latest")),
+        )
+        for label, mutate in mutations:
+            value = copy.deepcopy(app)
+            mutate(value["schema_compatibility_evidence"][0])
+            with self.subTest(mutation=label):
+                with self.assertRaises(RegistryError):
+                    validate_application("romanlms-production", value)
+
     def test_schedulease_environments_are_isolated(self):
         apps = self.platform["applications"]
         staging = apps["schedulease-staging"]

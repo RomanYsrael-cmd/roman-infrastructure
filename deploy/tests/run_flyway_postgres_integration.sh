@@ -88,7 +88,8 @@ run_flyway() {
 flyway_history() {
   docker exec -e PGPASSWORD="$MIGRATION_DB_PASSWORD" "$POSTGRES_CONTAINER" \
     psql -h 127.0.0.1 -p 5432 -U roman_migration_runner -d roman_migration_it -Atqc \
-    "SELECT COALESCE(json_agg(json_build_object('version',version,'description',description,'type',type,'script',script,'checksum',checksum,'success',success) ORDER BY installed_rank),'[]'::json)::text FROM roman_lms.flyway_schema_history"
+    "SELECT COALESCE(json_agg(json_build_object('version',version,'description',description,'type',type,'script',script,'checksum',checksum,'success',success) ORDER BY installed_rank),'[]'::json)::text FROM roman_lms.flyway_schema_history" \
+    </dev/null
 }
 
 run_flyway "$baseline_image" -target=133 migrate

@@ -381,6 +381,40 @@
         "rollback_after_migration": "forward-only",
         "allow_initial_schema": false
       },
+      "schema_compatibility_evidence": [
+        {
+          "id": "romanlms-v152-v153-v154-grant-only",
+          "recorded_schema_version": "152",
+          "observed_schema_version": "153",
+          "target_schema_version": "154",
+          "target_commit_sha": "b010e4371277a5b9aa69c0a0380438898a0b4d66",
+          "target_platform_sha": "e386312fdccd56670c029a6ff3066e6d03c932dd",
+          "effect": "grant-only",
+          "applied_migration": {
+            "version": "153",
+            "script": "V153__control_plane_service_token_replay_runtime_grant.sql",
+            "checksum": 1851410206,
+            "sha256": "3fc7d731f2c02f0a4bdb259e7dc7e24037e57a062869aaea46baf7a4830b3d5f"
+          },
+          "pending_migrations": [
+            {
+              "version": "154",
+              "script": "V154__gds_runtime_minimum_table_and_sequence_grants.sql",
+              "checksum": -1067200834,
+              "sha256": "8f2d6f24705c2194c3638370bebfbf7dec6bb9f6541aa473193f4cb67e881b0f"
+            }
+          ],
+          "retained_release": {
+            "commit_sha": "edd022445e1319445013ed8510a999667550df74",
+            "platform_sha": "e386312fdccd56670c029a6ff3066e6d03c932dd",
+            "migration_image": "ghcr.io/romanysrael-cmd/romanlms-prod-migrator@sha256:c99bb9b037d0444b5867f0b6afa0d6750c75061dab2558eb8e2e47047fa43f26",
+            "components": {
+              "backend": "ghcr.io/romanysrael-cmd/romanlms-prod-backend@sha256:9cc8756fb9b501f4eebd04a0bf85cb234292a4e000be572ba2d842150f469244",
+              "frontend": "ghcr.io/romanysrael-cmd/romanlms-prod-frontend@sha256:9fb1e50a2b483725c7a6b16a906a5002fbd858827778db480e9f27e332a00784"
+            }
+          }
+        }
+      ],
       "production_backup": {
         "config_file": "/etc/pgbackrest/pgbackrest.conf",
         "stanza": "roman-platform",

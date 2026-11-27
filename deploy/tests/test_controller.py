@@ -270,6 +270,12 @@ class RequestValidationTests(unittest.TestCase):
         self.assertEqual(app["app_id"], "platform-smoke")
         self.assertEqual(value["commit_sha"], SHA)
 
+    def test_schema_reconciliation_cannot_be_requested_or_supplied_by_a_workflow(self):
+        with self.assertRaisesRegex(deploy.DeploymentError, "unsupported fields or operation"):
+            deploy.validate_request(request(operation="schema-reconciliation"), CONFIG)
+        with self.assertRaisesRegex(deploy.DeploymentError, "unsupported fields or operation"):
+            deploy.validate_request(request(schema_compatibility_evidence=[]), CONFIG)
+
     def test_rejects_header_injection_in_github_token(self):
         with self.assertRaisesRegex(deploy.DeploymentError, "GitHub token"):
             deploy.validate_request(request(github_token=GITHUB_APP_TOKEN_SAMPLE + "\r\nInjected: yes"), CONFIG)
@@ -833,7 +839,7 @@ class FlywayMigrationPolicyTests(unittest.TestCase):
                  "DB_PASSWORD": "local-migration-secret",
              })), mock.patch.object(deploy, "registry_session", return_value=contextlib.nullcontext({})), \
              mock.patch.object(deploy, "run_command", side_effect=commands), \
-             mock.patch.object(deploy, "_bind_flyway_plan_checksums", side_effect=lambda info, history, image, app, env: info), \
+             mock.patch.object(deploy, "_bind_flyway_plan_checksums", side_effect=lambda info, history, image, app, env, **kwargs: info), \
              mock.patch.object(deploy, "_verify_image"), mock.patch.object(deploy, "_append_audit"), \
              mock.patch.object(deploy, "_read_state", return_value={}), mock.patch.object(deploy, "_write_metrics"):
             result = deploy._validate_database(request_value, self.app, allow_pending_migration=True)
@@ -855,7 +861,7 @@ class FlywayMigrationPolicyTests(unittest.TestCase):
                  "DB_PASSWORD": "local-migration-secret",
              })), mock.patch.object(deploy, "registry_session", return_value=contextlib.nullcontext({})), \
              mock.patch.object(deploy, "run_command", side_effect=commands), \
-             mock.patch.object(deploy, "_bind_flyway_plan_checksums", side_effect=lambda info, history, image, app, env: info), \
+             mock.patch.object(deploy, "_bind_flyway_plan_checksums", side_effect=lambda info, history, image, app, env, **kwargs: info), \
              mock.patch.object(deploy, "_verify_image"), mock.patch.object(deploy, "_append_audit"), \
              mock.patch.object(deploy, "_read_state", return_value={}), mock.patch.object(deploy, "_write_metrics"):
             result = deploy._validate_database(request_value, self.app, allow_pending_migration=True)
@@ -1133,6 +1139,328 @@ class StackDeploymentTests(unittest.TestCase):
         self.app["production_backup"] = copy.deepcopy(production["production_backup"])
         self.app["database"] = copy.deepcopy(production["database"])
 
+    def _v153_compatibility_case(self):
+        active = self._active_release_with_backend()
+        active["schema_version"] = "152"
+        active_sha = active["commit_sha"]
+        applied = {
+            "version": "153",
+            "script": "V153__control_plane_service_token_replay_runtime_grant.sql",
+            "checksum": 1851410206,
+            "sha256": "1" * 64,
+        }
+        pending = [{
+            "version": "154",
+            "script": "V154__gds_runtime_minimum_table_and_sequence_grants.sql",
+            "checksum": -1067200834,
+            "sha256": "2" * 64,
+        }]
+        evidence = {
+            "id": "test-v152-v153-v154-grant-only",
+            "recorded_schema_version": "152",
+            "observed_schema_version": "153",
+            "target_schema_version": "154",
+            "target_commit_sha": SHA,
+            "target_platform_sha": WORKFLOW_SHA,
+            "effect": "grant-only",
+            "applied_migration": applied,
+            "pending_migrations": pending,
+            "retained_release": {
+                "commit_sha": active_sha,
+                "platform_sha": active["platform_sha"],
+                "migration_image": active["migration_image"],
+                "components": {name: row["image"] for name, row in active["components"].items()},
+            },
+        }
+        self.app["schema_compatibility_evidence"] = [evidence]
+        request_value = copy.deepcopy(self.request)
+        request_value.update({
+            "commit_sha": SHA,
+            "platform_sha": WORKFLOW_SHA,
+            "migration_image": "ghcr.io/owner/migrator@sha256:" + DIGEST,
+        })
+        applied_row = (
+            "Success", "Versioned", "SQL", "153", "control plane service token replay runtime grant",
+            "/flyway/sql/" + applied["script"], applied["checksum"],
+        )
+        pending_row = (
+            "Pending", "Versioned", "SQL", "154", "gds runtime minimum table and sequence grants",
+            "/flyway/sql/" + pending[0]["script"], pending[0]["checksum"],
+        )
+        plan = deploy.ForwardMigrationPlan(
+            "153", "154", (("154", pending[0]["script"], "gds runtime minimum table and sequence grants", pending[0]["checksum"]),),
+            "d" * 64, (applied_row, pending_row), "e" * 64,
+        )
+        status = {
+            "migration_pending": True,
+            "schema_version": "153",
+            "migration_target_version": "154",
+            "migration_plan": deploy._migration_plan_data(plan),
+            "migration_artifact_sha256": {applied["script"]: applied["sha256"], pending[0]["script"]: pending[0]["sha256"]},
+        }
+        return active, request_value, evidence, plan, status
+
+    def test_schema_compatibility_evidence_is_exact_repeatable_and_does_not_rewrite_history(self):
+        active, request_value, _, plan, status = self._v153_compatibility_case()
+        original = copy.deepcopy(active)
+        first = deploy._schema_compatibility_match(
+            self.app, active, None, plan, status["migration_artifact_sha256"], request_value,
+        )
+        second = deploy._schema_compatibility_match(
+            self.app, active, None, plan, status["migration_artifact_sha256"], request_value,
+        )
+        self.assertEqual(first["id"], second["id"])
+        self.assertEqual(active, original)
+        previous = copy.deepcopy(active)
+        previous["slot"] = "blue"
+        for name, component in previous["components"].items():
+            component["slot"] = "blue"
+            component["container"] = deploy._container_name(
+                deploy._stack_component_app(self.app, name), "blue", previous["commit_sha"],
+            )
+        self.assertEqual(
+            deploy._schema_compatibility_match(
+                self.app, active, previous, plan, status["migration_artifact_sha256"], request_value,
+            )["id"],
+            first["id"],
+        )
+        previous["components"]["backend"]["image"] = "different-image"
+        with self.assertRaises(deploy.DeploymentError):
+            deploy._schema_compatibility_match(
+                self.app, active, previous, plan, status["migration_artifact_sha256"], request_value,
+            )
+        previous["components"]["backend"]["image"] = active["components"]["backend"]["image"]
+        previous["components"]["backend"]["container"] = "unexpected-previous-container"
+        with self.assertRaises(deploy.DeploymentError):
+            deploy._schema_compatibility_match(
+                self.app, active, previous, plan, status["migration_artifact_sha256"], request_value,
+            )
+
+    def test_schema_compatibility_rejects_missing_or_mismatched_evidence(self):
+        active, request_value, _, plan, status = self._v153_compatibility_case()
+        cases = []
+        no_policy = copy.deepcopy(self.app)
+        no_policy.pop("schema_compatibility_evidence")
+        cases.append((no_policy, active, plan, status["migration_artifact_sha256"], request_value))
+        changed_history = list(plan.history)
+        changed_history[0] = (*changed_history[0][:-1], changed_history[0][-1] + 1)
+        checksum_plan = deploy.ForwardMigrationPlan(plan.source_version, plan.target_version, plan.pending, plan.fingerprint, tuple(changed_history), plan.release_fingerprint)
+        cases.append((self.app, active, checksum_plan, status["migration_artifact_sha256"], request_value))
+        cases.append((self.app, active, plan, {**status["migration_artifact_sha256"], "V153__control_plane_service_token_replay_runtime_grant.sql": "f" * 64}, request_value))
+        wrong_active = copy.deepcopy(active)
+        wrong_active["components"]["backend"]["image"] = "retagged-image"
+        cases.append((self.app, wrong_active, plan, status["migration_artifact_sha256"], request_value))
+        wrong_request = copy.deepcopy(request_value)
+        wrong_request["commit_sha"] = "f" * 40
+        cases.append((self.app, active, plan, status["migration_artifact_sha256"], wrong_request))
+        extra_pending = deploy.ForwardMigrationPlan(
+            "153", "155", (("155", "V155__unexpected.sql", "unexpected", 15),),
+            plan.fingerprint, plan.history, plan.release_fingerprint,
+        )
+        cases.append((self.app, active, extra_pending, status["migration_artifact_sha256"], request_value))
+        for app, release, candidate_plan, hashes, candidate_request in cases:
+            with self.subTest(target=candidate_plan.target_version, active=release.get("commit_sha")):
+                with self.assertRaises(deploy.DeploymentError):
+                    deploy._schema_compatibility_match(app, release, None, candidate_plan, hashes, candidate_request)
+
+    def test_verified_v153_drift_audits_then_keeps_backup_and_migration_gates(self):
+        self._configure_v133_migration()
+        self.app["single_backend_maintenance"] = True
+        active, request_value, evidence, plan, status = self._v153_compatibility_case()
+        self.request = request_value
+        previous = copy.deepcopy(active)
+        previous["slot"] = "blue"
+        for name, component in previous["components"].items():
+            component["slot"] = "blue"
+            component["container"] = deploy._container_name(
+                deploy._stack_component_app(self.app, name), "blue", previous["commit_sha"],
+            )
+        self.state.write_text(json.dumps({"active": active, "previous": previous}), encoding="utf-8")
+        post_history = (
+            *plan.history[:1],
+            ("Success", "Versioned", "SQL", "154", "gds runtime minimum table and sequence grants", "/flyway/sql/V154__gds_runtime_minimum_table_and_sequence_grants.sql", -1067200834),
+        )
+        post_plan = deploy.ForwardMigrationPlan("154", "154", (), "f" * 64, post_history, "c" * 64)
+        post_status = {
+            "migration_pending": False,
+            "schema_version": "154",
+            "migration_target_version": "154",
+            "migration_plan": deploy._migration_plan_data(post_plan),
+        }
+        statuses = iter((status, status, post_status))
+        events = []
+        audit = mock.Mock()
+        audit.side_effect = lambda _app, event: events.append(event)
+        previous_container_available = mock.Mock(return_value=False)
+        patches = [
+            mock.patch.object(deploy, "_validate_database", side_effect=lambda *args, **kwargs: next(statuses)),
+            mock.patch.object(deploy, "registry_session", return_value=contextlib.nullcontext({})),
+            mock.patch.object(deploy, "run_command", return_value=subprocess.CompletedProcess([], 0, "", "")),
+            mock.patch.object(deploy, "_verify_image"),
+            mock.patch.object(deploy, "_verify_retained_stack_images"),
+            mock.patch.object(deploy, "_verify_retained_migration_image"),
+            mock.patch.object(deploy, "_release_container_available", previous_container_available),
+            mock.patch.object(deploy, "_stack_validate_network"),
+            mock.patch.object(deploy, "_stack_route_content"),
+            mock.patch.object(deploy, "_remove_inactive_slot"),
+            mock.patch.object(deploy, "_stack_release_healthy"),
+            mock.patch.object(deploy, "_stack_route_healthy"),
+            mock.patch.object(deploy, "verify_release_origin"),
+            mock.patch.object(deploy, "_switch_stack_route"),
+            mock.patch.object(deploy, "require_storage_mounts"),
+            mock.patch.object(deploy, "_append_audit", side_effect=audit),
+            mock.patch.object(deploy, "_write_metrics"),
+            mock.patch.object(deploy, "_create_verified_production_backup", side_effect=lambda *args: events.append("backup") or "20261127-010203F"),
+            mock.patch.object(deploy, "_stop_stack_backend", side_effect=lambda *args: events.append("stop-backend")),
+            mock.patch.object(deploy, "_secure_env_file", return_value=Path("/safe/database.env")),
+            mock.patch.object(deploy, "_env_file_values", return_value={"DB_URL": "jdbc:postgresql://127.0.0.1:5432/romanlms_prod", "DB_USERNAME": "roman_app", "DB_PASSWORD": "secret"}),
+            mock.patch.object(deploy, "_migration_database_env", return_value=(Path("/safe/migration.env"), {"DB_URL": "jdbc:postgresql://127.0.0.1:5432/romanlms_prod", "DB_USERNAME": "romanlms_migrator", "DB_PASSWORD": "migration-secret"})),
+            mock.patch.object(deploy, "_assert_no_application_writers"),
+            mock.patch.object(deploy, "_run_approved_migration", side_effect=lambda *args: events.append("migrate")),
+            mock.patch.object(deploy, "_check_backend_start_memory"),
+            mock.patch.object(deploy, "available_memory_bytes", return_value=4 * 1024**3),
+        ]
+        with contextlib.ExitStack() as stack:
+            for patcher in patches:
+                stack.enter_context(patcher)
+            result = deploy._deploy_stack(self.request, self.app)
+
+        self.assertIn("schema_reconciliation_id", result)
+        self.assertLess(events.index("backup"), events.index("stop-backend"))
+        self.assertLess(events.index("stop-backend"), events.index("migrate"))
+        reconciliation = next(event for event in events if isinstance(event, dict) and event.get("operation") == "schema-reconciliation")
+        self.assertEqual(reconciliation["outcome"], "verified-compatible")
+        self.assertEqual(reconciliation["evidence_id"], evidence["id"])
+        previous_container_available.assert_not_called()
+        state = json.loads(self.state.read_text(encoding="utf-8"))
+        self.assertEqual(state["active"]["schema_version"], "154")
+        self.assertIsNone(state["previous"])
+
+    def test_schema_reconciliation_backup_failure_preserves_route_state_and_retained_backend(self):
+        self._configure_v133_migration()
+        self.app["single_backend_maintenance"] = True
+        active, request_value, _, _, status = self._v153_compatibility_case()
+        self.request = request_value
+        previous = copy.deepcopy(active)
+        previous["slot"] = "blue"
+        for name, component in previous["components"].items():
+            component["slot"] = "blue"
+            component["container"] = deploy._container_name(
+                deploy._stack_component_app(self.app, name), "blue", previous["commit_sha"],
+            )
+        original_state = {"active": active, "previous": previous}
+        original_state_bytes = (json.dumps(original_state) + "\n").encode()
+        self.state.write_bytes(original_state_bytes)
+        original_route = self.route.read_bytes()
+        with mock.patch.object(deploy, "_validate_database", return_value=status), \
+             mock.patch.object(deploy, "registry_session", return_value=contextlib.nullcontext({})), \
+             mock.patch.object(deploy, "run_command", return_value=subprocess.CompletedProcess([], 0, "", "")), \
+             mock.patch.object(deploy, "_verify_image"), \
+             mock.patch.object(deploy, "_verify_retained_stack_images"), \
+             mock.patch.object(deploy, "_verify_retained_migration_image"), \
+             mock.patch.object(deploy, "_stack_validate_network"), \
+             mock.patch.object(deploy, "_stack_route_content"), \
+             mock.patch.object(deploy, "_stack_release_healthy"), \
+             mock.patch.object(deploy, "_stack_route_healthy"), \
+             mock.patch.object(deploy, "_append_audit"), \
+             mock.patch.object(deploy, "_create_verified_production_backup", side_effect=deploy.DeploymentError("backup verification failed")) as backup, \
+             mock.patch.object(deploy, "_stop_stack_backend") as stop, \
+             mock.patch.object(deploy, "_run_approved_migration") as migrate, \
+             mock.patch.object(deploy, "_restart_stack_backend") as restart:
+            with self.assertRaisesRegex(deploy.DeploymentError, "backup verification failed"):
+                deploy._deploy_stack(self.request, self.app)
+        backup.assert_called_once()
+        stop.assert_not_called()
+        migrate.assert_not_called()
+        restart.assert_called_once_with(self.app, active)
+        self.assertEqual(self.state.read_bytes(), original_state_bytes)
+        self.assertEqual(self.route.read_bytes(), original_route)
+
+    def test_schema_reconciliation_migration_failure_keeps_forward_recovery_gates(self):
+        self._configure_v133_migration()
+        self.app["single_backend_maintenance"] = True
+        active, request_value, _, _, status = self._v153_compatibility_case()
+        self.request = request_value
+        original_state = {"active": active, "previous": None}
+        original_state_bytes = (json.dumps(original_state) + "\n").encode()
+        self.state.write_bytes(original_state_bytes)
+        original_route = self.route.read_bytes()
+        validations = iter((status, status))
+        with mock.patch.object(deploy, "_validate_database", side_effect=lambda *args, **kwargs: next(validations)), \
+             mock.patch.object(deploy, "registry_session", return_value=contextlib.nullcontext({})), \
+             mock.patch.object(deploy, "run_command", return_value=subprocess.CompletedProcess([], 0, "", "")), \
+             mock.patch.object(deploy, "_verify_image"), \
+             mock.patch.object(deploy, "_verify_retained_stack_images"), \
+             mock.patch.object(deploy, "_verify_retained_migration_image"), \
+             mock.patch.object(deploy, "_stack_validate_network"), \
+             mock.patch.object(deploy, "_stack_route_content"), \
+             mock.patch.object(deploy, "_stack_release_healthy"), \
+             mock.patch.object(deploy, "_stack_route_healthy"), \
+             mock.patch.object(deploy, "_append_audit"), \
+             mock.patch.object(deploy, "_create_verified_production_backup", return_value="20261127-010203F") as backup, \
+             mock.patch.object(deploy, "_stop_stack_backend") as stop, \
+             mock.patch.object(deploy, "_secure_env_file", return_value=Path("/safe/database.env")), \
+             mock.patch.object(deploy, "_env_file_values", return_value={"DB_URL": "jdbc:postgresql://127.0.0.1:5432/romanlms_prod", "DB_USERNAME": "roman_app", "DB_PASSWORD": "secret"}), \
+             mock.patch.object(deploy, "_migration_database_env", return_value=(Path("/safe/migration.env"), {"DB_URL": "jdbc:postgresql://127.0.0.1:5432/romanlms_prod", "DB_USERNAME": "romanlms_migrator", "DB_PASSWORD": "migration-secret"})), \
+             mock.patch.object(deploy, "_assert_no_application_writers"), \
+             mock.patch.object(deploy, "_run_approved_migration", side_effect=deploy.DeploymentError("Flyway failed")) as migrate, \
+             mock.patch.object(deploy, "_restart_stack_backend") as restart:
+            with self.assertRaisesRegex(deploy.DeploymentError, "database migrated forward"):
+                deploy._deploy_stack(self.request, self.app)
+        backup.assert_called_once()
+        stop.assert_called_once_with(self.app, active)
+        migrate.assert_called_once()
+        restart.assert_not_called()
+        self.assertEqual(self.state.read_bytes(), original_state_bytes)
+        self.assertEqual(self.route.read_bytes(), original_route)
+
+    def test_unhealthy_retained_release_cannot_use_schema_compatibility_evidence(self):
+        self._configure_v133_migration()
+        active, request_value, _, _, status = self._v153_compatibility_case()
+        self.request = request_value
+        self.app["single_backend_maintenance"] = True
+        self.app["allow_unhealthy_active_replacement"] = True
+        self.state.write_text(json.dumps({"active": active, "previous": None}), encoding="utf-8")
+        with mock.patch.object(deploy, "_validate_database", return_value=status), \
+             mock.patch.object(deploy, "_stack_release_healthy", side_effect=deploy.DeploymentError("Readiness check failed: retained backend unavailable")), \
+             mock.patch.object(deploy, "_append_audit"), mock.patch.object(deploy, "registry_session") as registry, \
+             mock.patch.object(deploy, "_create_verified_production_backup") as backup:
+            with self.assertRaisesRegex(deploy.DeploymentError, "compatibility reconciliation was denied"):
+                deploy._deploy_stack(self.request, self.app)
+        registry.assert_not_called()
+        backup.assert_not_called()
+        self.assertEqual(json.loads(self.state.read_text(encoding="utf-8"))["active"], active)
+
+    def test_concurrent_release_state_change_is_preserved_and_stops_before_migration(self):
+        self._configure_v133_migration()
+        active, request_value, _, _, status = self._v153_compatibility_case()
+        self.request = request_value
+        self.app["single_backend_maintenance"] = True
+        self.state.write_text(json.dumps({"active": active, "previous": None}), encoding="utf-8")
+        concurrent_state = {"active": active, "previous": None, "external_change": "preserve"}
+
+        def mutate_state(*args):
+            self.state.write_text(json.dumps(concurrent_state), encoding="utf-8")
+            return "20261127-010203F"
+
+        with mock.patch.object(deploy, "_validate_database", return_value=status), \
+             mock.patch.object(deploy, "registry_session", return_value=contextlib.nullcontext({})), \
+             mock.patch.object(deploy, "run_command", return_value=subprocess.CompletedProcess([], 0, "", "")), \
+             mock.patch.object(deploy, "_verify_image"), mock.patch.object(deploy, "_verify_retained_stack_images"), \
+             mock.patch.object(deploy, "_verify_retained_migration_image"), mock.patch.object(deploy, "_stack_validate_network"), \
+             mock.patch.object(deploy, "_stack_route_content"), mock.patch.object(deploy, "_stack_release_healthy"), \
+             mock.patch.object(deploy, "_stack_route_healthy"), mock.patch.object(deploy, "_append_audit"), \
+             mock.patch.object(deploy, "_create_verified_production_backup", side_effect=mutate_state) as backup, \
+             mock.patch.object(deploy, "_stop_stack_backend") as stop, mock.patch.object(deploy, "_run_approved_migration") as migrate, \
+             mock.patch.object(deploy, "_restart_stack_backend") as restart:
+            with self.assertRaisesRegex(deploy.DeploymentError, "changed concurrently"):
+                deploy._deploy_stack(self.request, self.app)
+        backup.assert_called_once()
+        stop.assert_not_called()
+        migrate.assert_not_called()
+        restart.assert_not_called()
+        self.assertEqual(json.loads(self.state.read_text(encoding="utf-8")), concurrent_state)
+
     def test_migration_waits_for_backup_quiescence_and_a_fresh_pending_plan(self):
         self._configure_v133_migration()
         self.app["single_backend_maintenance"] = True
@@ -1220,12 +1548,13 @@ class StackDeploymentTests(unittest.TestCase):
              mock.patch.object(deploy, "_verify_image"), mock.patch.object(deploy, "_stack_release_healthy"), \
              mock.patch.object(deploy, "_create_verified_production_backup") as backup, \
              mock.patch.object(deploy, "_stop_stack_backend") as stop, \
-             mock.patch.object(deploy, "_restart_stack_backend") as restart, mock.patch.object(deploy, "_write_metrics"):
+             mock.patch.object(deploy, "_restart_stack_backend") as restart, \
+             mock.patch.object(deploy, "_append_audit"), mock.patch.object(deploy, "_write_metrics"):
             with self.assertRaisesRegex(deploy.DeploymentError, "migration source schema"):
                 deploy._deploy_stack(self.request, self.app)
         backup.assert_not_called()
         stop.assert_not_called()
-        restart.assert_called_once_with(self.app, active)
+        restart.assert_not_called()
 
     def test_unknown_migration_outcome_never_restarts_the_retained_backend(self):
         self._configure_v133_migration()

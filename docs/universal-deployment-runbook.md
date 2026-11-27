@@ -26,6 +26,18 @@ Use the app's explicit rollback action. The controller selects the retained rele
 
 Application rollback never reverses SQL. If schema migration status is unknown, keep writers stopped and route unchanged, preserve the backup/audit metadata, and use the database recovery process. Stateful service restoration must use that application's verified volume backup adapter; do not restore a live volume from an unverified archive.
 
+### Database version ahead of the retained release
+
+If a forward migration completed but candidate activation failed, and the retained release record is behind the validated Flyway history:
+
+1. Keep the current route and database in place. Do not rewrite the retained release's `schema_version`, edit Flyway history, or retry the same deployment without a diagnosed correction.
+2. Use the registered, provenance-verified migrator to validate the complete Flyway history and exact checksums. Confirm the intended pending plan and target release commit.
+3. Verify the retained release records and running container image digests, provenance, health, and route. Confirm the previous record is consistent when present.
+4. Proceed only when one exact root-owned `schema_compatibility_evidence` record matches the observed schema drift, applied migration bytes, pending migration set, retained release, and target release. The controller writes an auditable reconciliation decision and repeats database-plan and release-state checks after backup and writer quiescence. A previous-slot release record must match the reviewed identities and slot-specific container names; its containers can be absent after prior cleanup because only the active retained containers must be running and verified.
+5. Continue through the normal verified backup, migration, postflight, candidate-health, and traffic-switch gates. If evidence is missing or any check fails, stop and preserve the current route, release state, database, and recovery materials.
+
+Compatibility evidence is specific to a reviewed migration and release. A grant-only policy is not a general assertion that schema changes are backward-compatible. This recovery path does not restart the prior application after a forward migration; use a compatible fix-forward release or the approved database-recovery procedure if candidate startup fails.
+
 ## Monitoring and troubleshooting
 
 - `roman_platform_last_deployment_info`: last operation, result, run ID and request commit by app ID.
