@@ -2012,6 +2012,7 @@ def _bind_flyway_plan_checksums(
     env: dict[str, str] | None = None,
     *,
     artifact_sha256_out: dict[str, str] | None = None,
+    include_applied_artifacts: bool = False,
 ) -> str:
     try:
         report = json.loads(info_output)
@@ -2024,7 +2025,7 @@ def _bind_flyway_plan_checksums(
         for entry in report["migrations"]
     )
     checksums: dict[str, int] | None = None
-    if pending:
+    if pending or include_applied_artifacts:
         checksums, artifact_hashes = _flyway_image_artifacts(image, app, env)
         if artifact_sha256_out is not None:
             artifact_sha256_out.update(artifact_hashes)
@@ -2824,6 +2825,7 @@ def _validate_database(
     *,
     allow_pending_migration: bool = False,
     expected_plan: ForwardMigrationPlan | None = None,
+    include_migration_artifacts: bool = False,
 ) -> dict[str, Any]:
     local_release_image = False
     if "migration_image" not in request:
@@ -2903,6 +2905,7 @@ def _validate_database(
             app,
             env,
             artifact_sha256_out=artifact_sha256,
+            include_applied_artifacts=include_migration_artifacts,
         )
         max_pending = migration_policy["max_pending"] if migration_policy else 32
         allow_initial = migration_policy["allow_initial_schema"] if migration_policy else False
@@ -4045,14 +4048,33 @@ def _deploy_stack(request: dict[str, Any], app: dict[str, Any]) -> dict[str, Any
                 _verify_retained_migration_image(app, active)
                 reconciliation_event = _schema_reconciliation_event(app, evidence, active, validated_plan, request)
             else:
+                _assert_release_state_unchanged(state_path, state_snapshot)
+                recovery_status = _validate_database(
+                    request,
+                    app,
+                    include_migration_artifacts=True,
+                )
+                recovery_plan = _migration_plan_from_data(recovery_status["migration_plan"])
+                if (
+                    recovery_status.get("migration_pending")
+                    or recovery_plan.needs_migration
+                    or recovery_plan.source_version != validated_plan.source_version
+                    or recovery_plan.target_version != validated_plan.target_version
+                    or recovery_plan.fingerprint != validated_plan.fingerprint
+                    or recovery_plan.release_fingerprint != validated_plan.release_fingerprint
+                ):
+                    raise DeploymentError("Flyway history changed while the exact recovery migration artifacts were being verified.")
+                _assert_release_state_unchanged(state_path, state_snapshot)
                 activation_proof = _post_migration_activation_evidence(
                     app,
                     active,
                     previous,
-                    validated_plan,
-                    database_status.get("migration_artifact_sha256", {}),
+                    recovery_plan,
+                    recovery_status.get("migration_artifact_sha256", {}),
                     request,
                 )
+                validated_plan = recovery_plan
+                database_status = recovery_status
                 _verify_retained_stack_images(app, active)
                 _verify_retained_migration_image(app, active)
                 _verify_post_migration_retained_state(app, active)
@@ -4185,7 +4207,11 @@ def _deploy_stack(request: dict[str, Any], app: dict[str, Any]) -> dict[str, Any
             _assert_release_state_unchanged(state_path, state_snapshot)
             _assert_no_application_writers(app, env_values)
             failure_phase = "activation-database-recheck"
-            latest_database_status = _validate_database(request, app)
+            latest_database_status = _validate_database(
+                request,
+                app,
+                include_migration_artifacts=True,
+            )
             latest_plan = _migration_plan_from_data(latest_database_status["migration_plan"])
             if (
                 latest_database_status.get("migration_pending")

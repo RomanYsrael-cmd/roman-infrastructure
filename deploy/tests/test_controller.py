@@ -869,6 +869,53 @@ class FlywayMigrationPolicyTests(unittest.TestCase):
             result = deploy._validate_database(request_value, self.app, allow_pending_migration=True)
         self.assertFalse(result["migration_pending"])
 
+    def test_stable_schema_only_reads_applied_artifacts_when_recovery_requests_them(self):
+        entry = copy.deepcopy(self.pending_info["migrations"][0])
+        filename = entry["filepath"].rsplit("/", 1)[-1]
+        report = {
+            "schemaVersion": "132",
+            "flywayVersion": "11.14.1",
+            "schemaName": "roman_lms",
+            "warnings": None,
+            "migrations": [entry],
+        }
+        history = [{
+            "version": entry["version"],
+            "description": entry["description"],
+            "type": entry["type"],
+            "script": filename,
+            "success": True,
+            "checksum": entry["checksum"],
+        }]
+        image = "registry/migrator@sha256:" + DIGEST
+        hashes = {filename: "a" * 64}
+        with mock.patch.object(
+            deploy,
+            "_flyway_image_artifacts",
+            return_value=({filename: entry["checksum"]}, hashes),
+        ) as inspect_artifacts:
+            artifacts = {}
+            bound = deploy._bind_flyway_plan_checksums(
+                json.dumps(report),
+                json.dumps(history),
+                image,
+                self.app,
+                artifact_sha256_out=artifacts,
+                include_applied_artifacts=True,
+            )
+        inspect_artifacts.assert_called_once()
+        self.assertEqual(artifacts, hashes)
+        self.assertEqual(json.loads(bound)["migrations"][0]["checksum"], entry["checksum"])
+
+        with mock.patch.object(deploy, "_flyway_image_artifacts") as inspect_artifacts:
+            artifacts = {}
+            deploy._bind_flyway_plan_checksums(
+                json.dumps(report), json.dumps(history), image, self.app,
+                artifact_sha256_out=artifacts,
+            )
+        inspect_artifacts.assert_not_called()
+        self.assertEqual(artifacts, {})
+
     def test_database_preflight_never_runs_unapproved_flyway_commands(self):
         request_value = {"migration_image": "registry/migrator@sha256:" + DIGEST}
         args = deploy._flyway_container_args(request_value, self.app, Path("/safe/database.env"), "migrate", migration_plan=self.plan)
@@ -1414,7 +1461,12 @@ class StackDeploymentTests(unittest.TestCase):
             proof = deploy._post_migration_activation_evidence(
                 self.app, active, previous, plan, hashes, request_value,
             )
-        statuses = iter((status, status, status))
+        statuses = iter((status, status, status, status))
+        validation_calls = []
+
+        def validate(*args, **kwargs):
+            validation_calls.append(kwargs)
+            return next(statuses)
         commands = []
         audit_events = []
 
@@ -1429,7 +1481,7 @@ class StackDeploymentTests(unittest.TestCase):
         stop_backend = mock.patch.object(deploy, "_stop_stack_backend")
         restart_backend = mock.patch.object(deploy, "_restart_stack_backend")
         patchers = [
-            mock.patch.object(deploy, "_validate_database", side_effect=lambda *args, **kwargs: next(statuses)),
+            mock.patch.object(deploy, "_validate_database", side_effect=validate),
             mock.patch.object(deploy, "_post_migration_activation_evidence", return_value=proof),
             backup,
             mock.patch.object(deploy, "_assert_no_application_writers"),
@@ -1459,6 +1511,11 @@ class StackDeploymentTests(unittest.TestCase):
 
         backup_mock = mocks[2]
         backup_mock.assert_called_once_with(self.app, self.request, plan, allow_no_migration=True)
+        self.assertEqual(len(validation_calls), 4)
+        self.assertTrue(validation_calls[1].get("include_migration_artifacts"))
+        self.assertTrue(validation_calls[2].get("include_migration_artifacts"))
+        self.assertFalse(validation_calls[0].get("include_migration_artifacts", False))
+        self.assertFalse(validation_calls[3].get("include_migration_artifacts", False))
         stop_backend_mock = mocks[-2]
         restart_backend_mock = mocks[-1]
         stop_backend_mock.assert_not_called()
