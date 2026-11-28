@@ -946,6 +946,7 @@
       "deployment_profile": "full-stack",
       "strategy": "blue-green",
       "single_backend_maintenance": true,
+      "runtime_refresh_enabled": true,
       "automatic_workflow_event": "workflow_run",
       "automatic_release_enabled": false,
       "automatic_operations": [],
@@ -1015,12 +1016,14 @@
             "blue": {
               "SERVER_ADDRESS": "0.0.0.0",
               "PORT": "8081",
-              "SPRING_FLYWAY_ENABLED": "false"
+              "SPRING_FLYWAY_ENABLED": "false",
+              "CONTROL_PLANE_WORKER_ENABLED": "true"
             },
             "green": {
               "SERVER_ADDRESS": "0.0.0.0",
               "PORT": "8081",
-              "SPRING_FLYWAY_ENABLED": "false"
+              "SPRING_FLYWAY_ENABLED": "false",
+              "CONTROL_PLANE_WORKER_ENABLED": "true"
             }
           },
           "route_prefix": "/api/",
@@ -1122,6 +1125,7 @@
       "confirmation_phrases": {
         "deploy-stack": "DEPLOY ROMANLMS CONTROL PLANE",
         "rollback-stack": "ROLLBACK ROMANLMS CONTROL PLANE",
+        "refresh-stack": "REFRESH ROMANLMS CONTROL PLANE RUNTIME CONFIGURATION",
         "verify-stack": "VERIFY ROMANLMS CONTROL PLANE",
         "validate-database": "VALIDATE ROMANLMS CONTROL PLANE DATABASE"
       },

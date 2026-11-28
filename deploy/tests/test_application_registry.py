@@ -115,6 +115,20 @@ class ApplicationRegistryTests(unittest.TestCase):
                 self.assertIn(statement, policy)
         self.assertNotIn("GRANT pg_read_all_data TO roman_control_backup", policy)
 
+    def test_control_plane_delivery_worker_is_enabled_in_both_slots_and_refreshable(self):
+        app = self.platform["applications"]["romanlms-control-plane"]
+        self.assertTrue(app["runtime_refresh_enabled"])
+        self.assertEqual(
+            app["confirmation_phrases"]["refresh-stack"],
+            "REFRESH ROMANLMS CONTROL PLANE RUNTIME CONFIGURATION",
+        )
+        for slot in ("blue", "green"):
+            with self.subTest(slot=slot):
+                self.assertEqual(
+                    app["components"]["backend"]["container_environment_by_slot"][slot]["CONTROL_PLANE_WORKER_ENABLED"],
+                    "true",
+                )
+
     def test_rejects_build_only_application_that_can_be_deployed(self):
         app = copy.deepcopy(self.examples["applications"]["sample-build-only"])
         app["deployment_enabled"] = True
