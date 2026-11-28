@@ -7,7 +7,7 @@ Use this runbook after an application and its reusable workflow are registered a
 1. Check the server's installed controller SHA, root-owned `applications.json`, active release state, Docker and Nginx health, `/srv/apps` space, available RAM/CPU, existing routes and port bindings.
 2. Check the app registration, full reusable workflow SHA, caller workflow path, exact current source SHA, successful required CI, actor, image source labels, image digests, and GitHub OIDC provenance.
 3. For database-backed work, run the registered Flyway read-only preflight. Review the observed schema, pending file list, checksums, plan fingerprint, backup adapter, migration role and compatibility evidence before the operation can execute.
-4. If migrations are pending, verify a fresh recoverable backup and writer quiescence before execution. With no pending migrations, confirm that the controller skips the backup and writer stop.
+4. If migrations are pending, verify a fresh recoverable backup and writer quiescence before execution. Ordinary releases with no pending migrations skip the backup and writer stop; the audited post-migration activation recovery below is an explicit exception and takes a fresh full backup.
 5. Do not proceed if the controller and migrator are on incompatible revisions or if the live capacity/port/routing preflight fails.
 
 ## Deploy and verify
@@ -37,6 +37,10 @@ If a forward migration completed but candidate activation failed, and the retain
 5. Continue through the normal verified backup, migration, postflight, candidate-health, and traffic-switch gates. If evidence is missing or any check fails, stop and preserve the current route, release state, database, and recovery materials.
 
 Compatibility evidence is specific to a reviewed migration and release. A grant-only policy is not a general assertion that schema changes are backward-compatible. This recovery path does not restart the prior application after a forward migration; use a compatible fix-forward release or the approved database-recovery procedure if candidate startup fails.
+
+#### Resume activation after a verified migration
+
+When audit records show that Flyway and postflight validation succeeded but candidate activation failed, the controller can resume only the exact root-reviewed target release. It requires a fresh authorized workflow run, image provenance and CI, complete checksum validation against the current migrator, the intact historical reconciliation/backup/migration/failure chain, unchanged retained state and route, and a stopped retained backend. The retained frontend must still be healthy. The controller creates and verifies a new full backup at the already-migrated schema, confirms no application writers, rechecks Flyway and release state, and then starts both candidate components. It does not re-run migration or restart the prior backend on the advanced database. A failed candidate remains stopped and leaves the route/state on the retained slot. Any later migration, successful release, ambiguous audit history, unknown schema effect, or mismatched image/release identity blocks this path.
 
 ## Monitoring and troubleshooting
 

@@ -49,6 +49,7 @@ PROVENANCE_OPERATIONS = frozenset({
     "deploy", "deploy-service", "unhealthy-test", "validate-database",
     "deploy-stack", "test-stack",
 })
+VERIFIED_PROVENANCE_REQUEST_KEY = "_controller_verified_provenance_fingerprint"
 
 
 def _validate_romanlms_capacity_policy(app: dict[str, Any]) -> None:
@@ -107,6 +108,32 @@ def _provenance_image_map(request: dict[str, Any]) -> dict[str, str]:
     if operation in {"deploy-stack", "validate-database"} and request.get("migration_image"):
         images["migrator"] = request["migration_image"]
     return images
+
+
+def _release_provenance_fingerprint(request: dict[str, Any], app: dict[str, Any]) -> str | None:
+    if request.get("operation") not in PROVENANCE_OPERATIONS or app.get("provenance_mode") != "github-oidc":
+        return None
+    token = request.get("provenance_token")
+    if not isinstance(token, str):
+        raise DeploymentError("GitHub OIDC provenance token is unavailable.")
+    release = request.get("release")
+    if not isinstance(release, dict):
+        raise DeploymentError("Release identity is unavailable for provenance verification.")
+    return _canonical_json_sha256({
+        "token_sha256": hashlib.sha256(token.encode("ascii", errors="strict")).hexdigest(),
+        "operation": request.get("operation"),
+        "images": _provenance_image_map(request),
+        "build_spec_sha256": request.get("build_spec_sha256"),
+        "commit_sha": request.get("commit_sha"),
+        "workflow_sha": request.get("workflow_sha"),
+        "platform_sha": request.get("platform_sha"),
+        "run_id": release.get("run_id"),
+        "run_attempt": release.get("run_attempt"),
+        "release_mode": release.get("mode", "manual"),
+        "trigger_run_id": release.get("trigger_run_id"),
+        "trigger_run_attempt": release.get("trigger_run_attempt"),
+        "actor": release.get("actor"),
+    })
 
 
 def _secret(value: Any, name: str) -> str:
@@ -325,17 +352,28 @@ def verify_release_origin(request: dict[str, Any], app: dict[str, Any]) -> None:
     # Check the signed, image-bound identity as soon as the request reaches the
     # controller. The Actions token is short-lived; defer no signature, issuer,
     # audience, or claim checks until after the GitHub API and CI lookups below.
-    if request["operation"] in PROVENANCE_OPERATIONS and app.get("provenance_mode") == "github-oidc":
-        try:
-            verify_release_provenance(
-                request["provenance_token"],
-                request,
-                app,
-                _provenance_image_map(request),
-                request["build_spec_sha256"],
-            )
-        except ProvenanceError as exc:
-            raise DeploymentError(f"Image provenance verification failed: {exc}.") from exc
+    # Strict request validation rejects this controller-only marker from callers.
+    # Late release gates compare the same immutable request binding and still
+    # recheck the live GitHub run, branch, commit, and CI without reusing an expired JWT.
+    provenance_fingerprint = _release_provenance_fingerprint(request, app)
+    if provenance_fingerprint is not None:
+        internal_binding = request.get(VERIFIED_PROVENANCE_REQUEST_KEY)
+        if internal_binding is None:
+            try:
+                verify_release_provenance(
+                    request["provenance_token"],
+                    request,
+                    app,
+                    _provenance_image_map(request),
+                    request["build_spec_sha256"],
+                )
+            except ProvenanceError as exc:
+                raise DeploymentError(f"Image provenance verification failed: {exc}.") from exc
+            request[VERIFIED_PROVENANCE_REQUEST_KEY] = provenance_fingerprint
+        elif internal_binding != provenance_fingerprint:
+            raise DeploymentError("The immutable release request changed after its OIDC provenance was verified.")
+    elif VERIFIED_PROVENANCE_REQUEST_KEY in request:
+        raise DeploymentError("The release operation changed after its OIDC provenance was verified.")
 
     run_id = request["release"]["run_id"]
     run = github_json(
@@ -2554,10 +2592,20 @@ def _create_verified_production_backup(
     app: dict[str, Any],
     request: dict[str, Any],
     plan: ForwardMigrationPlan,
+    *,
+    allow_no_migration: bool = False,
 ) -> str:
     policy = _schema_migration_policy(app)
-    if policy is None or not plan.needs_migration:
-        raise DeploymentError("No production migration is approved for this application.")
+    if policy is None or (
+        not plan.needs_migration
+        and not (
+            allow_no_migration
+            and plan.source_version is not None
+            and plan.source_version == plan.target_version
+            and not plan.pending
+        )
+    ):
+        raise DeploymentError("No production backup is approved for this application state.")
     if app.get("database", {}).get("backup_adapter") == "verified-dump":
         env_file = _secure_env_file(app.get("database_env_file"))
         runtime_values = _env_file_values(env_file)
@@ -3389,6 +3437,63 @@ def _switch_stack_route(app: dict[str, Any], slot: str) -> None:
         raise
 
 
+def _verify_schema_compatibility_retained_release(
+    app: dict[str, Any],
+    evidence: dict[str, Any],
+    active: dict[str, Any],
+    previous: dict[str, Any] | None,
+) -> None:
+    retained = evidence["retained_release"]
+    if (
+        active.get("app_id") != app.get("app_id")
+        or active.get("schema_version") != evidence["recorded_schema_version"]
+        or active.get("commit_sha") != retained["commit_sha"]
+        or active.get("platform_sha") != retained["platform_sha"]
+        or active.get("migration_image") != retained["migration_image"]
+        or active.get("slot") not in {"blue", "green"}
+        or not isinstance(active.get("components"), dict)
+        or set(active["components"]) != set(retained["components"])
+    ):
+        raise DeploymentError("The active release record does not match the reviewed immutable release identity.")
+    for name, expected_image in retained["components"].items():
+        component = active["components"].get(name)
+        component_app = _stack_component_app(app, name)
+        if (
+            not isinstance(component, dict)
+            or component.get("slot") != active["slot"]
+            or component.get("commit_sha") != retained["commit_sha"]
+            or component.get("image") != expected_image
+            or component.get("container") != _container_name(component_app, active["slot"], retained["commit_sha"])
+        ):
+            raise DeploymentError("A retained component record does not match its reviewed image digest.")
+
+    if previous is not None:
+        if (
+            not isinstance(previous, dict)
+            or previous.get("app_id") != app.get("app_id")
+            or previous.get("schema_version") != evidence["recorded_schema_version"]
+            or previous.get("commit_sha") != retained["commit_sha"]
+            or previous.get("platform_sha") != retained["platform_sha"]
+            or previous.get("migration_image") != retained["migration_image"]
+            or previous.get("slot") not in {"blue", "green"}
+            or previous.get("slot") == active["slot"]
+            or not isinstance(previous.get("components"), dict)
+            or set(previous["components"]) != set(retained["components"])
+        ):
+            raise DeploymentError("The previous release record is inconsistent with the reviewed retained release.")
+        for name, expected_image in retained["components"].items():
+            component = previous["components"].get(name)
+            component_app = _stack_component_app(app, name)
+            if (
+                not isinstance(component, dict)
+                or component.get("slot") != previous["slot"]
+                or component.get("commit_sha") != retained["commit_sha"]
+                or component.get("image") != expected_image
+                or component.get("container") != _container_name(component_app, previous["slot"], retained["commit_sha"])
+            ):
+                raise DeploymentError("A previous component record does not match its reviewed image digest.")
+
+
 def _schema_compatibility_match(
     app: dict[str, Any],
     active: dict[str, Any],
@@ -3452,55 +3557,349 @@ def _schema_compatibility_match(
         ):
             raise DeploymentError("The pending migration identity or immutable release content differs from approval.")
 
-    retained = evidence["retained_release"]
-    if (
-        active.get("app_id") != app.get("app_id")
-        or active.get("commit_sha") != retained["commit_sha"]
-        or active.get("platform_sha") != retained["platform_sha"]
-        or active.get("migration_image") != retained["migration_image"]
-        or active.get("slot") not in {"blue", "green"}
-        or not isinstance(active.get("components"), dict)
-        or set(active["components"]) != set(retained["components"])
-    ):
-        raise DeploymentError("The active release record does not match the reviewed immutable release identity.")
-    for name, expected_image in retained["components"].items():
-        component = active["components"].get(name)
-        component_app = _stack_component_app(app, name)
-        if (
-            not isinstance(component, dict)
-            or component.get("slot") != active["slot"]
-            or component.get("commit_sha") != retained["commit_sha"]
-            or component.get("image") != expected_image
-            or component.get("container") != _container_name(component_app, active["slot"], retained["commit_sha"])
-        ):
-            raise DeploymentError("A retained component record does not match its reviewed image digest.")
-
-    if previous is not None:
-        if (
-            not isinstance(previous, dict)
-            or previous.get("app_id") != app.get("app_id")
-            or previous.get("schema_version") != evidence["recorded_schema_version"]
-            or previous.get("commit_sha") != retained["commit_sha"]
-            or previous.get("platform_sha") != retained["platform_sha"]
-            or previous.get("migration_image") != retained["migration_image"]
-            or previous.get("slot") not in {"blue", "green"}
-            or previous.get("slot") == active["slot"]
-            or not isinstance(previous.get("components"), dict)
-            or set(previous["components"]) != set(retained["components"])
-        ):
-            raise DeploymentError("The previous release record is inconsistent with the reviewed retained release.")
-        for name, expected_image in retained["components"].items():
-            component = previous["components"].get(name)
-            component_app = _stack_component_app(app, name)
-            if (
-                not isinstance(component, dict)
-                or component.get("slot") != previous["slot"]
-                or component.get("commit_sha") != retained["commit_sha"]
-                or component.get("image") != expected_image
-                or component.get("container") != _container_name(component_app, previous["slot"], retained["commit_sha"])
-            ):
-                raise DeploymentError("A previous component record does not match its reviewed image digest.")
+    _verify_schema_compatibility_retained_release(app, evidence, active, previous)
     return evidence
+
+
+def _read_deployment_audit_events(app: dict[str, Any]) -> list[dict[str, Any]]:
+    path = Path(app["history_file"])
+    try:
+        metadata = path.lstat()
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or stat.S_ISLNK(metadata.st_mode)
+            or metadata.st_size > 128 * 1024 * 1024
+            or metadata.st_mode & 0o022
+            or (hasattr(metadata, "st_uid") and metadata.st_uid != 0)
+        ):
+            raise DeploymentError("The root-owned deployment audit history is unsafe or exceeds its recovery limit.")
+        events: list[dict[str, Any]] = []
+        with path.open("r", encoding="utf-8") as stream:
+            for line in stream:
+                value = json.loads(line)
+                if not isinstance(value, dict):
+                    raise DeploymentError("The deployment audit history contains a malformed event.")
+                events.append(value)
+    except DeploymentError:
+        raise
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise DeploymentError("The deployment audit history is unavailable or malformed.") from exc
+    return events
+
+
+def _version_tuple_for_recovery(value: str) -> tuple[int, ...]:
+    if not isinstance(value, str) or not re.fullmatch(r"(?:0|[1-9][0-9]*)(?:\.(?:0|[1-9][0-9]*))*", value):
+        raise DeploymentError("The reviewed migration version is invalid.")
+    return tuple(int(part) for part in value.split("."))
+
+
+def _post_migration_activation_evidence(
+    app: dict[str, Any],
+    active: dict[str, Any],
+    previous: dict[str, Any] | None,
+    plan: ForwardMigrationPlan,
+    artifact_sha256: dict[str, str],
+    request: dict[str, Any],
+) -> dict[str, Any]:
+    """Prove a failed activation followed an exact, verified forward migration."""
+    if (
+        request.get("operation") != "deploy-stack"
+        or plan.needs_migration
+        or plan.source_version is None
+        or plan.source_version != plan.target_version
+        or active.get("schema_version") == plan.source_version
+    ):
+        raise DeploymentError("Post-migration activation requires a stable, fully applied target schema.")
+
+    candidates = [
+        evidence for evidence in app.get("schema_compatibility_evidence", [])
+        if isinstance(evidence, dict)
+        and evidence.get("recorded_schema_version") == active.get("schema_version")
+        and evidence.get("target_schema_version") == plan.source_version
+        and evidence.get("target_commit_sha") == request.get("commit_sha")
+        and evidence.get("target_platform_sha") == request.get("platform_sha")
+    ]
+    if len(candidates) != 1:
+        raise DeploymentError("No unique root-owned evidence authorizes activation for the observed forward schema.")
+    evidence = candidates[0]
+    if evidence.get("effect") != "grant-only":
+        raise DeploymentError("Post-migration activation is limited to the reviewed grant-only migration chain.")
+
+    observed_parts = _version_tuple_for_recovery(evidence["observed_schema_version"])
+    target_parts = _version_tuple_for_recovery(evidence["target_schema_version"])
+    if _version_tuple_for_recovery(plan.source_version) != target_parts:
+        raise DeploymentError("The actual database version does not match the reviewed migration target.")
+
+    approved_migrations = [evidence["applied_migration"], *evidence["pending_migrations"]]
+    for expected in approved_migrations:
+        rows = [row for row in plan.history if len(row) == 7 and row[3] == expected["version"]]
+        if len(rows) != 1:
+            raise DeploymentError("The current Flyway history does not contain exactly one approved migration identity.")
+        row = rows[0]
+        migration_match = re.fullmatch(r"V[0-9]+(?:[._][0-9]+)*__(.*)\.sql", expected["script"])
+        if migration_match is None or (
+            row[0] != "Success"
+            or row[1] != "Versioned"
+            or row[2] != "SQL"
+            or row[4] != re.sub(r"[ _]+", " ", migration_match.group(1))
+            or row[5] != f"/flyway/sql/{expected['script']}"
+            or row[6] != expected["checksum"]
+            or artifact_sha256.get(expected["script"]) != expected["sha256"]
+        ):
+            raise DeploymentError("The current Flyway migration history or SQL artifact differs from root-owned evidence.")
+
+    actual_forward_versions = []
+    for row in plan.history:
+        if len(row) != 7 or row[0] != "Success" or row[1] != "Versioned" or row[2] != "SQL":
+            continue
+        version_parts = _version_tuple_for_recovery(row[3])
+        if observed_parts < version_parts <= target_parts:
+            actual_forward_versions.append(row[3])
+    expected_forward_versions = [item["version"] for item in evidence["pending_migrations"]]
+    if actual_forward_versions != expected_forward_versions:
+        raise DeploymentError("Unexpected applied migrations exist in the forward activation interval.")
+
+    _verify_schema_compatibility_retained_release(app, evidence, active, previous)
+    events = _read_deployment_audit_events(app)
+    reconciliations = [
+        (index, event) for index, event in enumerate(events)
+        if event.get("operation") == "schema-reconciliation"
+        and event.get("outcome") == "verified-compatible"
+        and event.get("evidence_id") == evidence["id"]
+        and event.get("recorded_schema_version") == evidence["recorded_schema_version"]
+        and event.get("observed_schema_version") == evidence["observed_schema_version"]
+        and event.get("target_schema_version") == evidence["target_schema_version"]
+        and event.get("target_commit_sha") == request.get("commit_sha")
+        and event.get("target_platform_sha") == request.get("platform_sha")
+        and isinstance(event.get("reconciliation_id"), str)
+    ]
+    if len(reconciliations) != 1:
+        raise DeploymentError("A unique prior audited schema reconciliation is required for activation recovery.")
+    reconciliation_index, reconciliation = reconciliations[0]
+    expected_reconciliation_id = reconciliation["reconciliation_id"]
+    identity = {key: value for key, value in reconciliation.items() if key not in {"timestamp", "reconciliation_id"}}
+    if _canonical_json_sha256(identity) != expected_reconciliation_id:
+        raise DeploymentError("The prior schema reconciliation audit record failed its integrity check.")
+
+    migrations = [
+        (index, event) for index, event in enumerate(events)
+        if event.get("operation") == "database-migration"
+        and event.get("outcome") == "verified"
+        and event.get("commit_sha") == request.get("commit_sha")
+        and event.get("schema_source_version") == evidence["observed_schema_version"]
+        and event.get("schema_target_version") == evidence["target_schema_version"]
+        and event.get("schema_reconciliation_id") == expected_reconciliation_id
+        and event.get("migration_plan_fingerprint") == reconciliation.get("migration_plan_fingerprint")
+        and event.get("release_binding_fingerprint") == reconciliation.get("release_binding_fingerprint")
+    ]
+    if len(migrations) != 1:
+        raise DeploymentError("A unique successful audited migration is required for activation recovery.")
+    migration_index, migration = migrations[0]
+    migration_run_id = migration.get("workflow_run_id")
+    if (
+        not isinstance(migration_run_id, str)
+        or migration_run_id != reconciliation.get("workflow_run_id")
+        or migration_index <= reconciliation_index
+    ):
+        raise DeploymentError("The successful migration is not linked to the prior compatibility reconciliation.")
+
+    expected_pending_identity = [
+        {key: item[key] for key in ("version", "script", "checksum")}
+        for item in evidence["pending_migrations"]
+    ]
+
+    def migration_audit_pending_matches(event: dict[str, Any]) -> bool:
+        pending = event.get("pending_migrations")
+        if not isinstance(pending, list):
+            return False
+        try:
+            actual = [{key: item[key] for key in ("version", "script", "checksum")} for item in pending]
+        except (KeyError, TypeError):
+            return False
+        return actual == expected_pending_identity
+
+    if migration.get("pending_migrations") != [item["version"] for item in evidence["pending_migrations"]]:
+        raise DeploymentError("The audited migration target differs from root-owned forward-compatibility evidence.")
+
+    def migration_audit_run_attempt_matches(event: dict[str, Any]) -> bool:
+        attempt = event.get("workflow_run_attempt")
+        expected_attempt = reconciliation.get("workflow_run_attempt")
+        return (
+            isinstance(attempt, (str, int))
+            and not isinstance(attempt, bool)
+            and str(attempt) == str(expected_attempt)
+            and event.get("actor") == reconciliation.get("actor")
+        )
+
+    starts = [
+        (index, event) for index, event in enumerate(events)
+        if event.get("operation") == "database-migration"
+        and event.get("outcome") == "started"
+        and event.get("workflow_run_id") == migration_run_id
+        and event.get("commit_sha") == request.get("commit_sha")
+        and event.get("migration_plan_fingerprint") == migration.get("migration_plan_fingerprint")
+        and event.get("schema_source_version") == migration.get("schema_source_version")
+        and event.get("schema_target_version") == migration.get("schema_target_version")
+        and event.get("migration_image") == reconciliation.get("migration_image")
+        and migration_audit_pending_matches(event)
+        and migration_audit_run_attempt_matches(event)
+    ]
+    migration_successes = [
+        (index, event) for index, event in enumerate(events)
+        if event.get("operation") == "database-migration"
+        and event.get("outcome") == "success"
+        and event.get("workflow_run_id") == migration_run_id
+        and event.get("commit_sha") == request.get("commit_sha")
+        and event.get("schema_source_version") == migration.get("schema_source_version")
+        and event.get("schema_target_version") == migration.get("schema_target_version")
+        and event.get("migration_plan_fingerprint") == migration.get("migration_plan_fingerprint")
+        and event.get("release_binding_fingerprint") == migration.get("release_binding_fingerprint")
+        and event.get("migration_image") == reconciliation.get("migration_image")
+        and migration_audit_pending_matches(event)
+        and migration_audit_run_attempt_matches(event)
+    ]
+    backups = [
+        (index, event) for index, event in enumerate(events)
+        if event.get("operation") == "database-backup"
+        and event.get("outcome") == "success"
+        and event.get("workflow_run_id") == migration_run_id
+        and event.get("commit_sha") == request.get("commit_sha")
+        and event.get("backup_type") == "full"
+        and event.get("schema_source_version") == migration.get("schema_source_version")
+        and event.get("schema_target_version") == migration.get("schema_target_version")
+        and event.get("migration_plan_fingerprint") == migration.get("migration_plan_fingerprint")
+        and event.get("pending_migrations") == [item["version"] for item in evidence["pending_migrations"]]
+        and event.get("backup_label") == migration.get("backup_label")
+    ]
+    if len(starts) != 1 or len(migration_successes) != 1 or len(backups) != 1 or migration.get("backup_label") is None:
+        raise DeploymentError("The prior migration lacks one matching successful backup and migration-start audit chain.")
+    if not (reconciliation_index < backups[0][0] < starts[0][0] < migration_successes[0][0] < migration_index):
+        raise DeploymentError("The prior backup and migration audit sequence is inconsistent.")
+
+    deploy_starts = [
+        (index, event) for index, event in enumerate(events)
+        if event.get("operation") == "deploy-stack"
+        and event.get("outcome") == "started"
+        and event.get("workflow_run_id") == migration_run_id
+        and event.get("commit_sha") == request.get("commit_sha")
+        and event.get("platform_sha") == request.get("platform_sha")
+        and event.get("schema_reconciliation_id") == expected_reconciliation_id
+        and event.get("images") == reconciliation.get("target_images")
+    ]
+    failures = [
+        (index, event) for index, event in enumerate(events)
+        if event.get("operation") == "deploy-stack"
+        and event.get("outcome") == "failure"
+        and event.get("workflow_run_id") == migration_run_id
+        and event.get("commit_sha") == request.get("commit_sha")
+    ]
+    if len(deploy_starts) != 1 or len(failures) != 1 or not (migration_index < deploy_starts[0][0] < failures[0][0]):
+        raise DeploymentError("The audit trail does not prove a failed activation after the successful migration.")
+    if any(
+        event.get("operation") == "database-migration"
+        for event in events[migration_index + 1:failures[0][0]]
+    ):
+        raise DeploymentError("An additional migration attempt occurred after the verified schema transition.")
+    failure_message = failures[0][1].get("error", "")
+    if not isinstance(failure_message, str) or "migrated forward" not in failure_message.lower():
+        raise DeploymentError("The audited release failure does not match the post-migration stop condition.")
+
+    # Permit retries only when every intervening state-changing attempt was a
+    # failed activation of this same reviewed target; any migration or release
+    # success supersedes the recovery evidence.
+    for index in range(failures[0][0] + 1, len(events)):
+        event = events[index]
+        operation = event.get("operation")
+        outcome = event.get("outcome")
+        if operation in {"database-migration", "rollback", "rollback-service", "rollback-stack", "refresh-stack", "deploy", "deploy-service"}:
+            raise DeploymentError("A later production mutation supersedes the failed-migration activation evidence.")
+        if operation == "deploy-stack":
+            if event.get("commit_sha") != request.get("commit_sha"):
+                raise DeploymentError("A later application release supersedes the failed-migration activation evidence.")
+            if outcome == "success":
+                raise DeploymentError("A later successful release supersedes the failed-migration activation evidence.")
+            if outcome not in {"started", "failure", "candidate-failed", "active-readiness-failed"}:
+                raise DeploymentError("A later activation attempt has an unrecognized audit outcome.")
+            if outcome == "started":
+                run_id = event.get("workflow_run_id")
+                completions = [later for later in events[index + 1:] if later.get("operation") == "deploy-stack" and later.get("workflow_run_id") == run_id and later.get("commit_sha") == request.get("commit_sha") and later.get("outcome") == "failure"]
+                if len(completions) != 1:
+                    raise DeploymentError("A later activation attempt has no unique audited failure completion.")
+
+    return {
+        "evidence": evidence,
+        "reconciliation": reconciliation,
+        "migration": migration,
+        "migration_run_id": migration_run_id,
+        "failed_activation_run_id": migration_run_id,
+    }
+
+
+def _schema_activation_recovery_event(
+    app: dict[str, Any],
+    proof: dict[str, Any],
+    active: dict[str, Any],
+    plan: ForwardMigrationPlan,
+    request: dict[str, Any],
+) -> dict[str, Any]:
+    release = request["release"]
+    record = {
+        "operation": "schema-activation-recovery",
+        "outcome": "verified-compatible",
+        "evidence_id": proof["evidence"]["id"],
+        "prior_reconciliation_id": proof["reconciliation"]["reconciliation_id"],
+        "prior_migration_run_id": proof["migration_run_id"],
+        "prior_failed_activation_run_id": proof["failed_activation_run_id"],
+        "recorded_schema_version": active["schema_version"],
+        "observed_schema_version": proof["evidence"]["observed_schema_version"],
+        "target_schema_version": proof["evidence"]["target_schema_version"],
+        "current_schema_version": plan.source_version,
+        "prior_migration_plan_fingerprint": proof["migration"]["migration_plan_fingerprint"],
+        "current_migration_plan_fingerprint": plan.fingerprint,
+        "retained_commit_sha": active["commit_sha"],
+        "target_commit_sha": request["commit_sha"],
+        "target_platform_sha": request["platform_sha"],
+        "target_images": request["images"],
+        "migration_image": request["migration_image"],
+        "workflow_run_id": release["run_id"],
+        "workflow_run_attempt": release["run_attempt"],
+        "actor": release["actor"],
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    identity = {key: value for key, value in record.items() if key != "timestamp"}
+    record["recovery_id"] = _canonical_json_sha256(identity)
+    return record
+
+
+def _verify_post_migration_retained_state(app: dict[str, Any], active: dict[str, Any]) -> None:
+    if app.get("single_backend_maintenance") is not True:
+        raise DeploymentError("Post-migration activation requires the approved single-backend maintenance policy.")
+    components = active.get("components")
+    if not isinstance(components, dict) or set(components) != set(app.get("components", {})):
+        raise DeploymentError("The retained release component set is incomplete for activation recovery.")
+    for name, record in components.items():
+        if not isinstance(record, dict) or not _release_container_available(_stack_component_app(app, name), record):
+            raise DeploymentError("The retained release container identity is unavailable for activation recovery.")
+        inspected = run_command(
+            ["docker", "inspect", "--format", "{{.State.Running}}|{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}", record["container"]],
+            timeout=15,
+        )
+        running, separator, health = inspected.stdout.strip().partition("|")
+        if not separator:
+            raise DeploymentError("The retained release container state could not be verified.")
+        if name == "backend":
+            if running.strip().lower() != "false":
+                raise DeploymentError("The retained backend must remain stopped after the forward migration.")
+        elif running.strip().lower() != "true" or health.strip().lower() != "healthy":
+            raise DeploymentError("A retained non-backend component is not healthy for activation recovery.")
+
+    route_path = Path(app["route_file"])
+    try:
+        route = route_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise DeploymentError("The retained production route is unavailable for activation recovery.") from exc
+    if route != _stack_route_content(app["components"], active["slot"]):
+        raise DeploymentError("The production route no longer points at the audited retained release.")
 
 
 def _verify_retained_migration_image(app: dict[str, Any], release: dict[str, Any]) -> None:
@@ -3583,7 +3982,7 @@ def _assert_release_state_unchanged(state_path: Path, expected: bytes | None) ->
     except OSError as exc:
         raise DeploymentError("Application release state could not be rechecked safely.") from exc
     if current != expected:
-        raise DeploymentError("Application release state changed during deployment; no migration was run.")
+        raise DeploymentError("Application release state changed during deployment; the operation was aborted.")
 
 
 def _deploy_stack(request: dict[str, Any], app: dict[str, Any]) -> dict[str, Any]:
@@ -3626,25 +4025,40 @@ def _deploy_stack(request: dict[str, Any], app: dict[str, Any]) -> dict[str, Any
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             })
     reconciliation_event: dict[str, Any] | None = None
+    activation_proof: dict[str, Any] | None = None
+    activation_recovery_event: dict[str, Any] | None = None
     if active and active.get("schema_version") != validated_plan.source_version:
         try:
-            if not active_health_verified:
-                raise DeploymentError("The retained application must pass readiness before compatibility can be considered.")
-            evidence = _schema_compatibility_match(
-                app,
-                active,
-                previous,
-                validated_plan,
-                database_status.get("migration_artifact_sha256", {}),
-                request,
-            )
-            _stack_route_healthy(app)
-            _verify_retained_stack_images(app, active)
-            _verify_retained_migration_image(app, active)
-            reconciliation_event = _schema_reconciliation_event(app, evidence, active, validated_plan, request)
+            if validated_plan.needs_migration:
+                if not active_health_verified:
+                    raise DeploymentError("The retained application must pass readiness before compatibility can be considered.")
+                evidence = _schema_compatibility_match(
+                    app,
+                    active,
+                    previous,
+                    validated_plan,
+                    database_status.get("migration_artifact_sha256", {}),
+                    request,
+                )
+                _stack_route_healthy(app)
+                _verify_retained_stack_images(app, active)
+                _verify_retained_migration_image(app, active)
+                reconciliation_event = _schema_reconciliation_event(app, evidence, active, validated_plan, request)
+            else:
+                activation_proof = _post_migration_activation_evidence(
+                    app,
+                    active,
+                    previous,
+                    validated_plan,
+                    database_status.get("migration_artifact_sha256", {}),
+                    request,
+                )
+                _verify_retained_stack_images(app, active)
+                _verify_retained_migration_image(app, active)
+                _verify_post_migration_retained_state(app, active)
         except DeploymentError as exc:
             _append_audit(app, {
-                "operation": "schema-reconciliation",
+                "operation": "schema-reconciliation" if validated_plan.needs_migration else "schema-activation-recovery",
                 "outcome": "denied",
                 "recorded_schema_version": active.get("schema_version"),
                 "observed_schema_version": validated_plan.source_version,
@@ -3661,8 +4075,11 @@ def _deploy_stack(request: dict[str, Any], app: dict[str, Any]) -> dict[str, Any
                 "error": str(exc)[:200],
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             })
-            raise DeploymentError("The retained application release does not match the observed migration source schema; compatibility reconciliation was denied.") from exc
-        _append_audit(app, reconciliation_event)
+            if validated_plan.needs_migration:
+                raise DeploymentError("The retained application release does not match the observed migration source schema; compatibility reconciliation was denied.") from exc
+            raise DeploymentError("The prior verified migration does not authorize this forward activation; recovery was denied.") from exc
+        if reconciliation_event is not None:
+            _append_audit(app, reconciliation_event)
     slot = "green" if active and active["slot"] == "blue" else "blue"
     # Validate the entire route before pulling images or disturbing retained containers.
     _stack_validate_network(app)
@@ -3678,10 +4095,13 @@ def _deploy_stack(request: dict[str, Any], app: dict[str, Any]) -> dict[str, Any
     prior_state = state_snapshot.decode("utf-8") if state_snapshot is not None else None
     started_names: list[str] = []
     route_switched = False
+    controller_state_snapshot = state_snapshot
+    forward_activation = activation_proof is not None
     backend_maintenance = app.get("single_backend_maintenance") is True and active is not None
     records: dict[str, Any] = {}
     migration_started = False
     state_written_by_controller = False
+    failure_phase = "pre-candidate"
     try:
         if validated_plan.needs_migration:
             if app.get("single_backend_maintenance") is not True:
@@ -3748,7 +4168,66 @@ def _deploy_stack(request: dict[str, Any], app: dict[str, Any]) -> dict[str, Any
                 "schema_reconciliation_id": reconciliation_event.get("reconciliation_id") if reconciliation_event else None,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             })
-        _append_audit(app, {"operation": "deploy-stack", "outcome": "started", "commit_sha": request["commit_sha"], "images": request["images"], "platform_sha": request["platform_sha"], "slot": slot, "workflow_run_id": request["release"]["run_id"], "actor": request["release"]["actor"], "schema_reconciliation_id": reconciliation_event.get("reconciliation_id") if reconciliation_event else None, "timestamp": datetime.now(timezone.utc).isoformat()})
+        elif forward_activation:
+            if _schema_migration_policy(app) is None:
+                raise DeploymentError("No production backup adapter is approved for post-migration activation.")
+            _assert_release_state_unchanged(state_path, state_snapshot)
+            env_file = _secure_env_file(app.get("database_env_file"))
+            env_values = _env_file_values(env_file)
+            _assert_no_application_writers(app, env_values)
+            failure_phase = "activation-backup"
+            backup_label = _create_verified_production_backup(
+                app,
+                request,
+                validated_plan,
+                allow_no_migration=True,
+            )
+            _assert_release_state_unchanged(state_path, state_snapshot)
+            _assert_no_application_writers(app, env_values)
+            failure_phase = "activation-database-recheck"
+            latest_database_status = _validate_database(request, app)
+            latest_plan = _migration_plan_from_data(latest_database_status["migration_plan"])
+            if (
+                latest_database_status.get("migration_pending")
+                or latest_database_status.get("schema_version") != validated_plan.target_version
+                or latest_plan.fingerprint != validated_plan.fingerprint
+                or latest_plan.release_fingerprint != validated_plan.release_fingerprint
+            ):
+                raise DeploymentError("The forward-migrated database changed after backup; candidate startup was denied.")
+            _assert_release_state_unchanged(state_path, state_snapshot)
+            activation_proof = _post_migration_activation_evidence(
+                app,
+                active,
+                previous,
+                latest_plan,
+                latest_database_status.get("migration_artifact_sha256", {}),
+                request,
+            )
+            _verify_retained_stack_images(app, active)
+            _verify_retained_migration_image(app, active)
+            _verify_post_migration_retained_state(app, active)
+            database_status = latest_database_status
+            activation_recovery_event = _schema_activation_recovery_event(
+                app,
+                activation_proof,
+                active,
+                latest_plan,
+                request,
+            )
+            _append_audit(app, activation_recovery_event)
+        _append_audit(app, {
+            "operation": "deploy-stack",
+            "outcome": "started",
+            "commit_sha": request["commit_sha"],
+            "images": request["images"],
+            "platform_sha": request["platform_sha"],
+            "slot": slot,
+            "workflow_run_id": request["release"]["run_id"],
+            "actor": request["release"]["actor"],
+            "schema_reconciliation_id": reconciliation_event.get("reconciliation_id") if reconciliation_event else None,
+            "schema_activation_recovery_id": activation_recovery_event.get("recovery_id") if activation_recovery_event else None,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        })
         if state.get("previous"):
             # The candidate reuses the retained slot. Clear the pointer before removing
             # anything so an interrupted cleanup cannot advertise a nonexistent rollback.
@@ -3756,11 +4235,12 @@ def _deploy_stack(request: dict[str, Any], app: dict[str, Any]) -> dict[str, Any
             require_storage_mounts(app)
             state_written_by_controller = True
             _atomic_write(state_path, json.dumps(state, indent=2, sort_keys=True) + "\n")
+            controller_state_snapshot = state_path.read_bytes()
         component_order = sorted(app["components"])
         if app.get("single_backend_maintenance") is True:
             component_order.sort(key=lambda name: (name == "backend", name))
         for name in component_order:
-            if name == "backend" and backend_maintenance and not validated_plan.needs_migration:
+            if name == "backend" and backend_maintenance and not validated_plan.needs_migration and not forward_activation:
                 _stop_stack_backend(app, active)
             if name == "backend" and app.get("single_backend_maintenance") is True:
                 _check_backend_start_memory(app)
@@ -3783,7 +4263,9 @@ def _deploy_stack(request: dict[str, Any], app: dict[str, Any]) -> dict[str, Any
             "components": records,
             "deployed_at": datetime.now(timezone.utc).isoformat(),
         }
+        failure_phase = "candidate-readiness"
         _stack_release_healthy(app, release)
+        failure_phase = "final-release-verification"
         verify_release_origin(request, app)
         if not validated_plan.needs_migration:
             # App-only releases do not stop writers or create a database backup,
@@ -3797,6 +4279,8 @@ def _deploy_stack(request: dict[str, Any], app: dict[str, Any]) -> dict[str, Any
             ):
                 raise DeploymentError("Database migration history changed during the application rollout; traffic was not switched.")
             database_status = latest_database_status
+        _assert_release_state_unchanged(state_path, controller_state_snapshot)
+        failure_phase = "route-switch"
         _switch_stack_route(app, slot)
         route_switched = True
         previous_release = active
@@ -3808,7 +4292,19 @@ def _deploy_stack(request: dict[str, Any], app: dict[str, Any]) -> dict[str, Any
         require_storage_mounts(app)
         state_written_by_controller = True
         _atomic_write(state_path, json.dumps(new_state, indent=2, sort_keys=True) + "\n")
-        _append_audit(app, {"operation": "deploy-stack", "outcome": "success", "commit_sha": request["commit_sha"], "images": request["images"], "platform_sha": request["platform_sha"], "slot": slot, "workflow_run_id": request["release"]["run_id"], "actor": request["release"]["actor"], "schema_reconciliation_id": reconciliation_event.get("reconciliation_id") if reconciliation_event else None, "timestamp": release["deployed_at"]})
+        _append_audit(app, {
+            "operation": "deploy-stack",
+            "outcome": "success",
+            "commit_sha": request["commit_sha"],
+            "images": request["images"],
+            "platform_sha": request["platform_sha"],
+            "slot": slot,
+            "workflow_run_id": request["release"]["run_id"],
+            "actor": request["release"]["actor"],
+            "schema_reconciliation_id": reconciliation_event.get("reconciliation_id") if reconciliation_event else None,
+            "schema_activation_recovery_id": activation_recovery_event.get("recovery_id") if activation_recovery_event else None,
+            "timestamp": release["deployed_at"],
+        })
     except Exception as deployment_exc:
         if route_switched:
             _atomic_write(route_path, prior_route)
@@ -3828,8 +4324,23 @@ def _deploy_stack(request: dict[str, Any], app: dict[str, Any]) -> dict[str, Any
                 raise DeploymentError("Application release state changed or became unreadable; it was preserved and no retained backend was restarted.") from state_exc
             if current_state != state_snapshot:
                 raise DeploymentError("Application release state changed concurrently; it was preserved and no retained backend was restarted.") from deployment_exc
+        with contextlib.suppress(Exception):
+            _append_audit(app, {
+                "operation": "deploy-stack-diagnostic",
+                "outcome": "candidate-rejected",
+                "failure_phase": failure_phase,
+                "exception_type": type(deployment_exc).__name__,
+                "forward_activation_recovery": forward_activation,
+                "schema_version": database_status.get("schema_version"),
+                "commit_sha": request["commit_sha"],
+                "workflow_run_id": request["release"]["run_id"],
+                "actor": request["release"]["actor"],
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            })
         if backend_maintenance:
             try:
+                if forward_activation:
+                    raise DeploymentError("The forward-activation candidate failed; the migrated database is preserved and the retained backend remains stopped.") from deployment_exc
                 if migration_started:
                     if isinstance(deployment_exc, MigrationOutcomeUnknown):
                         raise DeploymentError("The migration outcome could not be verified; the retained backend remains stopped for safe recovery.") from deployment_exc
@@ -3838,6 +4349,8 @@ def _deploy_stack(request: dict[str, Any], app: dict[str, Any]) -> dict[str, Any
             except Exception as recovery_exc:
                 if isinstance(deployment_exc, MigrationOutcomeUnknown):
                     message = "The migration outcome could not be verified; the retained backend remains stopped for safe recovery."
+                elif forward_activation:
+                    message = "The forward-activation candidate failed; the migrated database is preserved and the retained backend remains stopped."
                 elif migration_started:
                     message = "The database migrated forward; the retained backend remains stopped until a compatible fix-forward release or approved restore is available."
                 else:
@@ -3852,6 +4365,8 @@ def _deploy_stack(request: dict[str, Any], app: dict[str, Any]) -> dict[str, Any
     result = {"outcome": "success", "app_id": app["app_id"], "slot": slot, "commit_sha": request["commit_sha"], "images": request["images"], "metrics_warning": metrics_warning}
     if reconciliation_event is not None:
         result["schema_reconciliation_id"] = reconciliation_event["reconciliation_id"]
+    if activation_recovery_event is not None:
+        result["schema_activation_recovery_id"] = activation_recovery_event["recovery_id"]
     return result
 
 
