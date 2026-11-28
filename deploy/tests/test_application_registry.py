@@ -129,6 +129,16 @@ class ApplicationRegistryTests(unittest.TestCase):
                     "true",
                 )
 
+    def test_gds_entitlement_enforcement_is_enabled_only_for_gds_in_both_slots(self):
+        app = self.platform["applications"]["romanlms-production"]
+        enforcement_keys = {
+            slot: app["components"]["backend"]["container_environment_by_slot"][slot][
+                "ROMANLMS_FEATURE_ENFORCEMENT_ENABLED_KEYS"
+            ]
+            for slot in ("blue", "green")
+        }
+        self.assertEqual(enforcement_keys, {"blue": "GDS_SIMULATOR", "green": "GDS_SIMULATOR"})
+
     def test_rejects_build_only_application_that_can_be_deployed(self):
         app = copy.deepcopy(self.examples["applications"]["sample-build-only"])
         app["deployment_enabled"] = True
