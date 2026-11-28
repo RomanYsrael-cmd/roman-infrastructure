@@ -3817,6 +3817,64 @@ def _post_migration_activation_evidence(
         if operation in {"database-migration", "rollback", "rollback-service", "rollback-stack", "refresh-stack", "deploy", "deploy-service"}:
             raise DeploymentError("A later production mutation supersedes the failed-migration activation evidence.")
         if operation == "deploy-stack":
+            if outcome == "active-readiness-failed":
+                target_binding = {
+                    "target_commit_sha": request.get("commit_sha"),
+                    "target_platform_sha": request.get("platform_sha"),
+                    "observed_schema_version": plan.source_version,
+                    "target_schema_version": plan.target_version,
+                    "migration_plan_fingerprint": plan.fingerprint,
+                    "release_binding_fingerprint": plan.release_fingerprint,
+                }
+                binding_keys = set(target_binding)
+                present_binding_keys = binding_keys.intersection(event)
+                if present_binding_keys:
+                    # Newer audit records bind this readiness diagnostic directly to the
+                    # authenticated target. Partial or mismatched bindings fail closed.
+                    if present_binding_keys != binding_keys or any(
+                        event.get(key) != value for key, value in target_binding.items()
+                    ):
+                        raise DeploymentError("A later active readiness failure is bound to a different release.")
+                    continue
+
+                # Older controller versions did not record the requested target on this
+                # diagnostic. Accept it only when the same completed workflow run later
+                # recorded a denial for this exact migration target and a matching failed
+                # deployment completion. This preserves legacy audit history without
+                # treating an unrelated release attempt as harmless.
+                run_id = event.get("workflow_run_id")
+                if (
+                    not isinstance(run_id, str)
+                    or not run_id
+                    or event.get("active_commit_sha") != active.get("commit_sha")
+                ):
+                    raise DeploymentError("An unbound active readiness failure cannot be tied to the retained release.")
+                recovery_denials = [
+                    (later_index, later) for later_index, later in enumerate(events[index + 1:], index + 1)
+                    if later.get("operation") == "schema-activation-recovery"
+                    and later.get("outcome") == "denied"
+                    and later.get("workflow_run_id") == run_id
+                    and later.get("target_commit_sha") == request.get("commit_sha")
+                    and later.get("target_platform_sha") == request.get("platform_sha")
+                    and later.get("observed_schema_version") == plan.source_version
+                    and later.get("target_schema_version") == plan.target_version
+                    and later.get("migration_plan_fingerprint") == plan.fingerprint
+                    and later.get("actor") == event.get("actor")
+                ]
+                if len(recovery_denials) != 1:
+                    raise DeploymentError("An unbound active readiness failure lacks a unique matching recovery denial.")
+                denial_index, _ = recovery_denials[0]
+                failures = [
+                    (later_index, later) for later_index, later in enumerate(events[denial_index + 1:], denial_index + 1)
+                    if later.get("operation") == "deploy-stack"
+                    and later.get("outcome") == "failure"
+                    and later.get("workflow_run_id") == run_id
+                    and later.get("commit_sha") == request.get("commit_sha")
+                    and later.get("actor") == event.get("actor")
+                ]
+                if len(failures) != 1:
+                    raise DeploymentError("An unbound active readiness failure lacks a unique matching failed completion.")
+                continue
             if event.get("commit_sha") != request.get("commit_sha"):
                 raise DeploymentError("A later application release supersedes the failed-migration activation evidence.")
             if outcome == "success":
@@ -4022,7 +4080,14 @@ def _deploy_stack(request: dict[str, Any], app: dict[str, Any]) -> dict[str, Any
                 "operation": "deploy-stack",
                 "outcome": "active-readiness-failed",
                 "active_commit_sha": active.get("commit_sha"),
+                "target_commit_sha": request.get("commit_sha"),
+                "target_platform_sha": request.get("platform_sha"),
+                "observed_schema_version": validated_plan.source_version,
+                "target_schema_version": validated_plan.target_version,
+                "migration_plan_fingerprint": validated_plan.fingerprint,
+                "release_binding_fingerprint": validated_plan.release_fingerprint,
                 "workflow_run_id": request["release"]["run_id"],
+                "workflow_run_attempt": request["release"]["run_attempt"],
                 "actor": request["release"]["actor"],
                 "error": str(exc)[:160],
                 "timestamp": datetime.now(timezone.utc).isoformat(),

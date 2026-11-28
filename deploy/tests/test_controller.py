@@ -1443,6 +1443,66 @@ class StackDeploymentTests(unittest.TestCase):
             with self.assertRaisesRegex(deploy.DeploymentError, "unique audited failure completion"):
                 deploy._post_migration_activation_evidence(self.app, active, previous, plan, hashes, request_value)
 
+    def test_failed_activation_recovery_binds_active_readiness_diagnostics_to_the_same_target(self):
+        active, previous, request_value, _, plan, hashes, events = self._post_migration_activation_case()
+        retry_run = "46092550354"
+        readiness_failure = {
+            "operation": "deploy-stack", "outcome": "active-readiness-failed",
+            "active_commit_sha": active["commit_sha"], "workflow_run_id": retry_run,
+            "actor": "RomanYsrael-cmd",
+        }
+        recovery_denial = {
+            "operation": "schema-activation-recovery", "outcome": "denied",
+            "workflow_run_id": retry_run, "target_commit_sha": request_value["commit_sha"],
+            "target_platform_sha": request_value["platform_sha"],
+            "observed_schema_version": plan.source_version, "target_schema_version": plan.target_version,
+            "migration_plan_fingerprint": plan.fingerprint, "actor": "RomanYsrael-cmd",
+        }
+        failed_completion = {
+            "operation": "deploy-stack", "outcome": "failure", "workflow_run_id": retry_run,
+            "commit_sha": request_value["commit_sha"], "actor": "RomanYsrael-cmd",
+        }
+        legacy_audit = [*events, readiness_failure, recovery_denial, failed_completion]
+        with mock.patch.object(deploy, "_read_deployment_audit_events", return_value=legacy_audit):
+            deploy._post_migration_activation_evidence(self.app, active, previous, plan, hashes, request_value)
+
+        # The current controller records the exact authenticated target on the
+        # readiness diagnostic, so the in-flight attempt can validate its own audit.
+        bound_readiness_failure = {
+            **readiness_failure,
+            "workflow_run_id": request_value["release"]["run_id"],
+            "target_commit_sha": request_value["commit_sha"],
+            "target_platform_sha": request_value["platform_sha"],
+            "observed_schema_version": plan.source_version,
+            "target_schema_version": plan.target_version,
+            "migration_plan_fingerprint": plan.fingerprint,
+            "release_binding_fingerprint": plan.release_fingerprint,
+        }
+        with mock.patch.object(
+            deploy, "_read_deployment_audit_events", return_value=[*events, bound_readiness_failure],
+        ):
+            deploy._post_migration_activation_evidence(
+                self.app, active, previous, plan, hashes, request_value,
+            )
+
+        mismatched_denial = {**recovery_denial, "target_platform_sha": "f" * 40}
+        mismatched_audit = [*events, readiness_failure, mismatched_denial, failed_completion]
+        with mock.patch.object(deploy, "_read_deployment_audit_events", return_value=mismatched_audit):
+            with self.assertRaisesRegex(deploy.DeploymentError, "unique matching recovery denial"):
+                deploy._post_migration_activation_evidence(
+                    self.app, active, previous, plan, hashes, request_value,
+                )
+
+        partial_binding = {**bound_readiness_failure}
+        partial_binding.pop("release_binding_fingerprint")
+        with mock.patch.object(
+            deploy, "_read_deployment_audit_events", return_value=[*events, partial_binding],
+        ):
+            with self.assertRaisesRegex(deploy.DeploymentError, "different release"):
+                deploy._post_migration_activation_evidence(
+                    self.app, active, previous, plan, hashes, request_value,
+                )
+
     def test_forward_activation_takes_a_fresh_backup_and_never_restarts_the_old_backend(self):
         self.app["single_backend_maintenance"] = True
         active, previous, request_value, _, plan, hashes, events = self._post_migration_activation_case()
@@ -2231,6 +2291,11 @@ class StackDeploymentTests(unittest.TestCase):
         self.assertEqual(state["active"]["commit_sha"], SHA)
         self.assertEqual(state["previous"], active)
         self.assertEqual(audit[0]["outcome"], "active-readiness-failed")
+        target_plan = deploy._migration_plan_from_data(self._database_status()["migration_plan"])
+        self.assertEqual(audit[0]["target_commit_sha"], self.request["commit_sha"])
+        self.assertEqual(audit[0]["target_platform_sha"], self.request["platform_sha"])
+        self.assertEqual(audit[0]["migration_plan_fingerprint"], target_plan.fingerprint)
+        self.assertEqual(audit[0]["release_binding_fingerprint"], target_plan.release_fingerprint)
 
     def test_unhealthy_active_replacement_does_not_hide_candidate_readiness_failure(self):
         self.app["allow_unhealthy_active_replacement"] = True
