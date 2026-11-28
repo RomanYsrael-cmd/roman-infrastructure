@@ -275,6 +275,8 @@ class RequestValidationTests(unittest.TestCase):
             deploy.validate_request(request(operation="schema-reconciliation"), CONFIG)
         with self.assertRaisesRegex(deploy.DeploymentError, "unsupported fields or operation"):
             deploy.validate_request(request(schema_compatibility_evidence=[]), CONFIG)
+        with self.assertRaisesRegex(deploy.DeploymentError, "unsupported fields or operation"):
+            deploy.validate_request(request(**{deploy.VERIFIED_PROVENANCE_REQUEST_KEY: "0" * 64}), CONFIG)
 
     def test_rejects_header_injection_in_github_token(self):
         with self.assertRaisesRegex(deploy.DeploymentError, "GitHub token"):
@@ -1200,6 +1202,74 @@ class StackDeploymentTests(unittest.TestCase):
         }
         return active, request_value, evidence, plan, status
 
+    def _post_migration_activation_case(self):
+        self._configure_v133_migration()
+        active, request_value, evidence, original_plan, original_status = self._v153_compatibility_case()
+        previous = copy.deepcopy(active)
+        previous["slot"] = "blue"
+        for name, component in previous["components"].items():
+            component["slot"] = "blue"
+            component["container"] = deploy._container_name(
+                deploy._stack_component_app(self.app, name), "blue", previous["commit_sha"],
+            )
+        request_value["release"]["run_id"] = "recovery-attempt-current"
+        original_request = copy.deepcopy(request_value)
+        original_request["release"]["run_id"] = "46086844914"
+        original_request["release"]["run_attempt"] = 1
+        original_reconciliation = deploy._schema_reconciliation_event(
+            self.app, evidence, active, original_plan, original_request,
+        )
+        applied, pending = original_plan.history
+        applied_target = ("Success", *pending[1:])
+        plan = deploy.ForwardMigrationPlan("154", "154", (), "f" * 64, (applied, applied_target), "c" * 64)
+        backup = {
+            "operation": "database-backup", "outcome": "success", "backup_type": "full",
+            "backup_label": "20261128-002225F", "schema_source_version": "153",
+            "schema_target_version": "154", "migration_plan_fingerprint": original_plan.fingerprint,
+            "pending_migrations": ["154"], "commit_sha": request_value["commit_sha"],
+            "workflow_run_id": "46086844914", "actor": "RomanYsrael-cmd",
+        }
+        approved_pending = original_plan.pending[0]
+        migration_common = {
+            "operation": "database-migration", "commit_sha": request_value["commit_sha"],
+            "workflow_run_id": "46086844914", "actor": "RomanYsrael-cmd",
+            "schema_source_version": "153", "schema_target_version": "154",
+            "migration_plan_fingerprint": original_plan.fingerprint,
+            "release_binding_fingerprint": original_plan.release_fingerprint,
+            "migration_image": request_value["migration_image"],
+            "pending_migrations": [{
+                "version": approved_pending[0],
+                "script": approved_pending[1],
+                "description": approved_pending[2],
+                "checksum": approved_pending[3],
+            }],
+            "workflow_run_attempt": "1",
+        }
+        migration_started = {**migration_common, "outcome": "started"}
+        migration_success = {**migration_common, "outcome": "success"}
+        migration_verified = {
+            **{k: v for k, v in migration_common.items() if k != "migration_image" and k != "pending_migrations"},
+            "outcome": "verified", "backup_label": backup["backup_label"],
+            "pending_migrations": ["154"],
+            "schema_reconciliation_id": original_reconciliation["reconciliation_id"],
+        }
+        deploy_started = {
+            "operation": "deploy-stack", "outcome": "started", "commit_sha": request_value["commit_sha"],
+            "images": original_reconciliation["target_images"], "platform_sha": request_value["platform_sha"],
+            "slot": "blue", "workflow_run_id": "46086844914", "actor": "RomanYsrael-cmd",
+            "schema_reconciliation_id": original_reconciliation["reconciliation_id"],
+        }
+        deploy_failed = {
+            "operation": "deploy-stack", "outcome": "failure", "commit_sha": request_value["commit_sha"],
+            "workflow_run_id": "46086844914",
+            "error": "The database migrated forward; the retained backend remains stopped until a compatible fix-forward release or approved restore is available.",
+        }
+        events = [
+            original_reconciliation, backup, migration_started, migration_success,
+            migration_verified, deploy_started, deploy_failed,
+        ]
+        return active, previous, request_value, evidence, plan, original_status["migration_artifact_sha256"], events
+
     def test_schema_compatibility_evidence_is_exact_repeatable_and_does_not_rewrite_history(self):
         active, request_value, _, plan, status = self._v153_compatibility_case()
         original = copy.deepcopy(active)
@@ -1262,6 +1332,145 @@ class StackDeploymentTests(unittest.TestCase):
             with self.subTest(target=candidate_plan.target_version, active=release.get("commit_sha")):
                 with self.assertRaises(deploy.DeploymentError):
                     deploy._schema_compatibility_match(app, release, None, candidate_plan, hashes, candidate_request)
+
+    def test_failed_activation_can_resume_only_from_verified_audit_and_current_flyway_history(self):
+        active, previous, request_value, evidence, plan, hashes, events = self._post_migration_activation_case()
+        with mock.patch.object(deploy, "_read_deployment_audit_events", return_value=events):
+            proof = deploy._post_migration_activation_evidence(
+                self.app, active, previous, plan, hashes, request_value,
+            )
+        self.assertEqual(proof["evidence"]["id"], evidence["id"])
+        self.assertEqual(proof["migration_run_id"], "46086844914")
+        self.assertEqual(proof["reconciliation"]["target_schema_version"], "154")
+
+    def test_failed_activation_recovery_denies_missing_or_superseded_evidence(self):
+        active, previous, request_value, _, plan, hashes, events = self._post_migration_activation_case()
+        cases = []
+        no_evidence = copy.deepcopy(self.app)
+        no_evidence.pop("schema_compatibility_evidence")
+        cases.append((no_evidence, active, previous, plan, hashes, events))
+        changed_history = list(plan.history)
+        changed_history[1] = (*changed_history[1][:-1], changed_history[1][-1] + 1)
+        bad_checksum_plan = deploy.ForwardMigrationPlan(
+            plan.source_version, plan.target_version, plan.pending, plan.fingerprint,
+            tuple(changed_history), plan.release_fingerprint,
+        )
+        cases.append((self.app, active, previous, bad_checksum_plan, hashes, events))
+        cases.append((self.app, active, previous, plan, hashes, events[:-1]))
+        superseded = [*events, {
+            "operation": "deploy-stack", "outcome": "success",
+            "commit_sha": request_value["commit_sha"], "workflow_run_id": "later-run",
+        }]
+        cases.append((self.app, active, previous, plan, hashes, superseded))
+        wrong_image = copy.deepcopy(active)
+        wrong_image["components"]["backend"]["image"] = "retagged"
+        cases.append((self.app, wrong_image, previous, plan, hashes, events))
+        wrong_request = copy.deepcopy(request_value)
+        wrong_request["commit_sha"] = "f" * 40
+        cases.append((self.app, active, previous, plan, hashes, events, wrong_request))
+
+        for case in cases:
+            app, release, prior, candidate_plan, artifact_hashes, audit = case[:6]
+            candidate_request = case[6] if len(case) == 7 else request_value
+            with self.subTest(run_id=candidate_request["release"]["run_id"]):
+                with mock.patch.object(deploy, "_read_deployment_audit_events", return_value=audit):
+                    with self.assertRaises(deploy.DeploymentError):
+                        deploy._post_migration_activation_evidence(
+                            app, release, prior, candidate_plan, artifact_hashes, candidate_request,
+                        )
+
+    def test_failed_activation_recovery_allows_audited_failed_retries_but_not_duplicate_open_attempts(self):
+        active, previous, request_value, _, plan, hashes, events = self._post_migration_activation_case()
+        retry_run = "recovery-attempt-previous"
+        retry_events = [*events,
+            {"operation": "schema-activation-recovery", "outcome": "verified-compatible", "workflow_run_id": retry_run},
+            {"operation": "database-backup", "outcome": "success", "workflow_run_id": retry_run},
+            {"operation": "deploy-stack", "outcome": "started", "commit_sha": request_value["commit_sha"], "workflow_run_id": retry_run},
+            {"operation": "deploy-stack", "outcome": "failure", "commit_sha": request_value["commit_sha"], "workflow_run_id": retry_run},
+        ]
+        with mock.patch.object(deploy, "_read_deployment_audit_events", return_value=retry_events):
+            deploy._post_migration_activation_evidence(self.app, active, previous, plan, hashes, request_value)
+
+        open_retry = retry_events[:-1]
+        with mock.patch.object(deploy, "_read_deployment_audit_events", return_value=open_retry):
+            with self.assertRaisesRegex(deploy.DeploymentError, "unique audited failure completion"):
+                deploy._post_migration_activation_evidence(self.app, active, previous, plan, hashes, request_value)
+
+    def test_forward_activation_takes_a_fresh_backup_and_never_restarts_the_old_backend(self):
+        self.app["single_backend_maintenance"] = True
+        active, previous, request_value, _, plan, hashes, events = self._post_migration_activation_case()
+        self.request = request_value
+        initial_state = {"active": active, "previous": previous, "updated_at": "before"}
+        self.state.write_text(json.dumps(initial_state), encoding="utf-8")
+        self.route.write_text(deploy._stack_route_content(self.app["components"], active["slot"]), encoding="utf-8")
+        status = {
+            "migration_pending": False,
+            "schema_version": "154",
+            "migration_target_version": "154",
+            "migration_plan": deploy._migration_plan_data(plan),
+            "migration_artifact_sha256": hashes,
+        }
+        with mock.patch.object(deploy, "_read_deployment_audit_events", return_value=events):
+            proof = deploy._post_migration_activation_evidence(
+                self.app, active, previous, plan, hashes, request_value,
+            )
+        statuses = iter((status, status, status))
+        commands = []
+        audit_events = []
+
+        def run(args, **kwargs):
+            commands.append(args)
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        def switch(_app, slot):
+            self.route.write_text(f"switched {slot}\n", encoding="utf-8")
+
+        backup = mock.patch.object(deploy, "_create_verified_production_backup", return_value="20261128-091500F")
+        stop_backend = mock.patch.object(deploy, "_stop_stack_backend")
+        restart_backend = mock.patch.object(deploy, "_restart_stack_backend")
+        patchers = [
+            mock.patch.object(deploy, "_validate_database", side_effect=lambda *args, **kwargs: next(statuses)),
+            mock.patch.object(deploy, "_post_migration_activation_evidence", return_value=proof),
+            backup,
+            mock.patch.object(deploy, "_assert_no_application_writers"),
+            mock.patch.object(deploy, "_secure_env_file", return_value=Path("D:/safe/database.env")),
+            mock.patch.object(deploy, "_env_file_values", return_value={"DB_URL": "jdbc:postgresql://127.0.0.1:5432/romanlms_prod", "DB_USERNAME": "romanlms_app", "DB_PASSWORD": "secret"}),
+            mock.patch.object(deploy, "registry_session", return_value=contextlib.nullcontext({})),
+            mock.patch.object(deploy, "run_command", side_effect=run),
+            mock.patch.object(deploy, "_verify_image"),
+            mock.patch.object(deploy, "_remove_inactive_slot"),
+            mock.patch.object(deploy, "_stack_release_healthy"),
+            mock.patch.object(deploy, "_verify_retained_stack_images"),
+            mock.patch.object(deploy, "_verify_retained_migration_image"),
+            mock.patch.object(deploy, "_verify_post_migration_retained_state"),
+            mock.patch.object(deploy, "_stack_validate_network"),
+            mock.patch.object(deploy, "verify_release_origin"),
+            mock.patch.object(deploy, "_switch_stack_route", side_effect=switch),
+            mock.patch.object(deploy, "require_storage_mounts"),
+            mock.patch.object(deploy, "_append_audit", side_effect=lambda _app, event: audit_events.append(event)),
+            mock.patch.object(deploy, "_write_metrics"),
+            mock.patch.object(deploy, "_check_backend_start_memory"),
+            stop_backend,
+            restart_backend,
+        ]
+        with contextlib.ExitStack() as stack:
+            mocks = [stack.enter_context(patcher) for patcher in patchers]
+            result = deploy._deploy_stack(self.request, self.app)
+
+        backup_mock = mocks[2]
+        backup_mock.assert_called_once_with(self.app, self.request, plan, allow_no_migration=True)
+        stop_backend_mock = mocks[-2]
+        restart_backend_mock = mocks[-1]
+        stop_backend_mock.assert_not_called()
+        restart_backend_mock.assert_not_called()
+        self.assertEqual(result["commit_sha"], request_value["commit_sha"])
+        self.assertEqual(result["schema_activation_recovery_id"], audit_events[0]["recovery_id"])
+        new_state = json.loads(self.state.read_text(encoding="utf-8"))
+        self.assertEqual(new_state["active"]["schema_version"], "154")
+        self.assertEqual(new_state["active"]["commit_sha"], request_value["commit_sha"])
+        self.assertIsNone(new_state["previous"])
+        self.assertTrue(any(args[:2] == ["docker", "run"] for args in commands))
+        self.assertTrue(self.route.read_text(encoding="utf-8").startswith("switched "))
 
     def test_verified_v153_drift_audits_then_keeps_backup_and_migration_gates(self):
         self._configure_v133_migration()
@@ -2655,6 +2864,28 @@ class WorkflowOriginTests(unittest.TestCase):
             with self.assertRaisesRegex(deploy.DeploymentError, "Image provenance verification failed: expired"):
                 deploy.verify_release_origin(value, self.app)
         github_json.assert_not_called()
+
+    def test_late_origin_recheck_reuses_the_exact_already_verified_oidc_binding(self):
+        value = request()
+        with mock.patch.object(deploy, "verify_release_provenance") as provenance, \
+             mock.patch.object(deploy, "github_json", side_effect=self._responses()[:4] * 2), \
+             mock.patch.object(deploy, "verify_required_ci") as required_ci:
+            deploy.verify_release_origin(value, self.app)
+            deploy.verify_release_origin(value, self.app)
+
+        provenance.assert_called_once()
+        self.assertEqual(required_ci.call_count, 2)
+
+    def test_late_origin_recheck_rejects_a_changed_immutable_provenance_request(self):
+        value = request()
+        with mock.patch.object(deploy, "verify_release_provenance"), \
+             mock.patch.object(deploy, "github_json", side_effect=self._responses()[:4]) as github_json, \
+             mock.patch.object(deploy, "verify_required_ci"):
+            deploy.verify_release_origin(value, self.app)
+            value["commit_sha"] = "f" * 40
+            with self.assertRaisesRegex(deploy.DeploymentError, "request changed"):
+                deploy.verify_release_origin(value, self.app)
+        self.assertEqual(github_json.call_count, 4)
 
     def test_accepts_only_an_explicit_automatic_workflow_run_with_source_ci_identity(self):
         value = request(

@@ -12,6 +12,8 @@ Only versioned SQL migrations run automatically. The validator confirms canonica
 
 The controller runs Flyway information and validation against the exact release migrator. It records the observed schema version and an empty pending plan. It does not stop database writers, create a full backup, or run migration credentials. After the candidate passes health checks, it re-reads the schema history and requires the same plan fingerprint before switching traffic.
 
+An audited post-migration activation recovery is the sole exception: after a previously verified migration left the retained backend stopped, that recovery requires a new full verified backup at the current schema and confirms that no application writers are active before starting a candidate.
+
 ## One or more pending migrations
 
 1. The controller validates the applied schema and all pending rows and SQL files in the immutable release image. `target_version` is derived from the last pending migration. It records both the migration-history fingerprint and the release-binding fingerprint described above.
@@ -31,6 +33,7 @@ The per-application `max_pending` is a bounded operational batch size (1–100).
 - If Flyway reports the target fully applied and the history checksums are verified, the new candidate can continue to health checks. Application rollback remains blocked until the retained version is explicitly compatible with that observed schema.
 - If Flyway is still running or the database outcome is unknown, the writer stays stopped and traffic does not move to an unverified app. Do not retry, run `repair`, or edit `flyway_schema_history`. Preserve the backup metadata and follow the database incident/restore process.
 - If candidate health fails after migration, the controller may restore the retained application only when the actual schema and compatibility policy permit it. It never rolls back SQL automatically.
+- If postflight verified the target schema but candidate activation failed, the retained backend stays stopped. Recovery is allowed only through the audited activation procedure below; it does not restart the old release against the new schema.
 
 The controller audits the source/target, exact plan and fingerprint, migration image, backup adapter and identity, writer quiescence, execution outcome, checksums, release source, and postflight schema. Audit output does not include database passwords.
 
@@ -45,6 +48,23 @@ Before allowing the forward release to continue, the controller validates all Fl
 Passing this check only allows the normal forward-deployment path to proceed. A fresh verified backup, writer quiescence, unchanged migration plan, approved Flyway execution, postflight validation, candidate health, and the existing traffic-switch safeguards remain mandatory. The reconciliation path changes neither the database nor the retained release metadata. It cannot be used for a different target release or a later schema version. Missing evidence, an unhealthy retained release, any checksum or image mismatch, an unexpected migration, or a concurrent state change fails closed. If candidate activation fails after the database has moved forward, the old release is not restarted against an unapproved schema; keep traffic and state unchanged and use the forward-fix or approved database-recovery process.
 
 To handle another incident, verify the actual successful Flyway history and migration source, prove the retained release is healthy against that database, and review the exact effect and release identities before adding a narrowly scoped root-owned record. Never change `schema_version`, run Flyway `repair`, or use a client-supplied compatibility override as a recovery shortcut.
+
+## Audited post-migration activation recovery
+
+This path is for the narrow case where the controller already audited a successful migration and postflight validation, but the candidate failed before the production route and active release state changed. It does not rerun or repair Flyway and it does not make the retained release appear compatible by editing its schema version.
+
+The controller fails closed unless all of the following are true:
+
+1. The new request is a fresh, normally authorized `deploy-stack` for the exact root-registered target commit and pinned platform workflow, with valid image-bound OIDC provenance and current required CI.
+2. The current Flyway plan has no pending migrations, its source and target are the reviewed schema target, and the exact migrator image confirms the complete SQL history, checksums, and content hashes. The reviewed compatibility record must match the recorded release, observed source, target release, and grant-only V153/V154 migration identities.
+3. The root-owned audit file contains one intact, ordered chain linking the compatibility reconciliation, full pre-migration backup, migration start and success, postflight verification, candidate start, and failed activation. Any later migration or successful release invalidates the recovery evidence. Retries are accepted only after prior candidate attempts have an audited failure completion.
+4. The retained release state and both immutable component images still match the reviewed record. Its backend must remain stopped, its non-backend components must be healthy, and the managed route must still point exactly at the retained slot. It is never restarted against the forward schema.
+5. The controller verifies there are no registered application writers, creates and verifies a new full backup at the current target schema, and repeats the database-plan, audit-evidence, and release-state checks before starting candidates.
+6. The new backend and frontend must pass their direct readiness checks, GitHub must still confirm the in-progress authorized run, approved branch, and required CI, the database history must remain unchanged, and the managed route check must pass before release state is updated. A failed candidate is removed while the old backend remains stopped.
+
+The controller records a `schema-activation-recovery` audit entry bound to the prior reconciliation and migration, current database-plan fingerprint, retained and target release identities, new image digests, workflow actor/run, and timestamp. A safe stage code is separately recorded for candidate failures; raw credentials and tokens are never written to this audit. The request's OIDC token is cryptographically checked on entry. Later checkpoints compare a controller-only fingerprint of that same immutable request and repeat GitHub run/branch/CI checks without reusing an expired JWT. Strict request validation rejects client-supplied proof markers.
+
+This recovery is not an authorization to restore or downgrade the database. If the migration, audit chain, current history, container identity, backup, or candidate readiness cannot be established, leave the backend stopped and follow the separately approved database-recovery procedure.
 
 ## RomanLMS specifics
 
